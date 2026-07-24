@@ -9,8 +9,11 @@
 #include "esp32_camera.h"
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
+#include "hutuji_pipe.h"
 
+#include <cJSON.h>
 #include <esp_log.h>
+#include <stdexcept>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
@@ -271,6 +274,47 @@ private:
         // Allow switching between press-to-talk (长按说话) and click-to-talk (单击唤醒)
         press_to_talk_tool_ = new PressToTalkMcpTool();
         press_to_talk_tool_->Initialize();
+
+        // hutuji 写字机 Telnet 哑管道（方案 E：TCP 客户端 → Grbl_Esp32 Telnet:23）
+        hutuji::Pipe::GetInstance().Start();
+
+        mcp_server.AddTool("hutuji.status",
+            "查询写字机管道状态（CH340 连接/Grbl 就绪/最近一行应答）",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                auto& pipe = hutuji::Pipe::GetInstance();
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "connected", pipe.IsConnected());
+                cJSON_AddBoolToObject(root, "ready", pipe.IsReady());
+                cJSON_AddStringToObject(root, "last_line", pipe.GetLastLine().c_str());
+                char* str = cJSON_PrintUnformatted(root);
+                cJSON_Delete(root);
+                std::string json = str ? str : "{}";
+                cJSON_free(str);
+                return json;
+            });
+
+        mcp_server.AddTool("hutuji.draw",
+            "让写字机执行绘图：url 指向云端已生成的 G-code 文件，设备下载后逐行转发给写字机",
+            PropertyList({
+                Property("url", kPropertyTypeString)
+            }), [](const PropertyList& properties) -> ReturnValue {
+                const std::string& url = properties["url"].value<std::string>();
+                if (url.empty()) {
+                    throw std::runtime_error("url 不能为空");
+                }
+                // TODO(M2): xTaskCreate 独立任务：Board::GetNetwork()->CreateHttp()
+                // 流式下载 G-code，逐行 hutuji::Pipe::SendLine() + WaitOk() 转发；
+                // 耗时操作禁止在 MCP 回调（主任务）内阻塞。
+                ESP_LOGI(TAG, "hutuji.draw 占位实现, url=%s", url.c_str());
+                return "started";
+            });
+
+        mcp_server.AddTool("hutuji.abort",
+            "中止写字机当前绘图任务",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                // TODO(M2): 通知 M2 的下载/转发任务停止，并向写字机发复位/进给保持
+                return "ok";
+            });
     }
 
 public:
