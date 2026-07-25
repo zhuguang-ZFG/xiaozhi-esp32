@@ -24,6 +24,12 @@ constexpr EventBits_t kResponseErrorBit = (1 << 1);
 constexpr size_t kRxLineMax = 512;        // 单行聚合上限，防异常字节流撑爆内存
 constexpr uint32_t kBackoffInitMs = 1000; // 重连退避：1s/2s/4s…
 constexpr uint32_t kBackoffMaxMs = 30000; // …上限 30s
+
+// TCP keepalive：必须显式设参数，否则用 lwip 默认 KEEPIDLE=7200s(2h)+75s*9，
+// 对端断电要 ~2h11m 才发现，等于没有保活。10+3*3 ≈ 19s 内发现死链。
+constexpr int kKeepIdleSec = 10;  // 空闲多久开始探测
+constexpr int kKeepIntvlSec = 3;  // 探测间隔
+constexpr int kKeepCnt = 3;       // 连续失败几次判死
 } // namespace
 
 Pipe& Pipe::GetInstance() {
@@ -110,9 +116,17 @@ bool Pipe::ConnectOnce() {
         return false;
     }
 
-    // 可选保活：尽快发现对端断电/断网
+    // 保活：尽快发现对端断电/断网（无 FIN 的半开连接）
+    // 注意：只开 SO_KEEPALIVE 不够——lwip 默认 KEEPIDLE=7200s(2h)/INTVL=75s/CNT=9，
+    // 相当于 2h11m 后才发现，等于没有保活。必须显式设三个参数（见 protocol.md §1.2）。
     int keepalive = 1;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    int keep_idle = kKeepIdleSec;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+    int keep_intvl = kKeepIntvlSec;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+    int keep_cnt = kKeepCnt;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
 
     std::lock_guard<std::mutex> lock(sock_mutex_);
     sock_ = s;
