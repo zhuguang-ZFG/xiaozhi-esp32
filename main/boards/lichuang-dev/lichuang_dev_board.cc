@@ -279,7 +279,8 @@ private:
         hutuji::Pipe::GetInstance().Start();
 
         mcp_server.AddTool("hutuji.status",
-            "查询写字机管道状态（CH340 连接/Grbl 就绪/最近一行应答）",
+            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、最近应答行。"
+            "用户问「写字机连上了吗/能不能动」时用；云端生成服务请用 hutuji_status。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
                 auto& pipe = hutuji::Pipe::GetInstance();
                 cJSON* root = cJSON_CreateObject();
@@ -294,7 +295,8 @@ private:
             });
 
         mcp_server.AddTool("hutuji.draw",
-            "让写字机执行绘图：url 指向云端已生成的 G-code 文件，设备下载后逐行转发给写字机",
+            "执行出纸：参数 url 必须是云端 hutuji_draw 返回的 G-code 下载地址。"
+            "设备下载、校验后逐行经 Telnet 转发给写字机。用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
             PropertyList({
                 Property("url", kPropertyTypeString)
             }), [](const PropertyList& properties) -> ReturnValue {
@@ -310,7 +312,8 @@ private:
             });
 
         mcp_server.AddTool("hutuji.abort",
-            "中止写字机当前绘图任务",
+            "中止当前绘图转发。用户说停下/取消时用。"
+            "若正在换纸，可能无法立刻停，完成后才会停——须如实告诉用户。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
                 // TODO(M2): 通知 M2 的下载/转发任务停止，并向写字机发复位/进给保持
                 return "ok";
