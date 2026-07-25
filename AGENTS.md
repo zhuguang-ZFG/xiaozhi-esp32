@@ -92,3 +92,35 @@ The release script changes local `sdkconfig` and build state. Do not assume the 
 - CI matrix: `.github/workflows/build.yml`
 
 Keep detailed or fast-changing information in those files, not here. Add a nested `AGENTS.md` only when a subsystem needs specialized instructions.
+
+---
+
+## hutuji（写字机哑管道）专节
+
+本 fork 板型 `lichuang-dev` 承载 hutuji **方案 E：WiFi Telnet** 哑管道。枢纽真值在 `D:/Users/hutuji`，冲突以枢纽为准。
+
+### 动手前必读
+
+1. `D:/Users/hutuji/docs/agent-handoff.md`
+2. `D:/Users/hutuji/docs/agent-anti-drift.md`
+3. `D:/Users/hutuji/docs/protocol.md` v0.5（流控 / 单写者 / abort / §9）
+4. `D:/Users/hutuji/firmware/m1-usb-pipe.md`（分支名含 usb 是历史名，链路已是 Telnet）
+5. `D:/Users/hutuji/docs/worktree-inventory.md` + 本仓 `git status`
+
+### 硬约束
+
+- **哑管道**：不在 S3 生成/编辑/预览 G-code；只下载 + 校验 + 严格逐行转发。
+- **板级行为不进核心**：工具挂在板级 `InitializeTools()`；参照既有 board MCP 工具模式。
+- **出图中 status 只发 `?`**；禁止发 `[ESP901]` / `M704`（会吃 `ok`）。
+- **TCP keepalive** 必须设 `KEEPIDLE/KEEPINTVL/KEEPCNT`（见 protocol §1.2）；只开 `SO_KEEPALIVE` 无效。
+- **禁止**重开 USB Host / CH9350；禁止合并双芯片固件进单一镜像。
+- 出货前 `HUTUJI_PIPE_HOST` 必须是写字机固定 IP，禁止带开发占位值放行。
+- 保留无关工作树改动；M2（下载/CRC/授权门/流控/abort）未完成前不得宣称联调完成。
+
+### 构建
+
+```sh
+python3 scripts/release.py lichuang-dev
+```
+
+说明同步回枢纽 `D:/Users/hutuji/firmware/`。硬件结论必须带设备编号与固件 commit。
