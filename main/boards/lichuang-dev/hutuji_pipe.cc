@@ -17,19 +17,16 @@
 namespace hutuji {
 
 namespace {
-// Grbl 应答事件位
 constexpr EventBits_t kResponseOkBit = (1 << 0);
 constexpr EventBits_t kResponseErrorBit = (1 << 1);
 
-constexpr size_t kRxLineMax = 512;        // 单行聚合上限，防异常字节流撑爆内存
-constexpr uint32_t kBackoffInitMs = 1000; // 重连退避：1s/2s/4s…
-constexpr uint32_t kBackoffMaxMs = 30000; // …上限 30s
+constexpr size_t kRxLineMax = 512;
+constexpr uint32_t kBackoffInitMs = 1000;
+constexpr uint32_t kBackoffMaxMs = 30000;
 
-// TCP keepalive：必须显式设参数，否则用 lwip 默认 KEEPIDLE=7200s(2h)+75s*9，
-// 对端断电要 ~2h11m 才发现，等于没有保活。10+3*3 ≈ 19s 内发现死链。
-constexpr int kKeepIdleSec = 10;  // 空闲多久开始探测
-constexpr int kKeepIntvlSec = 3;  // 探测间隔
-constexpr int kKeepCnt = 3;       // 连续失败几次判死
+constexpr int kKeepIdleSec = 10;
+constexpr int kKeepIntvlSec = 3;
+constexpr int kKeepCnt = 3;
 } // namespace
 
 Pipe& Pipe::GetInstance() {
@@ -38,7 +35,6 @@ Pipe& Pipe::GetInstance() {
 }
 
 void Pipe::Start() {
-    // 幂等：只允许启动一次
     if (started_.exchange(true)) {
         return;
     }
@@ -46,7 +42,6 @@ void Pipe::Start() {
     response_events_ = xEventGroupCreate();
     configASSERT(response_events_);
 
-    // WiFi 由 WifiBoard 管理，本任务只做 TCP 层连接与退避重连
     BaseType_t ok = xTaskCreate(PipeTaskEntry, "hutuji_tcp", 4096, this, 10, &pipe_task_);
     configASSERT(ok == pdTRUE);
 
@@ -62,24 +57,24 @@ void Pipe::PipeTask() {
     while (true) {
         if (!ConnectOnce()) {
             ESP_LOGW(TAG, "连接 %s:%d 失败，%ums 后重试", HUTUJI_PIPE_HOST, HUTUJI_PIPE_PORT,
-                (unsigned)backoff_ms);
+                     (unsigned)backoff_ms);
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             backoff_ms = (backoff_ms * 2 > kBackoffMaxMs) ? kBackoffMaxMs : backoff_ms * 2;
             continue;
         }
-        backoff_ms = kBackoffInitMs;  // 连接成功，退避归零
+        backoff_ms = kBackoffInitMs;
         connected_.store(true);
         ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", HUTUJI_PIPE_HOST, HUTUJI_PIPE_PORT);
 
-        // 就绪探活：$I 查询构建信息，等 "[VER:" 置 ready_
-        SendRaw("$I\n", 3);
+        {
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            SendRawLocked("$I\n", 3);
+        }
 
-        // 接收泵：阻塞读 → 行聚合 → 应答解析
         uint8_t buf[256];
         while (true) {
             int len = recv(sock_, buf, sizeof(buf), 0);
             if (len <= 0) {
-                // 0 = 对端正常关闭，<0 = 错误，都走重连
                 if (len < 0) {
                     ESP_LOGW(TAG, "recv 错误: errno=%d (%s)", errno, strerror(errno));
                 }
@@ -91,6 +86,8 @@ void Pipe::PipeTask() {
         CloseSocket();
         connected_.store(false);
         ready_.store(false);
+        // 授权随会话：断连后需重新从应答推断
+        authorized_.store(false);
         rx_buffer_.clear();
         xEventGroupClearBits(response_events_, kResponseOkBit | kResponseErrorBit);
         ESP_LOGW(TAG, "写字机 Telnet 已断开，%ums 后重连", (unsigned)backoff_ms);
@@ -110,15 +107,11 @@ bool Pipe::ConnectOnce() {
     dest.sin_port = htons(HUTUJI_PIPE_PORT);
     dest.sin_addr.s_addr = inet_addr(HUTUJI_PIPE_HOST);
 
-    // 同步 connect；对端不可达时会阻塞到 lwip 超时，M1 可接受
     if (connect(s, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest)) != 0) {
         close(s);
         return false;
     }
 
-    // 保活：尽快发现对端断电/断网（无 FIN 的半开连接）
-    // 注意：只开 SO_KEEPALIVE 不够——lwip 默认 KEEPIDLE=7200s(2h)/INTVL=75s/CNT=9，
-    // 相当于 2h11m 后才发现，等于没有保活。必须显式设三个参数（见 protocol.md §1.2）。
     int keepalive = 1;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
     int keep_idle = kKeepIdleSec;
@@ -141,14 +134,20 @@ void Pipe::CloseSocket() {
     }
 }
 
-bool Pipe::SendRaw(const char* data, size_t len) {
+void Pipe::ShutdownSocket() {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    if (sock_ >= 0) {
+        shutdown(sock_, SHUT_RDWR);
+    }
+}
+
+bool Pipe::SendRawLocked(const char* data, size_t len) {
     std::lock_guard<std::mutex> lock(sock_mutex_);
     if (sock_ < 0) {
         return false;
     }
     size_t sent = 0;
     while (sent < len) {
-        // ESP-IDF lwip 不产生 SIGPIPE，无需 MSG_NOSIGNAL；断连靠返回值判断
         int n = send(sock_, data + sent, len - sent, 0);
         if (n < 0) {
             ESP_LOGE(TAG, "send 失败: errno=%d (%s)", errno, strerror(errno));
@@ -162,12 +161,7 @@ bool Pipe::SendRaw(const char* data, size_t len) {
 void Pipe::OnRxData(const uint8_t* data, size_t data_len) {
     rx_buffer_.append(reinterpret_cast<const char*>(data), data_len);
 
-    // 异常保护：长时间没有换行说明对端不按行协议，截断缓冲
-    if (rx_buffer_.size() > kRxLineMax) {
-        ESP_LOGW(TAG, "接收行超长，丢弃 %zu 字节", rx_buffer_.size());
-        rx_buffer_.clear();
-    }
-
+    // 先拆完整行，再丢超长残段——避免同分片里的 ok 被 clear 掉（M2 / protocol §3）
     size_t pos;
     while ((pos = rx_buffer_.find('\n')) != std::string::npos) {
         std::string line = rx_buffer_.substr(0, pos);
@@ -179,6 +173,30 @@ void Pipe::OnRxData(const uint8_t* data, size_t data_len) {
             ProcessLine(line);
         }
     }
+    if (rx_buffer_.size() > kRxLineMax) {
+        ESP_LOGW(TAG, "接收残段超长，丢弃 %zu 字节", rx_buffer_.size());
+        rx_buffer_.clear();
+    }
+}
+
+int Pipe::ParseErrorCode(const std::string& line) {
+    // "error:8" / "error:110" / 旧式 "error 8"
+    if (line.rfind("error", 0) != 0) {
+        return -1;
+    }
+    size_t i = 5;
+    while (i < line.size() && (line[i] == ':' || line[i] == ' ')) {
+        ++i;
+    }
+    if (i >= line.size() || line[i] < '0' || line[i] > '9') {
+        return -1;
+    }
+    int code = 0;
+    while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
+        code = code * 10 + (line[i] - '0');
+        ++i;
+    }
+    return code;
 }
 
 void Pipe::ProcessLine(const std::string& line) {
@@ -188,23 +206,28 @@ void Pipe::ProcessLine(const std::string& line) {
     }
     ESP_LOGI(TAG, "<- %s", line.c_str());
 
-    // 探活应答（如 "[VER:1.3a.20240101:...]"）：标记对端就绪
+    if (line.find("[License] Authorized") != std::string::npos) {
+        authorized_.store(true);
+    }
+
     if (line.rfind("[VER:", 0) == 0) {
         ready_.store(true);
         ESP_LOGI(TAG, "Grbl 探活成功（%s）", line.c_str());
         return;
     }
 
-    // 就绪标志（如 "Grbl 1.3a ['$' for help]"）：运行中出现 = 对端复位，重置状态并重新探活
     if (line.rfind("Grbl ", 0) == 0) {
         ready_.store(false);
+        authorized_.store(false);
         xEventGroupClearBits(response_events_, kResponseOkBit | kResponseErrorBit);
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_response_.clear();
+            last_error_code_ = -1;
         }
         ESP_LOGW(TAG, "检测到对端复位，重新探活");
-        SendRaw("$I\n", 3);
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        SendRawLocked("$I\n", 3);
         return;
     }
 
@@ -212,15 +235,18 @@ void Pipe::ProcessLine(const std::string& line) {
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_response_ = line;
+            last_error_code_ = -1;
         }
         xEventGroupSetBits(response_events_, kResponseOkBit);
     } else if (line.rfind("error", 0) == 0) {
+        int code = ParseErrorCode(line);
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_response_ = line;
+            last_error_code_ = code;
         }
         xEventGroupSetBits(response_events_, kResponseErrorBit);
-        ESP_LOGW(TAG, "Grbl 应答错误: %s", line.c_str());
+        ESP_LOGW(TAG, "Grbl 应答错误: %s (code=%d)", line.c_str(), code);
     }
 }
 
@@ -230,12 +256,12 @@ bool Pipe::SendLine(const std::string& line) {
         return false;
     }
 
-    // 发送前清掉上一轮应答位，保证 WaitOk 等的是本次应答
+    std::lock_guard<std::mutex> lock(write_mutex_);
     xEventGroupClearBits(response_events_, kResponseOkBit | kResponseErrorBit);
 
     std::string payload = line;
     payload.push_back('\n');
-    if (!SendRaw(payload.data(), payload.size())) {
+    if (!SendRawLocked(payload.data(), payload.size())) {
         ESP_LOGE(TAG, "发送失败: %s", line.c_str());
         return false;
     }
@@ -243,24 +269,49 @@ bool Pipe::SendLine(const std::string& line) {
     return true;
 }
 
-bool Pipe::WaitOk(uint32_t timeout_ms, std::string* response) {
-    if (response_events_ == nullptr) {
+bool Pipe::SendRealtime(char ch) {
+    if (!connected_.load()) {
         return false;
     }
-    EventBits_t bits = xEventGroupWaitBits(response_events_,
-        kResponseOkBit | kResponseErrorBit, pdTRUE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    return SendRawLocked(&ch, 1);
+}
 
-    if (response != nullptr) {
+WaitResult Pipe::WaitResponse(uint32_t timeout_ms, std::string* response, int* error_code) {
+    if (response_events_ == nullptr) {
+        return WaitResult::Timeout;
+    }
+    EventBits_t bits = xEventGroupWaitBits(response_events_,
+                                           kResponseOkBit | kResponseErrorBit, pdTRUE, pdFALSE,
+                                           pdMS_TO_TICKS(timeout_ms));
+
+    int code = -1;
+    {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        *response = last_response_;
+        if (response != nullptr) {
+            *response = last_response_;
+        }
+        code = last_error_code_;
     }
+    if (error_code != nullptr) {
+        *error_code = code;
+    }
+
     if (bits & kResponseOkBit) {
-        return true;
+        return WaitResult::Ok;
     }
-    if ((bits & (kResponseOkBit | kResponseErrorBit)) == 0) {
-        ESP_LOGW(TAG, "等待 Grbl 应答超时 (%ums)", (unsigned)timeout_ms);
+    if (bits & kResponseErrorBit) {
+        if (code == 8) {
+            return WaitResult::Deferred;
+        }
+        return WaitResult::Failed;
     }
-    return false;
+    ESP_LOGW(TAG, "等待 Grbl 应答超时 (%ums)", (unsigned)timeout_ms);
+    return WaitResult::Timeout;
+}
+
+bool Pipe::WaitOk(uint32_t timeout_ms, std::string* response) {
+    return WaitResponse(timeout_ms, response, nullptr) == WaitResult::Ok;
 }
 
 } // namespace hutuji

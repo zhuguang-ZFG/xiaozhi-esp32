@@ -10,6 +10,7 @@
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
 #include "hutuji_pipe.h"
+#include "hutuji_job.h"
 
 #include <cJSON.h>
 #include <esp_log.h>
@@ -279,44 +280,28 @@ private:
         hutuji::Pipe::GetInstance().Start();
 
         mcp_server.AddTool("hutuji.status",
-            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、最近应答行。"
+            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、是否授权、任务状态、最近应答行。"
             "用户问「写字机连上了吗/能不能动」时用；云端生成服务请用 hutuji_status。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
-                auto& pipe = hutuji::Pipe::GetInstance();
-                cJSON* root = cJSON_CreateObject();
-                cJSON_AddBoolToObject(root, "connected", pipe.IsConnected());
-                cJSON_AddBoolToObject(root, "ready", pipe.IsReady());
-                cJSON_AddStringToObject(root, "last_line", pipe.GetLastLine().c_str());
-                char* str = cJSON_PrintUnformatted(root);
-                cJSON_Delete(root);
-                std::string json = str ? str : "{}";
-                cJSON_free(str);
-                return json;
+                return hutuji::Job::GetInstance().StatusJson();
             });
 
         mcp_server.AddTool("hutuji.draw",
             "执行出纸：参数 url 必须是云端 hutuji_draw 返回的 G-code 下载地址。"
-            "设备下载、校验后逐行经 Telnet 转发给写字机。用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
+            "设备全量下载、CRC 校验、授权门通过后逐行经 Telnet 转发。进行中再调返回 busy。"
+            "用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
             PropertyList({
                 Property("url", kPropertyTypeString)
             }), [](const PropertyList& properties) -> ReturnValue {
                 const std::string& url = properties["url"].value<std::string>();
-                if (url.empty()) {
-                    throw std::runtime_error("url 不能为空");
-                }
-                // TODO(M2): xTaskCreate 独立任务：Board::GetNetwork()->CreateHttp()
-                // 流式下载 G-code，逐行 hutuji::Pipe::SendLine() + WaitOk() 转发；
-                // 耗时操作禁止在 MCP 回调（主任务）内阻塞。
-                ESP_LOGI(TAG, "hutuji.draw 占位实现, url=%s", url.c_str());
-                return "started";
+                return hutuji::Job::GetInstance().StartDraw(url);
             });
 
         mcp_server.AddTool("hutuji.abort",
             "中止当前绘图转发。用户说停下/取消时用。"
             "若正在换纸，可能无法立刻停，完成后才会停——须如实告诉用户。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
-                // TODO(M2): 通知 M2 的下载/转发任务停止，并向写字机发复位/进给保持
-                return "ok";
+                return hutuji::Job::GetInstance().RequestAbort();
             });
     }
 
