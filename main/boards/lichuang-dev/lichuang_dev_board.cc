@@ -12,6 +12,8 @@
 #include "hutuji_pipe.h"
 #include "hutuji_job.h"
 
+// #define HUTUJI_AUTO_TEST_DRAW
+
 #include <cJSON.h>
 #include <esp_log.h>
 #include <stdexcept>
@@ -303,6 +305,24 @@ private:
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().RequestAbort();
             });
+
+#ifdef HUTUJI_AUTO_TEST_DRAW
+        xTaskCreate([](void*) {
+            auto& pipe = hutuji::Pipe::GetInstance();
+            for (int i = 0; i < 60; ++i) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (pipe.IsConnected() && pipe.IsReady()) break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            if (pipe.IsConnected() && pipe.IsReady()) {
+                ESP_LOGW("AutoTest", "触发自动测试绘图");
+                auto result = hutuji::Job::GetInstance().StartDraw(
+                    "http://117.72.118.95/files/draw_20260727_020557_SEZl2yhc19ANAqpK89F2Mw.gcode");
+                ESP_LOGW("AutoTest", "StartDraw 返回: %s", result.c_str());
+            }
+            vTaskDelete(nullptr);
+        }, "auto_test", 4096, nullptr, 3, nullptr);
+#endif
     }
 
 public:

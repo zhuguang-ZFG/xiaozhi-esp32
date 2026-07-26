@@ -5,16 +5,18 @@
 
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <nvs_flash.h>
 
 #include "lwip/sockets.h"
-#include "lwip/netdb.h"
 
 #define TAG "HutujiPipe"
 
-// 写字机发现：优先 mDNS，回退同子网扫描 Telnet:23
-#define HUTUJI_PIPE_MDNS_HOST "grblesp.local"
 #define HUTUJI_PIPE_PORT 23
 #define HUTUJI_PIPE_SCAN_TIMEOUT_MS 50
+#define HUTUJI_PIPE_CACHED_TIMEOUT_MS 2000
+
+#define HUTUJI_NVS_NS "hutuji_pipe"
+#define HUTUJI_NVS_KEY_IP "grbl_ip"
 
 namespace hutuji {
 
@@ -29,6 +31,25 @@ constexpr uint32_t kBackoffMaxMs = 30000;
 constexpr int kKeepIdleSec = 10;
 constexpr int kKeepIntvlSec = 3;
 constexpr int kKeepCnt = 3;
+
+uint32_t LoadCachedIp() {
+    nvs_handle_t h;
+    uint32_t ip = 0;
+    if (nvs_open(HUTUJI_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u32(h, HUTUJI_NVS_KEY_IP, &ip);
+        nvs_close(h);
+    }
+    return ip;
+}
+
+void SaveCachedIp(uint32_t ip) {
+    nvs_handle_t h;
+    if (nvs_open(HUTUJI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u32(h, HUTUJI_NVS_KEY_IP, ip);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
 } // namespace
 
 Pipe& Pipe::GetInstance() {
@@ -47,7 +68,7 @@ void Pipe::Start() {
     BaseType_t ok = xTaskCreate(PipeTaskEntry, "hutuji_tcp", 4096, this, 10, &pipe_task_);
     configASSERT(ok == pdTRUE);
 
-    ESP_LOGI(TAG, "hutuji Telnet 哑管道已启动（目标 %s:%d）", HUTUJI_PIPE_MDNS_HOST, HUTUJI_PIPE_PORT);
+    ESP_LOGI(TAG, "hutuji Telnet 哑管道已启动（端口 %d）", HUTUJI_PIPE_PORT);
 }
 
 void Pipe::PipeTaskEntry(void* arg) {
@@ -55,7 +76,6 @@ void Pipe::PipeTaskEntry(void* arg) {
 }
 
 void Pipe::PipeTask() {
-    // 等 lwip 协议栈就绪（WiFi 初始化在 InitializeTools 之后）
     while (esp_netif_get_nr_of_ifs() == 0) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -64,8 +84,7 @@ void Pipe::PipeTask() {
     uint32_t backoff_ms = kBackoffInitMs;
     while (true) {
         if (!ConnectOnce()) {
-            ESP_LOGW(TAG, "连接 %s:%d 失败，%ums 后重试", HUTUJI_PIPE_MDNS_HOST, HUTUJI_PIPE_PORT,
-                     (unsigned)backoff_ms);
+            ESP_LOGW(TAG, "连接写字机失败，%ums 后重试", (unsigned)backoff_ms);
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             backoff_ms = (backoff_ms * 2 > kBackoffMaxMs) ? kBackoffMaxMs : backoff_ms * 2;
             continue;
@@ -103,24 +122,48 @@ void Pipe::PipeTask() {
     }
 }
 
-bool Pipe::TryConnect(uint32_t ip_addr) {
+bool Pipe::TryConnect(uint32_t ip_addr, int timeout_ms) {
     int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s < 0) return false;
 
-    struct timeval tv = { .tv_sec = 0, .tv_usec = HUTUJI_PIPE_SCAN_TIMEOUT_MS * 1000 };
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int old_flags = lwip_fcntl(s, F_GETFL, 0);
+    lwip_fcntl(s, F_SETFL, old_flags | O_NONBLOCK);
 
     struct sockaddr_in dest = {};
     dest.sin_family = AF_INET;
     dest.sin_port = htons(HUTUJI_PIPE_PORT);
     dest.sin_addr.s_addr = ip_addr;
 
-    if (connect(s, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest)) != 0) {
+    int ret = connect(s, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+    int conn_errno = errno;
+
+    if (ret == 0) {
+        // 立即成功（极少见）
+    } else if (conn_errno == EINPROGRESS) {
+        fd_set wset;
+        FD_ZERO(&wset);
+        FD_SET(s, &wset);
+        struct timeval tv = { .tv_sec = timeout_ms / 1000,
+                              .tv_usec = (timeout_ms % 1000) * 1000 };
+        int sel = select(s + 1, nullptr, &wset, nullptr, &tv);
+        if (sel <= 0) {
+            close(s);
+            return false;
+        }
+        int so_err = 0;
+        socklen_t elen = sizeof(so_err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, &so_err, &elen);
+        if (so_err != 0) {
+            close(s);
+            return false;
+        }
+    } else {
         close(s);
         return false;
     }
-    // 连通后恢复默认超时
-    tv = { .tv_sec = 10, .tv_usec = 0 };
+
+    lwip_fcntl(s, F_SETFL, old_flags & ~O_NONBLOCK);
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     inet_ntoa_r(dest.sin_addr, resolved_ip_, sizeof(resolved_ip_));
@@ -129,55 +172,54 @@ bool Pipe::TryConnect(uint32_t ip_addr) {
 }
 
 bool Pipe::ConnectOnce() {
+    // 等 DHCP 拿到 IP 再尝试（避免 WiFi 连接前的无效重试）
+    esp_netif_ip_info_t ip_info = {};
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!netif || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK ||
+        ip_info.ip.addr == 0) {
+        return false;
+    }
+
     bool found = false;
+    uint32_t cached_ip = LoadCachedIp();
 
-    // 1) 尝试 mDNS 解析 grblesp.local
-    {
-        struct addrinfo hints = {};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        struct addrinfo* res = nullptr;
-        char port_str[8];
-        snprintf(port_str, sizeof(port_str), "%d", HUTUJI_PIPE_PORT);
-
-        int err = getaddrinfo(HUTUJI_PIPE_MDNS_HOST, port_str, &hints, &res);
-        if (err == 0 && res != nullptr) {
-            auto* addr_in = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
-            uint32_t ip = addr_in->sin_addr.s_addr;
-            freeaddrinfo(res);
-            std::lock_guard<std::mutex> lock(sock_mutex_);
-            if (TryConnect(ip)) {
-                ESP_LOGI(TAG, "mDNS 发现写字机 %s", resolved_ip_);
-                found = true;
-            }
-        } else {
-            if (res) freeaddrinfo(res);
+    // 0) NVS 缓存（上次发现的写字机，2s 超时容忍短暂不可达）
+    if (cached_ip != 0) {
+        std::lock_guard<std::mutex> lock(sock_mutex_);
+        if (TryConnect(cached_ip, HUTUJI_PIPE_CACHED_TIMEOUT_MS)) {
+            ESP_LOGI(TAG, "缓存 IP 命中: %s", resolved_ip_);
+            found = true;
         }
     }
 
-    // 2) mDNS 失败：扫描同子网 Telnet:23（.1 ~ .254，跳过自身）
+    // 1) 子网扫描 Telnet:23（.1 ~ .254，50ms/地址）
     if (!found) {
-        esp_netif_ip_info_t ip_info = {};
-        esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK &&
-            ip_info.ip.addr != 0) {
-            uint32_t base = ip_info.ip.addr & ip_info.netmask.addr;
-            uint32_t self = ip_info.ip.addr;
-            ESP_LOGI(TAG, "扫描子网寻找写字机 Telnet:23...");
-            std::lock_guard<std::mutex> lock(sock_mutex_);
-            for (int host = 1; host < 255; ++host) {
-                uint32_t target = base | htonl(host);
-                if (target == self) continue;
-                if (TryConnect(target)) {
-                    ESP_LOGI(TAG, "子网扫描发现写字机 %s", resolved_ip_);
-                    found = true;
-                    break;
-                }
+        uint32_t base = ip_info.ip.addr & ip_info.netmask.addr;
+        uint32_t self = ip_info.ip.addr;
+        ESP_LOGI(TAG, "扫描子网寻找写字机 Telnet:23...");
+        std::lock_guard<std::mutex> lock(sock_mutex_);
+        for (int host = 1; host < 255; ++host) {
+            uint32_t target = base | htonl(host);
+            if (target == self) continue;
+            if (target == cached_ip) continue;
+            if (TryConnect(target, HUTUJI_PIPE_SCAN_TIMEOUT_MS)) {
+                ESP_LOGI(TAG, "子网扫描发现写字机 %s", resolved_ip_);
+                found = true;
+                break;
             }
         }
     }
 
     if (!found) return false;
+
+    // 缓存 IP 到 NVS（下次启动秒连，IP 未变时不写）
+    struct sockaddr_in peer = {};
+    socklen_t plen = sizeof(peer);
+    if (getpeername(sock_, reinterpret_cast<struct sockaddr*>(&peer), &plen) == 0 &&
+        peer.sin_addr.s_addr != cached_ip) {
+        SaveCachedIp(peer.sin_addr.s_addr);
+        ESP_LOGI(TAG, "写字机 IP 已缓存到 NVS");
+    }
 
     // keepalive: 10s 空闲 + 3s×3 次探测 ≈ 19s 发现死连
     int keepalive = 1;

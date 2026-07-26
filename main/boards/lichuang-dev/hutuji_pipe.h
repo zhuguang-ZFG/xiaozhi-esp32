@@ -75,7 +75,7 @@ private:
     static void PipeTaskEntry(void* arg);
     void PipeTask();
     bool ConnectOnce();
-    bool TryConnect(uint32_t ip_addr);  // sock_mutex_ 已持有
+    bool TryConnect(uint32_t ip_addr, int timeout_ms);  // sock_mutex_ 已持有
     void CloseSocket();
     bool SendRawLocked(const char* data, size_t len);  // 调用方已持 write_mutex_
 

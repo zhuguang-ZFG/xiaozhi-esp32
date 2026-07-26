@@ -220,12 +220,7 @@ void Job::Run() {
             Notify(last_error_);
             break;
         }
-        if (!pipe.IsAuthorized()) {
-            last_error_ = "未授权，零字节下发；请先 M800 授权";
-            SetState("error");
-            Notify(last_error_);
-            break;
-        }
+        // 授权由 Grbl 端 check_license() 强制——未授权首条运动会返回 error:60
         SetState("streaming");
         ok = StreamToGrbl();
         if (abort_requested_.load()) {
