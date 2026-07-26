@@ -9,6 +9,10 @@
 #include <atomic>
 #include <memory>
 
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+class GrobotEyes;
+#endif
+
 #define PREVIEW_IMAGE_DURATION_MS 5000
 
 class LcdDisplay : public LvglDisplay {
@@ -32,6 +36,9 @@ protected:
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    std::unique_ptr<GrobotEyes> grobot_eyes_;
+#endif
 
     void InitializeLcdThemes();
     virtual bool Lock(int timeout_ms = 0) override;

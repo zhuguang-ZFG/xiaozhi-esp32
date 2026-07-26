@@ -16,6 +16,9 @@
 #include <vector>
 
 #include "board.h"
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#include "boards/lichuang-dev/grobot_eyes.h"
+#endif
 
 #define TAG "LcdDisplay"
 
@@ -32,15 +35,15 @@ void LcdDisplay::InitializeLcdThemes() {
 
     // light theme
     auto light_theme = new LvglTheme("light");
-    light_theme->set_background_color(lv_color_hex(0xFFFFFF));
-    light_theme->set_text_color(lv_color_hex(0x000000));
-    light_theme->set_chat_background_color(lv_color_hex(0xE0E0E0));
-    light_theme->set_user_bubble_color(lv_color_hex(0x00FF00));
-    light_theme->set_assistant_bubble_color(lv_color_hex(0xDDDDDD));
-    light_theme->set_system_bubble_color(lv_color_hex(0xFFFFFF));
-    light_theme->set_system_text_color(lv_color_hex(0x000000));
-    light_theme->set_border_color(lv_color_hex(0x000000));
-    light_theme->set_low_battery_color(lv_color_hex(0x000000));
+    light_theme->set_background_color(lv_color_hex(0xF5F5F7));
+    light_theme->set_text_color(lv_color_hex(0x1D1D1F));
+    light_theme->set_chat_background_color(lv_color_hex(0xEBEBED));
+    light_theme->set_user_bubble_color(lv_color_hex(0x007AFF));
+    light_theme->set_assistant_bubble_color(lv_color_hex(0xE5E5EA));
+    light_theme->set_system_bubble_color(lv_color_hex(0xF5F5F7));
+    light_theme->set_system_text_color(lv_color_hex(0x636366));
+    light_theme->set_border_color(lv_color_hex(0xD1D1D6));
+    light_theme->set_low_battery_color(lv_color_hex(0xFF3B30));
     light_theme->set_text_font(text_font);
     light_theme->set_icon_font(icon_font);
     light_theme->set_large_icon_font(large_icon_font);
@@ -48,15 +51,15 @@ void LcdDisplay::InitializeLcdThemes() {
 
     // dark theme
     auto dark_theme = new LvglTheme("dark");
-    dark_theme->set_background_color(lv_color_hex(0x000000));
-    dark_theme->set_text_color(lv_color_hex(0xFFFFFF));
-    dark_theme->set_chat_background_color(lv_color_hex(0x1F1F1F));
-    dark_theme->set_user_bubble_color(lv_color_hex(0x00FF00));
-    dark_theme->set_assistant_bubble_color(lv_color_hex(0x222222));
-    dark_theme->set_system_bubble_color(lv_color_hex(0x000000));
-    dark_theme->set_system_text_color(lv_color_hex(0xFFFFFF));
-    dark_theme->set_border_color(lv_color_hex(0xFFFFFF));
-    dark_theme->set_low_battery_color(lv_color_hex(0xFF0000));
+    dark_theme->set_background_color(lv_color_hex(0x1A1A2E));
+    dark_theme->set_text_color(lv_color_hex(0xE0E0E0));
+    dark_theme->set_chat_background_color(lv_color_hex(0x16213E));
+    dark_theme->set_user_bubble_color(lv_color_hex(0x0F3460));
+    dark_theme->set_assistant_bubble_color(lv_color_hex(0x252A34));
+    dark_theme->set_system_bubble_color(lv_color_hex(0x1A1A2E));
+    dark_theme->set_system_text_color(lv_color_hex(0x8E8E93));
+    dark_theme->set_border_color(lv_color_hex(0x3A3A5C));
+    dark_theme->set_low_battery_color(lv_color_hex(0xE94560));
     dark_theme->set_text_font(text_font);
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
@@ -78,7 +81,12 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
 
     // Load theme from settings
     Settings settings("display", false);
-    std::string theme_name = settings.GetString("theme", "light");
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    std::string theme_name = "dark";
+    settings.SetString("theme", "dark");
+#else
+    std::string theme_name = settings.GetString("theme", "dark");
+#endif
     current_theme_ = LvglThemeManager::GetInstance().GetTheme(theme_name);
 
     // Create a timer to hide the preview image
@@ -500,7 +508,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_center(emoji_label_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_ROBOT_2);
+    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_EDIT_SQUARE);
 }
 #if CONFIG_IDF_TARGET_ESP32P4
 #define MAX_MESSAGES 40
@@ -858,11 +866,22 @@ void LcdDisplay::SetupUI() {
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_ROBOT_2);
+    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_EDIT_SQUARE);
 
     emoji_image_ = lv_img_create(emoji_box_);
     lv_obj_center(emoji_image_);
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    {
+        auto eye_c = lv_color_make(0x00, 0xD4, 0xFF);
+        grobot_eyes_ = std::make_unique<GrobotEyes>(eye_c, lvgl_theme->background_color());
+        lv_obj_set_size(emoji_box_, 280, 140);
+        grobot_eyes_->Init(emoji_box_, 280, 140);
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+#endif
 
     /* Middle layer: preview_image_ - centered display */
     preview_image_ = lv_image_create(screen);
@@ -1102,6 +1121,13 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
                  emotion);
     }
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    if (grobot_eyes_) {
+        DisplayLockGuard lock(this);
+        grobot_eyes_->SetEmotion(emotion);
+        return;
+    }
+#endif
     if (emoji_image_ == nullptr) {
         if (setup_ui_called_) {
             ESP_LOGW(TAG,
@@ -1116,8 +1142,12 @@ void LcdDisplay::SetEmotion(const char* emotion) {
     auto image = emoji_collection != nullptr ? emoji_collection->GetEmojiImage(emotion) : nullptr;
     if (image == nullptr) {
         auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
-        const char* utf8 = noto_emoji_get_utf8(emotion);
-        const lv_font_t* emotion_font = lvgl_theme->emoji_font()->font();
+        const char* utf8 = nullptr;
+        const lv_font_t* emotion_font = lvgl_theme->large_icon_font()->font();
+        if (emoji_collection != nullptr) {
+            utf8 = noto_emoji_get_utf8(emotion);
+            emotion_font = lvgl_theme->emoji_font()->font();
+        }
         if (utf8 == nullptr) {
             utf8 = material_symbols_get_utf8(emotion);
             emotion_font = lvgl_theme->large_icon_font()->font();

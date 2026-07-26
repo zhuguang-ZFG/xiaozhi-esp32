@@ -109,6 +109,15 @@ std::string Job::StartDraw(const std::string& url) {
     if (busy_.exchange(true)) {
         return "busy";
     }
+    auto& pipe = Pipe::GetInstance();
+    if (!pipe.IsConnected()) {
+        busy_.store(false);
+        return "{\"error\":\"写字机 Telnet 未连接\"}";
+    }
+    if (!pipe.IsReady()) {
+        busy_.store(false);
+        return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
+    }
     abort_requested_.store(false);
     paper_active_.store(false);
     url_ = url;
