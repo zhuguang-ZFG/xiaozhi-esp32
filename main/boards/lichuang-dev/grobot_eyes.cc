@@ -73,7 +73,7 @@ void GrobotEyes::Blink() {
         targetL_.topH = baseL_.topH; targetR_.topH = baseR_.topH;
         last_blink_us_ = esp_timer_get_time();
         blink_dur_ms_ = 200 + (esp_random() % 200);
-        blink_interval_ms_ = 4000 + (esp_random() % 11000);
+        blink_interval_ms_ = 2000 + (esp_random() % 4000);
     }
 }
 

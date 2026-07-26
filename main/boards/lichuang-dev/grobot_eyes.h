@@ -57,7 +57,7 @@ private:
 
     int64_t last_frame_us_ = 0;
     int64_t last_blink_us_ = 0;
-    int blink_interval_ms_ = 5000;
+    int blink_interval_ms_ = 3000;
     int blink_dur_ms_ = 250;
     float dt_ = 0;
     int frame_ = 0;
