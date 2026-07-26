@@ -15,7 +15,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
-#include <stdexcept>
+
 
 #define TAG "HutujiJob"
 
@@ -103,7 +103,7 @@ bool Job::LooksLikeMotionLine(const std::string& line) {
 
 std::string Job::StartDraw(const std::string& url) {
     if (url.empty()) {
-        throw std::runtime_error("url 不能为空");
+        return "{\"error\":\"url 不能为空\"}";
     }
     if (busy_.exchange(true)) {
         return "busy";
@@ -118,7 +118,7 @@ std::string Job::StartDraw(const std::string& url) {
     if (ok != pdTRUE) {
         busy_.store(false);
         SetState("idle");
-        throw std::runtime_error("无法创建出图任务");
+        return "{\"error\":\"无法创建出图任务\"}";
     }
     return "started";
 }
@@ -229,11 +229,11 @@ void Job::Run() {
 
     ReleaseBuffer();
     paper_active_.store(false);
-    busy_.store(false);
-    if (state_ == "aborted" || (busy_.load() == false && abort_requested_.load())) {
-        // state 可能已设
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        ESP_LOGI(TAG, "任务结束 state=%s err=%s", state_.c_str(), last_error_.c_str());
     }
-    ESP_LOGI(TAG, "任务结束 state=%s err=%s", state_.c_str(), last_error_.c_str());
+    busy_.store(false);
 }
 
 bool Job::DownloadToPsram(const std::string& url) {

@@ -2,6 +2,7 @@
 #define HUTUJI_JOB_H
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 
