@@ -12,7 +12,7 @@
 #define TAG "HutujiPipe"
 
 // ===== 联调配置：写字机 Grbl_Esp32 Telnet 地址（联调时改成实际固定 IP）=====
-#define HUTUJI_PIPE_HOST "192.168.1.50"
+#define HUTUJI_PIPE_HOST "192.168.1.13"
 #define HUTUJI_PIPE_PORT 23
 
 namespace hutuji {
