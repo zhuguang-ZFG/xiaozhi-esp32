@@ -60,7 +60,6 @@ private:
     int blink_interval_ms_ = 3000;
     int blink_dur_ms_ = 250;
     float dt_ = 0;
-    int frame_ = 0;
 
     static constexpr float kEyeRadius = 45.0f;
     static constexpr float kPupilRadius = 30.0f;

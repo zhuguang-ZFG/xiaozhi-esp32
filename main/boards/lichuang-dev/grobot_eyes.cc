@@ -36,6 +36,7 @@ GrobotEyes::GrobotEyes(lv_color_t eyeColor, lv_color_t bgColor)
 
 GrobotEyes::~GrobotEyes() {
     if (timer_) lv_timer_delete(timer_);
+    if (canvas_) lv_obj_delete(canvas_);
     if (draw_buf_) lv_draw_buf_destroy(draw_buf_);
 }
 
@@ -186,7 +187,6 @@ void GrobotEyes::DrawEye(int cx, int cy, int pR, int eyeR, int lidH,
 
 void GrobotEyes::Render() {
     UpdateDeltaTime();
-    frame_++;
     DrawBackground();
     Blink();
     float scale = (float)h_ / kBaseH;
