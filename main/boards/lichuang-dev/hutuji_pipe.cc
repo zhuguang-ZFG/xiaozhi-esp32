@@ -11,9 +11,10 @@
 
 #define TAG "HutujiPipe"
 
-// ===== 联调配置：写字机 Grbl_Esp32 Telnet 地址（联调时改成实际固定 IP）=====
-#define HUTUJI_PIPE_HOST "192.168.1.13"
+// 写字机发现：优先 mDNS，回退同子网扫描 Telnet:23
+#define HUTUJI_PIPE_MDNS_HOST "grblesp.local"
 #define HUTUJI_PIPE_PORT 23
+#define HUTUJI_PIPE_SCAN_TIMEOUT_MS 50
 
 namespace hutuji {
 
@@ -46,7 +47,7 @@ void Pipe::Start() {
     BaseType_t ok = xTaskCreate(PipeTaskEntry, "hutuji_tcp", 4096, this, 10, &pipe_task_);
     configASSERT(ok == pdTRUE);
 
-    ESP_LOGI(TAG, "hutuji Telnet 哑管道已启动（目标 %s:%d）", HUTUJI_PIPE_HOST, HUTUJI_PIPE_PORT);
+    ESP_LOGI(TAG, "hutuji Telnet 哑管道已启动（目标 %s:%d）", HUTUJI_PIPE_MDNS_HOST, HUTUJI_PIPE_PORT);
 }
 
 void Pipe::PipeTaskEntry(void* arg) {
@@ -63,7 +64,7 @@ void Pipe::PipeTask() {
     uint32_t backoff_ms = kBackoffInitMs;
     while (true) {
         if (!ConnectOnce()) {
-            ESP_LOGW(TAG, "连接 %s:%d 失败，%ums 后重试", HUTUJI_PIPE_HOST, HUTUJI_PIPE_PORT,
+            ESP_LOGW(TAG, "连接 %s:%d 失败，%ums 后重试", HUTUJI_PIPE_MDNS_HOST, HUTUJI_PIPE_PORT,
                      (unsigned)backoff_ms);
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             backoff_ms = (backoff_ms * 2 > kBackoffMaxMs) ? kBackoffMaxMs : backoff_ms * 2;
@@ -71,7 +72,7 @@ void Pipe::PipeTask() {
         }
         backoff_ms = kBackoffInitMs;
         connected_.store(true);
-        ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", HUTUJI_PIPE_HOST, HUTUJI_PIPE_PORT);
+        ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", resolved_ip_, HUTUJI_PIPE_PORT);
 
         {
             std::lock_guard<std::mutex> lock(write_mutex_);
@@ -102,34 +103,91 @@ void Pipe::PipeTask() {
     }
 }
 
-bool Pipe::ConnectOnce() {
+bool Pipe::TryConnect(uint32_t ip_addr) {
     int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s < 0) {
-        ESP_LOGE(TAG, "socket 创建失败: errno=%d (%s)", errno, strerror(errno));
-        return false;
-    }
+    if (s < 0) return false;
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = HUTUJI_PIPE_SCAN_TIMEOUT_MS * 1000 };
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     struct sockaddr_in dest = {};
     dest.sin_family = AF_INET;
     dest.sin_port = htons(HUTUJI_PIPE_PORT);
-    dest.sin_addr.s_addr = inet_addr(HUTUJI_PIPE_HOST);
+    dest.sin_addr.s_addr = ip_addr;
 
     if (connect(s, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest)) != 0) {
         close(s);
         return false;
     }
+    // 连通后恢复默认超时
+    tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    int keepalive = 1;
-    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-    int keep_idle = kKeepIdleSec;
-    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
-    int keep_intvl = kKeepIntvlSec;
-    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
-    int keep_cnt = kKeepCnt;
-    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
-
-    std::lock_guard<std::mutex> lock(sock_mutex_);
+    inet_ntoa_r(dest.sin_addr, resolved_ip_, sizeof(resolved_ip_));
     sock_ = s;
+    return true;
+}
+
+bool Pipe::ConnectOnce() {
+    bool found = false;
+
+    // 1) 尝试 mDNS 解析 grblesp.local
+    {
+        struct addrinfo hints = {};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo* res = nullptr;
+        char port_str[8];
+        snprintf(port_str, sizeof(port_str), "%d", HUTUJI_PIPE_PORT);
+
+        int err = getaddrinfo(HUTUJI_PIPE_MDNS_HOST, port_str, &hints, &res);
+        if (err == 0 && res != nullptr) {
+            auto* addr_in = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
+            uint32_t ip = addr_in->sin_addr.s_addr;
+            freeaddrinfo(res);
+            std::lock_guard<std::mutex> lock(sock_mutex_);
+            if (TryConnect(ip)) {
+                ESP_LOGI(TAG, "mDNS 发现写字机 %s", resolved_ip_);
+                found = true;
+            }
+        } else {
+            if (res) freeaddrinfo(res);
+        }
+    }
+
+    // 2) mDNS 失败：扫描同子网 Telnet:23（.1 ~ .254，跳过自身）
+    if (!found) {
+        esp_netif_ip_info_t ip_info = {};
+        esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK &&
+            ip_info.ip.addr != 0) {
+            uint32_t base = ip_info.ip.addr & ip_info.netmask.addr;
+            uint32_t self = ip_info.ip.addr;
+            ESP_LOGI(TAG, "扫描子网寻找写字机 Telnet:23...");
+            std::lock_guard<std::mutex> lock(sock_mutex_);
+            for (int host = 1; host < 255; ++host) {
+                uint32_t target = base | htonl(host);
+                if (target == self) continue;
+                if (TryConnect(target)) {
+                    ESP_LOGI(TAG, "子网扫描发现写字机 %s", resolved_ip_);
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!found) return false;
+
+    // keepalive: 10s 空闲 + 3s×3 次探测 ≈ 19s 发现死连
+    int keepalive = 1;
+    setsockopt(sock_, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    int keep_idle = kKeepIdleSec;
+    setsockopt(sock_, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+    int keep_intvl = kKeepIntvlSec;
+    setsockopt(sock_, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+    int keep_cnt = kKeepCnt;
+    setsockopt(sock_, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
     return true;
 }
 

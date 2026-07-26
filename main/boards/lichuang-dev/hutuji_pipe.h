@@ -75,6 +75,7 @@ private:
     static void PipeTaskEntry(void* arg);
     void PipeTask();
     bool ConnectOnce();
+    bool TryConnect(uint32_t ip_addr);  // sock_mutex_ 已持有
     void CloseSocket();
     bool SendRawLocked(const char* data, size_t len);  // 调用方已持 write_mutex_
 
@@ -101,6 +102,8 @@ private:
     std::string last_line_;
     std::string last_response_;
     int last_error_code_ = -1;
+
+    char resolved_ip_[16] = {};
 };
 
 } // namespace hutuji
