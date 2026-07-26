@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include <esp_log.h>
+#include <esp_netif.h>
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -53,6 +54,12 @@ void Pipe::PipeTaskEntry(void* arg) {
 }
 
 void Pipe::PipeTask() {
+    // 等 lwip 协议栈就绪（WiFi 初始化在 InitializeTools 之后）
+    while (esp_netif_get_nr_of_ifs() == 0) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    ESP_LOGI(TAG, "网络接口就绪，开始连接写字机");
+
     uint32_t backoff_ms = kBackoffInitMs;
     while (true) {
         if (!ConnectOnce()) {
