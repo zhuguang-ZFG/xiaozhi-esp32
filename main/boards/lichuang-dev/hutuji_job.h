@@ -44,6 +44,9 @@ private:
     static bool LooksLikePaperLine(const std::string& line);
     static bool LooksLikeMotionLine(const std::string& line);
 
+    void UpdateDisplayProgress();
+    size_t CountLines() const;
+
     std::string url_;
     uint8_t* buffer_ = nullptr;
     size_t buffer_len_ = 0;
@@ -57,6 +60,9 @@ private:
     std::atomic<bool> busy_{false};
     std::atomic<bool> abort_requested_{false};
     std::atomic<bool> paper_active_{false};
+
+    size_t lines_total_ = 0;
+    size_t lines_sent_ = 0;
 };
 
 } // namespace hutuji

@@ -4,6 +4,7 @@
 
 #include "application.h"
 #include "board.h"
+#include "display.h"
 #include "http.h"
 
 #include <cJSON.h>
@@ -186,6 +187,7 @@ void Job::Run() {
             break;
         }
         SetState("downloading");
+        if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("下载中...");
         if (!DownloadToPsram(url_)) {
             SetState("error");
             Notify(std::string("下载失败: ") + last_error_);
@@ -196,6 +198,7 @@ void Job::Run() {
             break;
         }
         SetState("verifying");
+        if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("校验中...");
         if (!VerifyCrc()) {
             SetState("error");
             Notify(std::string("校验失败: ") + last_error_);
@@ -218,12 +221,15 @@ void Job::Run() {
         ok = StreamToGrbl();
         if (abort_requested_.load()) {
             SetState("aborted");
+            if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("已取消");
         } else if (ok) {
             SetState("done");
             Notify("出图完成");
+            if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("画好啦！");
         } else {
             SetState("error");
             Notify(std::string("转发失败: ") + last_error_);
+            if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("出错了");
         }
     } while (false);
 
@@ -336,9 +342,40 @@ bool Job::VerifyCrc() {
     return true;
 }
 
+size_t Job::CountLines() const {
+    size_t count = 0;
+    size_t i = 0;
+    while (i < buffer_len_) {
+        size_t start = i;
+        while (i < buffer_len_ && buffer_[i] != '\n' && buffer_[i] != '\r') ++i;
+        if (i > start) ++count;
+        while (i < buffer_len_ && (buffer_[i] == '\n' || buffer_[i] == '\r')) ++i;
+    }
+    return count;
+}
+
+void Job::UpdateDisplayProgress() {
+    auto* display = Board::GetInstance().GetDisplay();
+    if (!display) return;
+
+    char buf[48];
+    if (paper_active_.load()) {
+        snprintf(buf, sizeof(buf), "换纸中... %zu/%zu", lines_sent_, lines_total_);
+    } else {
+        int pct = lines_total_ > 0
+            ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
+        snprintf(buf, sizeof(buf), "画画中 %d%%  (%zu/%zu)", pct, lines_sent_, lines_total_);
+    }
+    display->SetStatus(buf);
+}
+
 bool Job::StreamToGrbl() {
     auto& pipe = Pipe::GetInstance();
-    // 按行切分（保留在 PSRAM，不复制整份到 vector 字符串过多时可流式扫）
+
+    lines_total_ = CountLines();
+    lines_sent_ = 0;
+    UpdateDisplayProgress();
+
     size_t i = 0;
     while (i < buffer_len_) {
         if (abort_requested_.load()) {
@@ -374,6 +411,7 @@ bool Job::StreamToGrbl() {
             line.erase(0, b);
         }
         if (line.empty()) {
+            ++lines_sent_;
             continue;
         }
 
@@ -415,6 +453,7 @@ bool Job::StreamToGrbl() {
             }
 
             if (wr == WaitResult::Ok) {
+                ++lines_sent_;
                 if (paper_line) {
                     paper_active_.store(false);
                     SetState("streaming");
@@ -423,6 +462,7 @@ bool Job::StreamToGrbl() {
                         return false;
                     }
                 }
+                UpdateDisplayProgress();
                 break;
             }
             if (wr == WaitResult::Deferred) {
