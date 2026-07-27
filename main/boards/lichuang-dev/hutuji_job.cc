@@ -28,11 +28,18 @@ constexpr uint32_t kOkTimeoutMs = 60000;
 constexpr uint32_t kPaperOkTimeoutMs = 90000;
 constexpr uint32_t kMotionOkTimeoutMs = 30000;
 constexpr int kDeferredMaxRetries = 8;
+// 暂停上限：超过则自动放弃，避免 busy_ 被无限期占用导致所有工具返回 busy。
+constexpr uint32_t kMaxPauseMs = 10 * 60 * 1000;
 } // namespace
 
 Job& Job::GetInstance() {
     static Job instance;
     return instance;
+}
+
+void Job::SetStreamingOrPaused() {
+    // 暂停中不得把状态写成 streaming，否则 hutuji.status 会谎报正在画。
+    SetState(paused_.load() ? "paused" : "streaming");
 }
 
 void Job::SetState(const char* state) {
@@ -191,6 +198,10 @@ std::string Job::RequestPause() {
 std::string Job::RequestResume() {
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
+    }
+    // 与 RequestPause 对称：试笔期间两个工具给同一个解释。
+    if (pen_test_active_.load()) {
+        return "正在试笔，请稍候";
     }
     if (!paused_.exchange(false)) {
         return "本来就没暂停";
@@ -361,7 +372,9 @@ void Job::Run() {
             break;
         }
         // 授权由 Grbl 端 check_license() 强制——未授权首条运动会返回 error:60
-        SetState("streaming");
+        // 下载/校验期间就被暂停时，不能把状态改回 streaming——否则 status 谎报
+        // 正在画，实际转发循环一进去就卡在暂停门上。
+        SetStreamingOrPaused();
         ok = StreamToGrbl();
         if (abort_requested_.load()) {
             SetState("aborted");
@@ -523,6 +536,31 @@ void Job::UpdateDisplayProgress() {
     display->SetStatus(buf);
 }
 
+bool Job::WaitWhilePaused() {
+    if (!paused_.load()) {
+        return true;
+    }
+    auto& pipe = Pipe::GetInstance();
+    TickType_t began = xTaskGetTickCount();
+    while (paused_.load() && !abort_requested_.load()) {
+        if (!pipe.IsConnected() || !pipe.IsReady()) {
+            last_error_ = "暂停中链路丢失";
+            return false;
+        }
+        // 暂停不能无限期挂住 busy_，否则 draw/repeat/pen_test 全被顶成 busy，
+        // 用户只剩 abort 一条出路。超时按放弃处理，并如实告知云端。
+        if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(kMaxPauseMs)) {
+            paused_.store(false);
+            abort_requested_.store(true);
+            last_error_ = "暂停超时自动取消";
+            Notify("暂停超过 10 分钟，已自动取消这幅画；想画的话跟我说一声");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    return !abort_requested_.load();
+}
+
 bool Job::StreamToGrbl() {
     auto& pipe = Pipe::GetInstance();
 
@@ -539,12 +577,9 @@ bool Job::StreamToGrbl() {
         }
         // 暂停门：停在行边界，不切断已发出的行。Grbl 侧由 `!` 做进给保持，
         // 这里只是不再灌新行，避免暂停期间 planner 继续被填满。
-        while (paused_.load() && !abort_requested_.load()) {
-            if (!pipe.IsConnected() || !pipe.IsReady()) {
-                last_error_ = "暂停中链路丢失";
-                return false;
-            }
-            vTaskDelay(pdMS_TO_TICKS(200));
+        if (!WaitWhilePaused()) {
+            if (last_error_.empty()) last_error_ = "aborted";
+            return false;
         }
         if (abort_requested_.load()) {
             last_error_ = "aborted";
@@ -596,12 +631,9 @@ bool Job::StreamToGrbl() {
         int retries = 0;
         while (true) {
             // 行已经解析但尚未写入时也可能收到 pause；在这里等待而不是忙等重试。
-            while (paused_.load() && !abort_requested_.load()) {
-                if (!pipe.IsConnected() || !pipe.IsReady()) {
-                    last_error_ = "暂停中链路丢失";
-                    return false;
-                }
-                vTaskDelay(pdMS_TO_TICKS(200));
+            if (!WaitWhilePaused()) {
+                if (last_error_.empty()) last_error_ = "aborted";
+                return false;
             }
             if (abort_requested_.load() && !paper_active_.load()) {
                 last_error_ = "aborted";
@@ -628,12 +660,9 @@ bool Job::StreamToGrbl() {
             const uint32_t slice = 1000;
             while (waited < timeout) {
                 // 当前行已发送时也要冻结等待超时；否则暂停超过 timeout 会被误判为转发失败。
-                while (paused_.load() && !abort_requested_.load()) {
-                    if (!pipe.IsConnected() || !pipe.IsReady()) {
-                        last_error_ = "暂停中链路丢失";
-                        return false;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(200));
+                if (!WaitWhilePaused()) {
+                    if (last_error_.empty()) last_error_ = "aborted";
+                    return false;
                 }
                 if (abort_requested_.load() && !paper_active_.load()) {
                     last_error_ = "aborted";
@@ -655,7 +684,8 @@ bool Job::StreamToGrbl() {
                 ++lines_sent_;
                 if (paper_line) {
                     paper_active_.store(false);
-                    SetState("streaming");
+                    // 换纸期间用户可能已按暂停：别把 paused 覆盖成 streaming。
+                    SetState(paused_.load() ? "paused" : "streaming");
                     if (abort_requested_.load()) {
                         last_error_ = "aborted";
                         return false;

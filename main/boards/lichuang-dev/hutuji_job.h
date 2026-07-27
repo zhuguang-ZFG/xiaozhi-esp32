@@ -53,6 +53,8 @@ private:
     bool StreamToGrbl();
     void ReleaseBuffer();
     void SetState(const char* state);
+    /** 按 paused_ 真值写 streaming/paused，避免状态谎报。 */
+    void SetStreamingOrPaused();
     void Notify(const std::string& message);
 
     static uint32_t Crc32Ieee(const uint8_t* data, size_t len);
@@ -61,6 +63,12 @@ private:
 
     void UpdateDisplayProgress();
     size_t CountLines() const;
+
+    /**
+     * 暂停期间阻塞等待，直到恢复、abort、链路丢失或超过 kMaxPauseMs。
+     * @return true 可继续转发；false 应终止（原因已写入 last_error_）
+     */
+    bool WaitWhilePaused();
 
     std::string url_;
     uint8_t* buffer_ = nullptr;
