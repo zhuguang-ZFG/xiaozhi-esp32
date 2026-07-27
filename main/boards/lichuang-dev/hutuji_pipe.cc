@@ -1,12 +1,16 @@
 #include "hutuji_pipe.h"
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
+#include <cJSON.h>
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <nvs_flash.h>
 
+#include "application.h"
 #include "lwip/sockets.h"
 
 #define TAG "HutujiPipe"
@@ -31,6 +35,7 @@ constexpr uint32_t kBackoffMaxMs = 30000;
 constexpr int kKeepIdleSec = 10;
 constexpr int kKeepIntvlSec = 3;
 constexpr int kKeepCnt = 3;
+constexpr int kPollIntervalSec = 3;
 
 uint32_t LoadCachedIp() {
     nvs_handle_t h;
@@ -92,6 +97,7 @@ void Pipe::PipeTask() {
         backoff_ms = kBackoffInitMs;
         connected_.store(true);
         ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", resolved_ip_, HUTUJI_PIPE_PORT);
+        NotifyCloud(std::string("写字机已连接 (") + resolved_ip_ + ")");
 
         {
             std::lock_guard<std::mutex> lock(write_mutex_);
@@ -101,20 +107,28 @@ void Pipe::PipeTask() {
         uint8_t buf[256];
         while (true) {
             int len = recv(sock_, buf, sizeof(buf), 0);
-            if (len <= 0) {
-                if (len < 0) {
-                    ESP_LOGW(TAG, "recv 错误: errno=%d (%s)", errno, strerror(errno));
+            if (len > 0) {
+                OnRxData(buf, static_cast<size_t>(len));
+            } else if (len == 0) {
+                break;
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // recv 超时：发 ? 轮询 Grbl 状态
+                    std::lock_guard<std::mutex> wlock(write_mutex_);
+                    SendRawLocked("?", 1);
+                    continue;
                 }
+                ESP_LOGW(TAG, "recv 错误: errno=%d (%s)", errno, strerror(errno));
                 break;
             }
-            OnRxData(buf, static_cast<size_t>(len));
         }
 
         CloseSocket();
         connected_.store(false);
         ready_.store(false);
-        // 授权随会话：断连后需重新从应答推断
         authorized_.store(false);
+        grbl_state_.store(GrblState::Unknown);
+        NotifyCloud("写字机连接断开");
         rx_buffer_.clear();
         xEventGroupClearBits(response_events_, kResponseOkBit | kResponseErrorBit);
         ESP_LOGW(TAG, "写字机 Telnet 已断开，%ums 后重连", (unsigned)backoff_ms);
@@ -230,6 +244,10 @@ bool Pipe::ConnectOnce() {
     setsockopt(sock_, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
     int keep_cnt = kKeepCnt;
     setsockopt(sock_, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
+
+    // recv 超时驱动周期轮询：无数据 3s 后 recv 返回 EAGAIN，PipeTask 发 `?`
+    struct timeval recv_tv = { .tv_sec = kPollIntervalSec, .tv_usec = 0 };
+    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
     return true;
 }
 
@@ -313,6 +331,35 @@ void Pipe::ProcessLine(const std::string& line) {
     }
     ESP_LOGI(TAG, "<- %s", line.c_str());
 
+    // `?` 状态报告：<State|MPos:X,Y,Z|...>
+    if (!line.empty() && line.front() == '<' && line.back() == '>') {
+        ParseStatusReport(line);
+        return;
+    }
+
+    // ALARM:N 消息
+    if (line.rfind("ALARM:", 0) == 0) {
+        int code = std::atoi(line.c_str() + 6);
+        GrblState prev = grbl_state_.exchange(GrblState::Alarm);
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            alarm_code_ = code;
+        }
+        ESP_LOGW(TAG, "Grbl 报警: ALARM:%d", code);
+        if (prev != GrblState::Alarm) {
+            float ax, ay, az;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                ax = mpos_x_; ay = mpos_y_; az = mpos_z_;
+            }
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "写字机报警 ALARM:%d 位置 X=%.1f Y=%.1f Z=%.1f", code, ax, ay, az);
+            NotifyCloud(buf);
+        }
+        return;
+    }
+
     if (line.find("[License] Authorized") != std::string::npos) {
         authorized_.store(true);
     }
@@ -354,6 +401,106 @@ void Pipe::ProcessLine(const std::string& line) {
         }
         xEventGroupSetBits(response_events_, kResponseErrorBit);
         ESP_LOGW(TAG, "Grbl 应答错误: %s (code=%d)", line.c_str(), code);
+    }
+}
+
+void Pipe::ParseStatusReport(const std::string& line) {
+    // <State|MPos:X,Y,Z|Bf:N,N|FS:N,N|...>
+    std::string content = line.substr(1, line.size() - 2);
+
+    size_t pipe_pos = content.find('|');
+    std::string state_str = (pipe_pos != std::string::npos)
+        ? content.substr(0, pipe_pos) : content;
+
+    // Hold:0 / Alarm:1 等带子码
+    int sub_code = 0;
+    size_t colon = state_str.find(':');
+    if (colon != std::string::npos) {
+        sub_code = std::atoi(state_str.c_str() + colon + 1);
+        state_str = state_str.substr(0, colon);
+    }
+
+    GrblState gs = GrblState::Unknown;
+    if (state_str == "Idle")       gs = GrblState::Idle;
+    else if (state_str == "Run")   gs = GrblState::Run;
+    else if (state_str == "Hold")  gs = GrblState::Hold;
+    else if (state_str == "Jog")   gs = GrblState::Jog;
+    else if (state_str == "Alarm") gs = GrblState::Alarm;
+    else if (state_str == "Door")  gs = GrblState::Door;
+    else if (state_str == "Check") gs = GrblState::Check;
+    else if (state_str == "Home")  gs = GrblState::Home;
+    else if (state_str == "Sleep") gs = GrblState::Sleep;
+
+    GrblState prev = grbl_state_.exchange(gs);
+    if (prev != gs) {
+        ESP_LOGI(TAG, "Grbl 状态: %s -> %s", GrblStateName(prev), GrblStateName(gs));
+        float nx, ny, nz;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            nx = mpos_x_; ny = mpos_y_; nz = mpos_z_;
+        }
+        char buf[128];
+        if (gs == GrblState::Alarm) {
+            std::snprintf(buf, sizeof(buf),
+                "写字机报警 ALARM:%d 位置 X=%.1f Y=%.1f Z=%.1f", sub_code, nx, ny, nz);
+            NotifyCloud(buf);
+        } else if (prev == GrblState::Run && gs == GrblState::Idle) {
+            std::snprintf(buf, sizeof(buf),
+                "写字机运动完成 (Run→Idle) 停在 X=%.1f Y=%.1f", nx, ny);
+            NotifyCloud(buf);
+        } else if (gs == GrblState::Hold) {
+            std::snprintf(buf, sizeof(buf),
+                "写字机暂停 (Hold) 位置 X=%.1f Y=%.1f", nx, ny);
+            NotifyCloud(buf);
+        }
+    }
+
+    // MPos
+    size_t mpos = content.find("MPos:");
+    if (mpos != std::string::npos) {
+        float x = 0, y = 0, z = 0;
+        if (std::sscanf(content.c_str() + mpos, "MPos:%f,%f,%f", &x, &y, &z) == 3) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            mpos_x_ = x; mpos_y_ = y; mpos_z_ = z;
+        }
+    }
+
+    if (gs == GrblState::Alarm) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        alarm_code_ = sub_code;
+    }
+}
+
+const char* Pipe::GrblStateName(GrblState s) {
+    switch (s) {
+        case GrblState::Unknown: return "Unknown";
+        case GrblState::Idle:    return "Idle";
+        case GrblState::Run:     return "Run";
+        case GrblState::Hold:    return "Hold";
+        case GrblState::Jog:     return "Jog";
+        case GrblState::Alarm:   return "Alarm";
+        case GrblState::Door:    return "Door";
+        case GrblState::Check:   return "Check";
+        case GrblState::Home:    return "Home";
+        case GrblState::Sleep:   return "Sleep";
+        default:                 return "?";
+    }
+}
+
+void Pipe::NotifyCloud(const std::string& message) {
+    ESP_LOGI(TAG, "notify: %s", message.c_str());
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(root, "method", "notifications/message");
+    cJSON* params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "level", "info");
+    cJSON_AddStringToObject(params, "data", message.c_str());
+    cJSON_AddItemToObject(root, "params", params);
+    char* str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (str) {
+        Application::GetInstance().SendMcpMessage(str);
+        cJSON_free(str);
     }
 }
 

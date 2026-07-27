@@ -19,6 +19,20 @@ enum class WaitResult {
     Timeout,
 };
 
+/** Grbl 机器状态（由 `?` 状态报告或 ALARM 消息推断）。 */
+enum class GrblState {
+    Unknown = 0,
+    Idle,
+    Run,
+    Hold,
+    Jog,
+    Alarm,
+    Door,
+    Check,
+    Home,
+    Sleep,
+};
+
 /**
  * @brief hutuji 写字机哑管道（方案 E：WiFi Telnet TCP 客户端）
  *
@@ -55,6 +69,19 @@ public:
     bool IsReady() const { return ready_.load(); }
     bool IsAuthorized() const { return authorized_.load(); }
 
+    GrblState GetGrblState() const { return grbl_state_.load(); }
+    static const char* GrblStateName(GrblState s);
+
+    void GetMachinePos(float& x, float& y, float& z) const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        x = mpos_x_; y = mpos_y_; z = mpos_z_;
+    }
+
+    int GetAlarmCode() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return alarm_code_;
+    }
+
     std::string GetLastLine() const {
         std::lock_guard<std::mutex> lock(state_mutex_);
         return last_line_;
@@ -81,12 +108,15 @@ private:
 
     void OnRxData(const uint8_t* data, size_t data_len);
     void ProcessLine(const std::string& line);
+    void ParseStatusReport(const std::string& line);
+    void NotifyCloud(const std::string& message);
     static int ParseErrorCode(const std::string& line);
 
     std::atomic<bool> started_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> authorized_{false};
+    std::atomic<GrblState> grbl_state_{GrblState::Unknown};
 
     TaskHandle_t pipe_task_ = nullptr;
     EventGroupHandle_t response_events_ = nullptr;
@@ -102,6 +132,8 @@ private:
     std::string last_line_;
     std::string last_response_;
     int last_error_code_ = -1;
+    float mpos_x_ = 0, mpos_y_ = 0, mpos_z_ = 0;
+    int alarm_code_ = 0;
 
     char resolved_ip_[16] = {};
 };

@@ -306,6 +306,35 @@ private:
                 return hutuji::Job::GetInstance().RequestAbort();
             });
 
+        mcp_server.AddTool("hutuji.pause",
+            "暂停当前绘图（笔停在原地，进度不丢）。用户说「暂停/等一下/停一下」时用。"
+            "与 hutuji.abort 不同：pause 可以用 hutuji.resume 接着画，abort 是彻底放弃。"
+            "换纸中无法暂停，此时会如实返回提示。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestPause();
+            });
+
+        mcp_server.AddTool("hutuji.resume",
+            "恢复之前暂停的绘图，从暂停处接着画。用户说「继续/接着画」时用。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestResume();
+            });
+
+        mcp_server.AddTool("hutuji.repeat",
+            "把上一张画再画一遍（复用设备里存的 G-code，不用重新生成，也不用再问云端）。"
+            "用户说「再画一张/再来一个/一样的再画一次」时用。"
+            "注意：需要先换上白纸；没画过东西时会返回错误。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestRepeat();
+            });
+
+        mcp_server.AddTool("hutuji.pen_test",
+            "笔测试：落笔停 1 秒再抬笔，用来确认笔能不能碰到纸、有没有墨。"
+            "用户说「试一下笔/笔能用吗/怎么画不出来」时用。测完让用户看纸上有没有点。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestPenTest();
+            });
+
 #ifdef HUTUJI_AUTO_TEST_DRAW
         xTaskCreate([](void*) {
             auto& pipe = hutuji::Pipe::GetInstance();

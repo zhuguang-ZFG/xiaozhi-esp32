@@ -120,6 +120,10 @@ std::string Job::StartDraw(const std::string& url) {
     }
     abort_requested_.store(false);
     paper_active_.store(false);
+    paused_.store(false);
+    // 新任务：留存的旧 G-code 作废（Run 里 DownloadToPsram 会 ReleaseBuffer）
+    repeat_mode_.store(false);
+    buffer_replayable_.store(false);
     url_ = url;
     last_error_.clear();
     SetState("downloading");
@@ -158,11 +162,131 @@ std::string Job::RequestAbort() {
     return "ok";
 }
 
+std::string Job::RequestPause() {
+    if (!busy_.load()) {
+        return "{\"error\":\"当前没在出图\"}";
+    }
+    if (pen_test_active_.load()) {
+        return "正在试笔，请稍候";
+    }
+    if (paper_active_.load()) {
+        return "换纸中无法暂停，换纸完成后可再试";
+    }
+    // 与 SendLine 持同一把锁：`!` 发出后不能再有下一行进入 planner。
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    if (paused_.exchange(true)) {
+        return "已经是暂停状态";
+    }
+    // `!` 进给保持：Grbl 减速停住，planner 内容保留，`~` 可原地续跑。
+    // 发送失败时回滚本地状态，不能把断链说成已暂停。
+    if (!Pipe::GetInstance().SendRealtime('!')) {
+        paused_.store(false);
+        return "{\"error\":\"写字机 Telnet 已断开，无法暂停\"}";
+    }
+    SetState("paused");
+    if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("已暂停");
+    return "ok";
+}
+
+std::string Job::RequestResume() {
+    if (!busy_.load()) {
+        return "{\"error\":\"当前没在出图\"}";
+    }
+    if (!paused_.exchange(false)) {
+        return "本来就没暂停";
+    }
+    if (!Pipe::GetInstance().SendRealtime('~')) {
+        paused_.store(true);
+        return "{\"error\":\"写字机 Telnet 已断开，无法继续\"}";
+    }
+    SetState("streaming");
+    if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("继续画...");
+    return "ok";
+}
+
+std::string Job::RequestRepeat() {
+    if (busy_.exchange(true)) {
+        return "busy";
+    }
+    auto& pipe = Pipe::GetInstance();
+    if (!pipe.IsConnected()) {
+        busy_.store(false);
+        return "{\"error\":\"写字机 Telnet 未连接\"}";
+    }
+    if (!pipe.IsReady()) {
+        busy_.store(false);
+        return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
+    }
+    // 有留存 buffer 走快路（跳下载+CRC）；否则回落重新下载上次 url_
+    bool replay = buffer_replayable_.load() && buffer_ != nullptr && buffer_len_ > 0;
+    if (!replay && url_.empty()) {
+        busy_.store(false);
+        return "{\"error\":\"还没画过东西，没有可重画的内容\"}";
+    }
+    abort_requested_.store(false);
+    paused_.store(false);
+    paper_active_.store(false);
+    repeat_mode_.store(replay);
+    last_error_.clear();
+    SetState(replay ? "streaming" : "downloading");
+
+    BaseType_t ok = xTaskCreate(TaskEntry, "hutuji_draw", 8192, this, 5, nullptr);
+    if (ok != pdTRUE) {
+        busy_.store(false);
+        repeat_mode_.store(false);
+        SetState("idle");
+        return "{\"error\":\"无法创建出图任务\"}";
+    }
+    return replay ? "started" : "started_redownload";
+}
+
+std::string Job::RequestPenTest() {
+    // 试笔也必须独占 Telnet 写入，避免与新出图的首行或重画交错。
+    if (busy_.exchange(true)) {
+        return "busy";
+    }
+    auto& pipe = Pipe::GetInstance();
+    if (!pipe.IsConnected() || !pipe.IsReady()) {
+        busy_.store(false);
+        return "{\"error\":\"写字机未连接或未就绪\"}";
+    }
+    SetState("pen_test");
+    pen_test_active_.store(true);
+    // 不在 MCP 回调里 sleep：独立短任务做 M5 → M3 → 1s → M5
+    BaseType_t created = xTaskCreate(
+        [](void*) {
+            auto& p = Pipe::GetInstance();
+            auto& job = Job::GetInstance();
+            bool ok = false;
+            // 先抬笔建立确定的起点；随后一次明确的 M3 落笔必然可在纸上留下点迹。
+            if (p.SendLine("M5") && p.WaitOk(3000) &&
+                p.SendLine("M3 S1000") && p.WaitOk(3000)) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                ok = p.SendLine("M5") && p.WaitOk(3000);
+            }
+            job.Notify(ok ? "笔测试完成：已落笔停 1 秒再抬笔，请看纸上有没有点"
+                          : "笔测试失败：写字机没正常应答");
+            job.SetState(ok ? "done" : "error");
+            job.pen_test_active_.store(false);
+            job.busy_.store(false);
+            vTaskDelete(nullptr);
+        },
+        "hutuji_pentest", 3072, nullptr, 5, nullptr);
+    if (created != pdTRUE) {
+        pen_test_active_.store(false);
+        busy_.store(false);
+        SetState("idle");
+        return "{\"error\":\"无法创建试笔任务\"}";
+    }
+    return "started";
+}
+
 std::string Job::StatusJson() const {
     auto& pipe = Pipe::GetInstance();
-    // 出图中只发 ?；空闲可发探活类命令——此处仅 ?
-    if (busy_.load() && pipe.IsConnected()) {
+    // 发 ? 查最新状态，等 150ms 让 PipeTask 收到并解析响应
+    if (pipe.IsConnected()) {
         pipe.SendRealtime('?');
+        vTaskDelay(pdMS_TO_TICKS(150));
     }
 
     std::string state;
@@ -174,7 +298,17 @@ std::string Job::StatusJson() const {
     cJSON_AddBoolToObject(root, "connected", pipe.IsConnected());
     cJSON_AddBoolToObject(root, "ready", pipe.IsReady());
     cJSON_AddBoolToObject(root, "authorized", pipe.IsAuthorized());
+    cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());
     cJSON_AddStringToObject(root, "state", state.c_str());
+    cJSON_AddStringToObject(root, "grbl_state", Pipe::GrblStateName(pipe.GetGrblState()));
+    float mx, my, mz;
+    pipe.GetMachinePos(mx, my, mz);
+    cJSON_AddNumberToObject(root, "mpos_x", mx);
+    cJSON_AddNumberToObject(root, "mpos_y", my);
+    cJSON_AddNumberToObject(root, "mpos_z", mz);
+    if (pipe.GetGrblState() == GrblState::Alarm) {
+        cJSON_AddNumberToObject(root, "alarm_code", pipe.GetAlarmCode());
+    }
     cJSON_AddStringToObject(root, "last_line", pipe.GetLastLine().c_str());
     char* str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -195,23 +329,29 @@ void Job::Run() {
             SetState("aborted");
             break;
         }
-        SetState("downloading");
-        if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("下载中...");
-        if (!DownloadToPsram(url_)) {
-            SetState("error");
-            Notify(std::string("下载失败: ") + last_error_);
-            break;
-        }
-        if (abort_requested_.load()) {
-            SetState("aborted");
-            break;
-        }
-        SetState("verifying");
-        if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("校验中...");
-        if (!VerifyCrc()) {
-            SetState("error");
-            Notify(std::string("校验失败: ") + last_error_);
-            break;
+        // 重画：buffer_ 里已是上次校验通过的内容，跳过下载与 CRC
+        if (repeat_mode_.load()) {
+            if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("重画中...");
+            ESP_LOGI(TAG, "重画：复用 PSRAM %zu 字节，跳过下载/校验", buffer_len_);
+        } else {
+            SetState("downloading");
+            if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("下载中...");
+            if (!DownloadToPsram(url_)) {
+                SetState("error");
+                Notify(std::string("下载失败: ") + last_error_);
+                break;
+            }
+            if (abort_requested_.load()) {
+                SetState("aborted");
+                break;
+            }
+            SetState("verifying");
+            if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("校验中...");
+            if (!VerifyCrc()) {
+                SetState("error");
+                Notify(std::string("校验失败: ") + last_error_);
+                break;
+            }
         }
         auto& pipe = Pipe::GetInstance();
         if (!pipe.IsReady()) {
@@ -237,11 +377,21 @@ void Job::Run() {
         }
     } while (false);
 
-    ReleaseBuffer();
+    // 出图成功则留存 buffer_ 供 hutuji.repeat 复用（PSRAM 上限 512KB，只留一份）；
+    // 失败/中止时释放，避免重画一份画坏的内容。
+    if (ok && !abort_requested_.load() && buffer_ != nullptr) {
+        buffer_replayable_.store(true);
+    } else {
+        buffer_replayable_.store(false);
+        ReleaseBuffer();
+    }
     paper_active_.store(false);
+    paused_.store(false);
+    repeat_mode_.store(false);
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        ESP_LOGI(TAG, "任务结束 state=%s err=%s", state_.c_str(), last_error_.c_str());
+        ESP_LOGI(TAG, "任务结束 state=%s err=%s replayable=%d",
+                 state_.c_str(), last_error_.c_str(), (int)buffer_replayable_.load());
     }
     busy_.store(false);
 }
@@ -379,6 +529,7 @@ bool Job::StreamToGrbl() {
     lines_total_ = CountLines();
     lines_sent_ = 0;
     UpdateDisplayProgress();
+    TickType_t last_notify_tick = xTaskGetTickCount();
 
     size_t i = 0;
     while (i < buffer_len_) {
@@ -386,8 +537,25 @@ bool Job::StreamToGrbl() {
             last_error_ = "aborted";
             return false;
         }
+        // 暂停门：停在行边界，不切断已发出的行。Grbl 侧由 `!` 做进给保持，
+        // 这里只是不再灌新行，避免暂停期间 planner 继续被填满。
+        while (paused_.load() && !abort_requested_.load()) {
+            if (!pipe.IsConnected() || !pipe.IsReady()) {
+                last_error_ = "暂停中链路丢失";
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        if (abort_requested_.load()) {
+            last_error_ = "aborted";
+            return false;
+        }
         if (!pipe.IsConnected() || !pipe.IsReady()) {
             last_error_ = "转发中链路丢失";
+            return false;
+        }
+        if (pipe.GetGrblState() == GrblState::Alarm) {
+            last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
             return false;
         }
 
@@ -427,13 +595,28 @@ bool Job::StreamToGrbl() {
 
         int retries = 0;
         while (true) {
+            // 行已经解析但尚未写入时也可能收到 pause；在这里等待而不是忙等重试。
+            while (paused_.load() && !abort_requested_.load()) {
+                if (!pipe.IsConnected() || !pipe.IsReady()) {
+                    last_error_ = "暂停中链路丢失";
+                    return false;
+                }
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
             if (abort_requested_.load() && !paper_active_.load()) {
                 last_error_ = "aborted";
                 return false;
             }
-            if (!pipe.SendLine(line)) {
-                last_error_ = "SendLine 失败";
-                return false;
+            {
+                // 与 RequestPause() 同步：暂停命令发出后，本行不能再进入 planner。
+                std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+                if (paused_.load()) {
+                    continue;
+                }
+                if (!pipe.SendLine(line)) {
+                    last_error_ = "SendLine 失败";
+                    return false;
+                }
             }
 
             uint32_t timeout = paper_line ? kPaperOkTimeoutMs
@@ -444,8 +627,20 @@ bool Job::StreamToGrbl() {
             uint32_t waited = 0;
             const uint32_t slice = 1000;
             while (waited < timeout) {
+                // 当前行已发送时也要冻结等待超时；否则暂停超过 timeout 会被误判为转发失败。
+                while (paused_.load() && !abort_requested_.load()) {
+                    if (!pipe.IsConnected() || !pipe.IsReady()) {
+                        last_error_ = "暂停中链路丢失";
+                        return false;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                }
                 if (abort_requested_.load() && !paper_active_.load()) {
                     last_error_ = "aborted";
+                    return false;
+                }
+                if (pipe.GetGrblState() == GrblState::Alarm) {
+                    last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
                     return false;
                 }
                 uint32_t step = (timeout - waited > slice) ? slice : (timeout - waited);
@@ -467,6 +662,20 @@ bool Job::StreamToGrbl() {
                     }
                 }
                 UpdateDisplayProgress();
+                // 每 5s 向云端推送一次进度
+                TickType_t now = xTaskGetTickCount();
+                if ((now - last_notify_tick) >= pdMS_TO_TICKS(5000)) {
+                    last_notify_tick = now;
+                    float mx, my, mz;
+                    pipe.GetMachinePos(mx, my, mz);
+                    int pct = lines_total_ > 0
+                        ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
+                    char buf[128];
+                    snprintf(buf, sizeof(buf),
+                             "出图进度: %d%% (%zu/%zu行) 位置 X=%.1f Y=%.1f",
+                             pct, lines_sent_, lines_total_, mx, my);
+                    Notify(buf);
+                }
                 break;
             }
             if (wr == WaitResult::Deferred) {

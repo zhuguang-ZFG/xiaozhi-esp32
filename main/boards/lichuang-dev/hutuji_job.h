@@ -22,6 +22,21 @@ public:
     /** 分状态 abort（protocol §4.1）。 */
     std::string RequestAbort();
 
+    /** 暂停当前出图：发 `!` 进给保持，转发循环停在行边界。 */
+    std::string RequestPause();
+
+    /** 恢复暂停的出图：发 `~` 继续。 */
+    std::string RequestResume();
+
+    /**
+     * 重画上一张：复用 PSRAM 里留存的 G-code，跳过下载与 CRC。
+     * 无留存内容时回落到用上次 url_ 重新下载。
+     */
+    std::string RequestRepeat();
+
+    /** 笔测试：M3 落笔 → 停 1s → M5 抬笔，确认笔能触纸。 */
+    std::string RequestPenTest();
+
     /** status JSON：connected/ready/authorized/state/last_line */
     std::string StatusJson() const;
 
@@ -54,12 +69,21 @@ private:
     bool have_crc_ = false;
 
     mutable std::mutex state_mutex_;
+    // 协调 pause 与 SendLine：暂停字符发出后禁止再灌入新行。
+    std::mutex stream_mutex_;
     std::string state_{"idle"};
     std::string last_error_;
 
     std::atomic<bool> busy_{false};
     std::atomic<bool> abort_requested_{false};
     std::atomic<bool> paper_active_{false};
+    std::atomic<bool> paused_{false};
+    // 重画：跳过下载/校验，直接复用 buffer_
+    std::atomic<bool> repeat_mode_{false};
+    // buffer_ 是否留存着可重画的 G-code（出图成功后不释放）
+    std::atomic<bool> buffer_replayable_{false};
+    // 试笔期间不接受暂停/恢复，避免 M3/M5 被实时进给保持打断。
+    std::atomic<bool> pen_test_active_{false};
 
     size_t lines_total_ = 0;
     size_t lines_sent_ = 0;
