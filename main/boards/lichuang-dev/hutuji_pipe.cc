@@ -25,8 +25,9 @@
 namespace hutuji {
 
 namespace {
-constexpr EventBits_t kResponseOkBit = (1 << 0);
-constexpr EventBits_t kResponseErrorBit = (1 << 1);
+// 应答队列深度：窗口化流控（设计见 docs/design/p2-windowed-flow-control.md）下
+// 在途可达 ~21 行，队列须能缓冲一串连续到达的应答而不丢。取 32 留余量。
+constexpr UBaseType_t kRespQueueDepth = 32;
 
 constexpr size_t kRxLineMax = 512;
 constexpr uint32_t kBackoffInitMs = 1000;
@@ -36,6 +37,14 @@ constexpr int kKeepIdleSec = 10;
 constexpr int kKeepIntvlSec = 3;
 constexpr int kKeepCnt = 3;
 constexpr int kPollIntervalSec = 3;
+
+// 连续多少次 recv 超时（每次都发过 `?`）仍收不到任何字节，就判定链路已死。
+// TCP keepalive（10/3/3 ≈ 19s）只能发现「TCP 层断了」；若对端 TCP 栈活着而 Grbl
+// 主循环假死（不回 `?`、不回状态行），keepalive 不触发，原先的无条件 continue 会
+// 永远转圈。参考奎享同类兜底：Grbl WiFi 侧 1s 发 `?`、累计 20 拍收不到状态行即断链
+// （machine/grbl/a.java:382-404），串口侧两级静默 5s+5s（machine/b/b.java:20-28）。
+// 本机 kPollIntervalSec=3s，取 7 次 ≈ 21s，与 keepalive 的 19s 同量级互为补充。
+constexpr int kSilentPollLimit = 7;
 
 uint32_t LoadCachedIp() {
     nvs_handle_t h;
@@ -67,8 +76,10 @@ void Pipe::Start() {
         return;
     }
 
-    response_events_ = xEventGroupCreate();
-    configASSERT(response_events_);
+    // 应答队列取代原 EventGroup 单 bit：窗口化流控必须知道「收到了几个 ok」，
+    // EventGroup 会把连续到达的多个 ok 合并成一个 bit，在途计数会永久漂移。
+    resp_queue_ = xQueueCreate(kRespQueueDepth, sizeof(RespItem));
+    configASSERT(resp_queue_);
 
     BaseType_t ok = xTaskCreate(PipeTaskEntry, "hutuji_tcp", 4096, this, 10, &pipe_task_);
     configASSERT(ok == pdTRUE);
@@ -105,15 +116,26 @@ void Pipe::PipeTask() {
         }
 
         uint8_t buf[256];
+        // 连续「探活已发但一个字节都没回」的次数。任何数据到达即归零。
+        int silent_polls = 0;
         while (true) {
             int len = recv(sock_, buf, sizeof(buf), 0);
             if (len > 0) {
+                silent_polls = 0;
                 OnRxData(buf, static_cast<size_t>(len));
             } else if (len == 0) {
                 break;
             } else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // recv 超时：发 ? 轮询 Grbl 状态
+                    // recv 超时：发 ? 轮询 Grbl 状态。
+                    // TCP keepalive 只能发现「TCP 层死了」；若对端协议栈活着而 Grbl
+                    // 主循环假死（不回 `?`），keepalive 不触发，这里必须自己判死，
+                    // 否则本循环会永远转圈。参考奎享 grbl/a.java:382-404 的同类机制。
+                    if (++silent_polls >= kSilentPollLimit) {
+                        ESP_LOGW(TAG, "连续 %d 次探活无应答（约 %ds），判定链路假死",
+                                 silent_polls, silent_polls * kPollIntervalSec);
+                        break;
+                    }
                     std::lock_guard<std::mutex> wlock(write_mutex_);
                     SendRawLocked("?", 1);
                     continue;
@@ -130,7 +152,9 @@ void Pipe::PipeTask() {
         grbl_state_.store(GrblState::Unknown);
         NotifyCloud("写字机连接断开");
         rx_buffer_.clear();
-        xEventGroupClearBits(response_events_, kResponseOkBit | kResponseErrorBit);
+        // 断连必须清空应答队列：上次连接遗留的 ok 若留到下次，会被当成本次命令的
+        // 应答，窗口化流控下等于在途计数凭空少一格（最终死锁）。
+        DrainResponses();
         ESP_LOGW(TAG, "写字机 Telnet 已断开，%ums 后重连", (unsigned)backoff_ms);
         vTaskDelay(pdMS_TO_TICKS(backoff_ms));
     }
@@ -373,7 +397,8 @@ void Pipe::ProcessLine(const std::string& line) {
     if (line.rfind("Grbl ", 0) == 0) {
         ready_.store(false);
         authorized_.store(false);
-        xEventGroupClearBits(response_events_, kResponseOkBit | kResponseErrorBit);
+        // 对端软复位会丢弃其内部排队状态，我方遗留应答全部失效。
+        DrainResponses();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_response_.clear();
@@ -385,13 +410,15 @@ void Pipe::ProcessLine(const std::string& line) {
         return;
     }
 
+    // 只有 `ok` 与 `error:NN` 入应答队列。banner / `[VER:` / `<...>` 状态行
+    // 都在上面提前 return —— 对应官方 stream.py 的「非应答行不消耗窗口」（R3）。
     if (line == "ok") {
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_response_ = line;
             last_error_code_ = -1;
         }
-        xEventGroupSetBits(response_events_, kResponseOkBit);
+        PushResponse(WaitResult::Ok, -1);
     } else if (line.rfind("error", 0) == 0) {
         int code = ParseErrorCode(line);
         {
@@ -399,7 +426,8 @@ void Pipe::ProcessLine(const std::string& line) {
             last_response_ = line;
             last_error_code_ = code;
         }
-        xEventGroupSetBits(response_events_, kResponseErrorBit);
+        // error:8 = 换纸期运动行被推迟，该行已被丢弃需重发，与其它 error 区分。
+        PushResponse(code == 8 ? WaitResult::Deferred : WaitResult::Failed, code);
         ESP_LOGW(TAG, "Grbl 应答错误: %s (code=%d)", line.c_str(), code);
     }
 }
@@ -511,7 +539,12 @@ bool Pipe::SendLine(const std::string& line) {
     }
 
     std::lock_guard<std::mutex> lock(write_mutex_);
-    xEventGroupClearBits(response_events_, kResponseOkBit | kResponseErrorBit);
+    // 逐行模式：发新行前清掉残留应答，防止上一行超时后迟到的 ok 满足本行的等待。
+    // 窗口化模式必须关掉这个清空——那时队列里的应答是「在途」的合法凭据，
+    // 清掉会让在途计数永久漂移（设计文档 §4.1）。
+    if (drain_on_send_.load()) {
+        DrainResponses();
+    }
 
     std::string payload = line;
     payload.push_back('\n');
@@ -531,37 +564,60 @@ bool Pipe::SendRealtime(char ch) {
     return SendRawLocked(&ch, 1);
 }
 
-WaitResult Pipe::WaitResponse(uint32_t timeout_ms, std::string* response, int* error_code) {
-    if (response_events_ == nullptr) {
+void Pipe::PushResponse(WaitResult result, int error_code) {
+    // 队列满说明上游没有及时消费 —— 丢最老的，保留最新的。窗口化流控的在途计数
+    // 由 Job 侧的 c_line 独立维护，丢应答只会让窗口偏保守（少发），不会误发。
+    RespItem item{result, error_code};
+    if (xQueueSend(resp_queue_, &item, 0) != pdTRUE) {
+        RespItem dropped;
+        if (xQueueReceive(resp_queue_, &dropped, 0) == pdTRUE) {
+            ESP_LOGW(TAG, "应答队列满，丢弃最老应答 result=%d", (int)dropped.result);
+        }
+        xQueueSend(resp_queue_, &item, 0);
+    }
+}
+
+void Pipe::DrainResponses() {
+    RespItem item;
+    while (xQueueReceive(resp_queue_, &item, 0) == pdTRUE) {
+    }
+}
+
+WaitResult Pipe::TakeResponse(uint32_t timeout_ms, int* error_code) {
+    if (resp_queue_ == nullptr) {
         return WaitResult::Timeout;
     }
-    EventBits_t bits = xEventGroupWaitBits(response_events_,
-                                           kResponseOkBit | kResponseErrorBit, pdTRUE, pdFALSE,
-                                           pdMS_TO_TICKS(timeout_ms));
-
-    int code = -1;
+    RespItem item{};
+    if (xQueueReceive(resp_queue_, &item, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "等待 Grbl 应答超时 (%ums)", (unsigned)timeout_ms);
+        return WaitResult::Timeout;
+    }
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (response != nullptr) {
-            *response = last_response_;
+        // 还原成原来的行文本形态（`ok` / `error:NN`）。改队列后 last_response_ 不再是
+        // 接收泵直接赋的原文，这里按码重建，保持 WaitResponse(response=...) 的旧语义。
+        if (item.result == WaitResult::Ok) {
+            last_response_ = "ok";
+        } else if (item.error_code >= 0) {
+            last_response_ = "error:" + std::to_string(item.error_code);
+        } else {
+            last_response_ = "error";
         }
-        code = last_error_code_;
+        last_error_code_ = item.error_code;
     }
     if (error_code != nullptr) {
-        *error_code = code;
+        *error_code = item.error_code;
     }
+    return item.result;
+}
 
-    if (bits & kResponseOkBit) {
-        return WaitResult::Ok;
+WaitResult Pipe::WaitResponse(uint32_t timeout_ms, std::string* response, int* error_code) {
+    WaitResult wr = TakeResponse(timeout_ms, error_code);
+    if (response != nullptr) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        *response = last_response_;
     }
-    if (bits & kResponseErrorBit) {
-        if (code == 8) {
-            return WaitResult::Deferred;
-        }
-        return WaitResult::Failed;
-    }
-    ESP_LOGW(TAG, "等待 Grbl 应答超时 (%ums)", (unsigned)timeout_ms);
-    return WaitResult::Timeout;
+    return wr;
 }
 
 bool Pipe::WaitOk(uint32_t timeout_ms, std::string* response) {

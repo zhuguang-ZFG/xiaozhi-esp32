@@ -153,12 +153,15 @@ std::string Job::RequestAbort() {
         Notify("写字机正在换纸，无法即停；换纸完成后任务将停止");
         return "换纸中无法即停，完成后即停";
     }
-    // 不在 MCP 回调里 sleep：独立短任务发 ! → 8s → 0x18
+    // 不在 MCP 回调里 sleep：独立短任务发 ! → 抬笔 → 8s → 0x18
     xTaskCreate(
         [](void*) {
             auto& pipe = Pipe::GetInstance();
             auto& job = Job::GetInstance();
+            // 先发进给保持减速，再抬笔；0x18 软复位会丢坐标系且来不及执行排队行，
+            // 故必须在 0x18 之前把抬笔发出去，否则笔停在纸上。对齐奎享 f.java:74。
             pipe.SendRealtime('!');
+            pipe.SendLine("G1G90 Z0.0F10000");
             vTaskDelay(pdMS_TO_TICKS(8000));
             if (!job.IsPaperActive()) {
                 pipe.SendRealtime(static_cast<char>(0x18));
@@ -190,6 +193,11 @@ std::string Job::RequestPause() {
         paused_.store(false);
         return "{\"error\":\"写字机 Telnet 已断开，无法暂停\"}";
     }
+    // 抬笔防墨渗：`!` 后笔停在纸面，长暂停（kMaxPauseMs 允许 10 分钟）会渗墨。
+    // 对齐奎享（machine/f/f.java:63-68 暂停即注入抬笔）。用 Z 运动（M3/M5 宏在本机失效），
+    // 且非「吃 ok」——SendLine 走单写者锁、ok 由 StreamToGrbl 主循环消费；这里只发出，
+    // 不等 ok，避免暂停期间任务循环已被 paused_ 拦住时把 ok 留在队列里。
+    Pipe::GetInstance().SendLine("G1G90 Z0.0F10000");
     SetState("paused");
     if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("已暂停");
     return "ok";
@@ -210,6 +218,9 @@ std::string Job::RequestResume() {
         paused_.store(true);
         return "{\"error\":\"写字机 Telnet 已断开，无法继续\"}";
     }
+    // 落笔：与暂停时的抬笔配对。`~` 恢复进给后笔位未变，重新落笔恢复作画。
+    // 不等 ok（理由同 RequestPause：避免在恢复瞬间把 ok 留给被 paused_ 拦住的主循环）。
+    Pipe::GetInstance().SendLine("G1G90 Z5.0F10000");
     SetState("streaming");
     if (auto* d = Board::GetInstance().GetDisplay()) d->SetStatus("继续画...");
     return "ok";
@@ -509,18 +520,6 @@ bool Job::VerifyCrc() {
     return true;
 }
 
-size_t Job::CountLines() const {
-    size_t count = 0;
-    size_t i = 0;
-    while (i < buffer_len_) {
-        size_t start = i;
-        while (i < buffer_len_ && buffer_[i] != '\n' && buffer_[i] != '\r') ++i;
-        if (i > start) ++count;
-        while (i < buffer_len_ && (buffer_[i] == '\n' || buffer_[i] == '\r')) ++i;
-    }
-    return count;
-}
-
 void Job::UpdateDisplayProgress() {
     auto* display = Board::GetInstance().GetDisplay();
     if (!display) return;
@@ -561,16 +560,54 @@ bool Job::WaitWhilePaused() {
     return !abort_requested_.load();
 }
 
+std::vector<Job::LineSpan> Job::ParseLines() const {
+    std::vector<LineSpan> spans;
+    size_t i = 0;
+    while (i < buffer_len_) {
+        size_t start = i;
+        while (i < buffer_len_ && buffer_[i] != '\n' && buffer_[i] != '\r') {
+            ++i;
+        }
+        size_t end = i;  // [start, end) = 本行原始内容（不含换行）
+        while (i < buffer_len_ && (buffer_[i] == '\n' || buffer_[i] == '\r')) {
+            ++i;
+        }
+
+        // 以下三步与改造前 StreamToGrbl 的内联逻辑逐字等价，只是改为移动边界
+        // 而非拷贝字符串：① 剥 `;` 注释 ② 剥尾部空白 ③ 剥首部空白。
+        for (size_t k = start; k < end; ++k) {
+            if (buffer_[k] == ';') {
+                end = k;
+                break;
+            }
+        }
+        while (end > start && (buffer_[end - 1] == ' ' || buffer_[end - 1] == '\t')) {
+            --end;
+        }
+        while (start < end && (buffer_[start] == ' ' || buffer_[start] == '\t')) {
+            ++start;
+        }
+        if (start == end) {
+            continue;  // 空行/纯注释行不转发（改造前同样跳过，不计入 lines_total_）
+        }
+        spans.push_back(LineSpan{static_cast<uint32_t>(start),
+                                 static_cast<uint32_t>(end - start)});
+    }
+    return spans;
+}
+
 bool Job::StreamToGrbl() {
     auto& pipe = Pipe::GetInstance();
 
-    lines_total_ = CountLines();
+    // S2：先预解析成行索引，获得 peek 能力（窗口化流控前提）。
+    // 窗口仍 = 1（逐行等 ok），行为与改造前一致；打开窗口是 S3 的事。
+    const std::vector<LineSpan> spans = ParseLines();
+    lines_total_ = spans.size();
     lines_sent_ = 0;
     UpdateDisplayProgress();
     TickType_t last_notify_tick = xTaskGetTickCount();
 
-    size_t i = 0;
-    while (i < buffer_len_) {
+    for (size_t idx = 0; idx < spans.size(); ++idx) {
         if (abort_requested_.load()) {
             last_error_ = "aborted";
             return false;
@@ -594,33 +631,8 @@ bool Job::StreamToGrbl() {
             return false;
         }
 
-        size_t start = i;
-        while (i < buffer_len_ && buffer_[i] != '\n' && buffer_[i] != '\r') {
-            ++i;
-        }
-        std::string line(reinterpret_cast<char*>(buffer_ + start), i - start);
-        while (i < buffer_len_ && (buffer_[i] == '\n' || buffer_[i] == '\r')) {
-            ++i;
-        }
-        // 去注释与空行
-        auto hash = line.find(';');
-        if (hash != std::string::npos) {
-            line.erase(hash);
-        }
-        while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) {
-            line.pop_back();
-        }
-        size_t b = 0;
-        while (b < line.size() && (line[b] == ' ' || line[b] == '\t')) {
-            ++b;
-        }
-        if (b > 0) {
-            line.erase(0, b);
-        }
-        if (line.empty()) {
-            ++lines_sent_;
-            continue;
-        }
+        // 只为当前要发的这一行做一次拷贝；索引表本身零拷贝指向 buffer_。
+        const std::string line(LineAt(spans[idx]));
 
         bool paper_line = LooksLikePaperLine(line);
         if (paper_line) {

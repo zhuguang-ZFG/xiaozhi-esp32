@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace hutuji {
 
@@ -62,13 +64,37 @@ private:
     static bool LooksLikeMotionLine(const std::string& line);
 
     void UpdateDisplayProgress();
-    size_t CountLines() const;
 
     /**
      * 暂停期间阻塞等待，直到恢复、abort、链路丢失或超过 kMaxPauseMs。
      * @return true 可继续转发；false 应终止（原因已写入 last_error_）
      */
     bool WaitWhilePaused();
+
+    /**
+     * S2：一行在 buffer_ 里的位置（剥注释/首尾空白之后的内容 span）。
+     *
+     * 存 {offset,len} 而不是 std::string：512KB buffer 上限可含 ~24k 行，
+     * 每行一个堆 string 会产生 ~24k 次 30 字节小分配。本板
+     * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048 把 2048 字节以下的分配
+     * 强制放内部 RAM，而 ESP32-S3 内部 RAM 仅 ~512KB 且已被 WiFi/LVGL/音频
+     * 占去大半 —— 会 OOM。索引表最终约 ~192KB，其大块存储超过阈值后落 PSRAM。
+     */
+    struct LineSpan {
+        uint32_t offset;  // 相对 buffer_ 的字节偏移
+        uint32_t len;     // 行长度（不含换行/注释/首尾空白）
+    };
+
+    /**
+     * 把 buffer_ 预解析成行索引，供 StreamToGrbl 预取下一行长度
+     * （窗口化流控的 peek 前提）。解析规则与改造前内联逻辑逐字一致。
+     */
+    std::vector<LineSpan> ParseLines() const;
+
+    /** 取某行的文本视图（零拷贝，指向 buffer_）。 */
+    std::string_view LineAt(const LineSpan& s) const {
+        return std::string_view(reinterpret_cast<const char*>(buffer_) + s.offset, s.len);
+    }
 
     std::string url_;
     uint8_t* buffer_ = nullptr;

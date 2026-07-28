@@ -6,7 +6,7 @@
 #include <string>
 
 #include <freertos/FreeRTOS.h>
-#include <freertos/event_groups.h>
+#include <freertos/queue.h>
 #include <freertos/task.h>
 
 namespace hutuji {
@@ -65,6 +65,25 @@ public:
     /** 兼容旧调用：仅 Ok→true。 */
     bool WaitOk(uint32_t timeout_ms, std::string* response = nullptr);
 
+    /**
+     * 消费一条应答（窗口化流控用，S1）。
+     * 与 WaitResponse 的区别：语义是「这一条」的结果而非「有没有收到过」，
+     * 多个 ok 连续到达不会被合并。ok 与 error 都计数（Grbl 官方 stream.py R2）。
+     * @param error_code 非空且 Failed/Deferred 时写入 NN；Timeout/Ok 时为 -1
+     */
+    WaitResult TakeResponse(uint32_t timeout_ms, int* error_code = nullptr);
+
+    /**
+     * 窗口化流控开关（S1 设计文档 §4.1）。
+     * 逐行模式（默认）：SendLine 前清空残留应答，与现状行为一致。
+     * 窗口化模式：SendLine 不再清空——队列里的应答是「在途」的合法凭据。
+     * S2/S3 阶段由 Job 侧打开；S1 保持默认 false。
+     */
+    void SetWindowed(bool enabled) { drain_on_send_.store(!enabled); }
+
+    /** 丢弃队列内全部积压应答（连接重建 / 新任务开始时调用）。 */
+    void DrainResponses();
+
     bool IsConnected() const { return connected_.load(); }
     bool IsReady() const { return ready_.load(); }
     bool IsAuthorized() const { return authorized_.load(); }
@@ -119,7 +138,26 @@ private:
     std::atomic<GrblState> grbl_state_{GrblState::Unknown};
 
     TaskHandle_t pipe_task_ = nullptr;
-    EventGroupHandle_t response_events_ = nullptr;
+
+    /**
+     * 应答队列：每条 ok/error 入队一次，深度 kRespQueueDepth。
+     * 取代原 EventGroup 单 bit —— bit 只能表达「有没有」，多个 ok 连续到达
+     * 会被合并成一个，窗口化流控的在途计数会永久漂移最终死锁。
+     */
+    QueueHandle_t resp_queue_ = nullptr;
+
+    /** 逐行模式下 SendLine 前是否清残留应答（默认 true；窗口化模式置 false）。 */
+    std::atomic<bool> drain_on_send_{true};
+
+    /** 单条应答的载荷。 */
+    struct RespItem {
+        WaitResult result;
+        int error_code;
+    };
+
+    /** 入队一条应答（仅 ProcessLine 的 ok/error 分支调用）。队列满时丢最老。 */
+    void PushResponse(WaitResult result, int error_code);
+
 
     // 单写者：所有发送（行/实时）串行化
     std::mutex write_mutex_;
