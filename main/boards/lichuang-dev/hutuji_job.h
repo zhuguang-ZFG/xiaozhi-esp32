@@ -53,6 +53,9 @@ private:
     bool DownloadToPsram(const std::string& url);
     bool VerifyCrc();
     bool StreamToGrbl();
+    bool WaitForIdle(bool honor_abort, uint32_t timeout_ms);
+    bool ChangePaperAfterDraw();
+    bool RecoverDisconnectedDraw();
     void ReleaseBuffer();
     void SetState(const char* state);
     /** 按 paused_ 真值写 streaming/paused，避免状态谎报。 */
@@ -119,10 +122,13 @@ private:
     // 试笔期间不接受暂停/恢复，避免 M3/M5 被实时进给保持打断。
     std::atomic<bool> pen_test_active_{false};
 
+    bool stream_disconnected_ = false;
+    uint32_t stream_connection_seq_ = 0;
+
     size_t lines_total_ = 0;
     size_t lines_sent_ = 0;
 };
 
-} // namespace hutuji
+}  // namespace hutuji
 
-#endif // HUTUJI_JOB_H
+#endif  // HUTUJI_JOB_H

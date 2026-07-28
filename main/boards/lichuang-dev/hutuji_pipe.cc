@@ -5,9 +5,9 @@
 #include <cstdlib>
 #include <cstring>
 
-#include <cJSON.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <cJSON.h>
 #include <nvs_flash.h>
 
 #include "application.h"
@@ -46,6 +46,15 @@ constexpr int kPollIntervalSec = 3;
 // 本机 kPollIntervalSec=3s，取 7 次 ≈ 21s，与 keepalive 的 19s 同量级互为补充。
 constexpr int kSilentPollLimit = 7;
 
+// 连接后等对端 Telnet banner（"\r\nGrbl <ver> ...\r\n"）的最长时间。
+// Grbl_Esp32 在每个新 Telnet 连接上无条件发 report_init_message（TelnetServer.cpp:151，
+// ENABLE_TELNET_WELCOME_MSG 已开）。这条 banner 是「对端确实是写字机」的唯一被动指纹，
+// 用来堵「局域网里任意开着 :23 的主机（如路由器）被当成写字机缓存/顶替」的活锁。
+// 缓存命中与子网扫描共用此校验。非写字机的 :23 主机每台最多付一次此超时。
+constexpr int kVerifyTimeoutMs = 1500;
+constexpr char kGrblBanner[] = "Grbl ";
+constexpr uint8_t kCachedBusyRetriesBeforeScan = 5;
+
 uint32_t LoadCachedIp() {
     nvs_handle_t h;
     uint32_t ip = 0;
@@ -64,7 +73,7 @@ void SaveCachedIp(uint32_t ip) {
         nvs_close(h);
     }
 }
-} // namespace
+}  // namespace
 
 Pipe& Pipe::GetInstance() {
     static Pipe instance;
@@ -87,9 +96,7 @@ void Pipe::Start() {
     ESP_LOGI(TAG, "hutuji Telnet 哑管道已启动（端口 %d）", HUTUJI_PIPE_PORT);
 }
 
-void Pipe::PipeTaskEntry(void* arg) {
-    static_cast<Pipe*>(arg)->PipeTask();
-}
+void Pipe::PipeTaskEntry(void* arg) { static_cast<Pipe*>(arg)->PipeTask(); }
 
 void Pipe::PipeTask() {
     while (esp_netif_get_nr_of_ifs() == 0) {
@@ -106,14 +113,26 @@ void Pipe::PipeTask() {
             continue;
         }
         backoff_ms = kBackoffInitMs;
-        connected_.store(true);
-        ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", resolved_ip_, HUTUJI_PIPE_PORT);
-        NotifyCloud(std::string("写字机已连接 (") + resolved_ip_ + ")");
-
-        {
+        paper_changing_.store(PaperChangingState::Unknown);
+        ready_.store(false);
+        authorized_.store(false);
+        DrainResponses();
+        if (task_session_active_.load()) {
+            // 进行中的绘图刚经历断连。旧 planner 可能仍在运动，或 M30 换纸仍在
+            // 阻塞；此时 M5/G1 授权探针都会污染状态。先交给 Job 查询 Changing。
+            auth_probe_stage_ = AuthProbeStage::Idle;
+            ESP_LOGW(TAG, "绘图会话重连：暂停自动授权探测，等待断连分流");
+        } else {
+            auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
             std::lock_guard<std::mutex> lock(write_mutex_);
             SendRawLocked("$I\n", 3);
         }
+        // 队列和探测阶段全部初始化后才向 Job 发布新 session，避免任务刚看到
+        // connection_seq 变化就发 `[ESP901]`，随后又被这里的 DrainResponses 清掉。
+        connection_seq_.fetch_add(1);
+        connected_.store(true);
+        ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", resolved_ip_, HUTUJI_PIPE_PORT);
+        NotifyCloud(std::string("写字机已连接 (") + resolved_ip_ + ")");
 
         uint8_t buf[256];
         // 连续「探活已发但一个字节都没回」的次数。任何数据到达即归零。
@@ -127,13 +146,23 @@ void Pipe::PipeTask() {
                 break;
             } else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Changing=On 分流结束后，Job 会释放会话保护。由 Pipe 自己在
+                    // 接收任务内恢复标准探测，避免跨任务并发修改 auth_probe_stage_。
+                    if (!task_session_active_.load() && !ready_.load() &&
+                        auth_probe_stage_ == AuthProbeStage::Idle) {
+                        auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
+                        std::lock_guard<std::mutex> wlock(write_mutex_);
+                        SendRawLocked("$I\n", 3);
+                        silent_polls = 0;
+                        continue;
+                    }
                     // recv 超时：发 ? 轮询 Grbl 状态。
                     // TCP keepalive 只能发现「TCP 层死了」；若对端协议栈活着而 Grbl
                     // 主循环假死（不回 `?`），keepalive 不触发，这里必须自己判死，
                     // 否则本循环会永远转圈。参考奎享 grbl/a.java:382-404 的同类机制。
                     if (++silent_polls >= kSilentPollLimit) {
-                        ESP_LOGW(TAG, "连续 %d 次探活无应答（约 %ds），判定链路假死",
-                                 silent_polls, silent_polls * kPollIntervalSec);
+                        ESP_LOGW(TAG, "连续 %d 次探活无应答（约 %ds），判定链路假死", silent_polls,
+                                 silent_polls * kPollIntervalSec);
                         break;
                     }
                     std::lock_guard<std::mutex> wlock(write_mutex_);
@@ -149,6 +178,8 @@ void Pipe::PipeTask() {
         connected_.store(false);
         ready_.store(false);
         authorized_.store(false);
+        paper_changing_.store(PaperChangingState::Unknown);
+        auth_probe_stage_ = AuthProbeStage::Idle;
         grbl_state_.store(GrblState::Unknown);
         NotifyCloud("写字机连接断开");
         rx_buffer_.clear();
@@ -160,9 +191,52 @@ void Pipe::PipeTask() {
     }
 }
 
+Pipe::PeerCheck Pipe::VerifyGrblPeer(int sock, int timeout_ms) {
+    // 只读、不发任何字节：banner 由对端 Telnet accept 路径主动送出
+    // （report_init_message → TelnetServer.cpp:151，ENABLE_TELNET_WELCOME_MSG 已开），
+    // 不需要我们先发 `$I`（那要等 Grbl 主循环，换纸期会阻塞）。
+    // banner 字节在此被消费掉、不再送达主循环 —— 但主循环连上后会主动发 `$I`，
+    // 靠 `[VER:` 应答（ProcessLine :391）置 ready_，不依赖这条 banner。
+    // banner 尾部残段（如 " for help]"）落入主循环也不匹配任何分支，无害。
+    std::string probe;
+    int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
+
+    while (esp_timer_get_time() < deadline_us) {
+        int64_t left_us = deadline_us - esp_timer_get_time();
+        struct timeval tv = {.tv_sec = static_cast<time_t>(left_us / 1000000),
+                             .tv_usec = static_cast<suseconds_t>(left_us % 1000000)};
+        fd_set rset;
+        FD_ZERO(&rset);
+        FD_SET(sock, &rset);
+        if (select(sock + 1, &rset, nullptr, nullptr, &tv) <= 0) {
+            break;  // 超时或出错：连接仍开着但拿不到 banner
+        }
+
+        uint8_t buf[128];
+        int n = recv(sock, buf, sizeof(buf), 0);
+        if (n == 0) {
+            // Grbl MAX_TLNT_CLIENTS=1。旧半开连接占槽时，server 会 accept 后立即
+            // close 新连接；不能把它误判成「缓存 IP 被别的设备顶替」。
+            return probe.empty() ? PeerCheck::ClosedBeforeBanner : PeerCheck::Invalid;
+        }
+        if (n < 0) {
+            break;
+        }
+        probe.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
+        if (probe.find(kGrblBanner) != std::string::npos) {
+            return PeerCheck::Valid;
+        }
+        if (probe.size() > kRxLineMax) {
+            break;  // 一直在说话但不是 Grbl（例如某些设备的登录提示）
+        }
+    }
+    return PeerCheck::Invalid;
+}
+
 bool Pipe::TryConnect(uint32_t ip_addr, int timeout_ms) {
     int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s < 0) return false;
+    if (s < 0)
+        return false;
 
     int old_flags = lwip_fcntl(s, F_GETFL, 0);
     lwip_fcntl(s, F_SETFL, old_flags | O_NONBLOCK);
@@ -181,8 +255,7 @@ bool Pipe::TryConnect(uint32_t ip_addr, int timeout_ms) {
         fd_set wset;
         FD_ZERO(&wset);
         FD_SET(s, &wset);
-        struct timeval tv = { .tv_sec = timeout_ms / 1000,
-                              .tv_usec = (timeout_ms % 1000) * 1000 };
+        struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
         int sel = select(s + 1, nullptr, &wset, nullptr, &tv);
         if (sel <= 0) {
             close(s);
@@ -201,7 +274,7 @@ bool Pipe::TryConnect(uint32_t ip_addr, int timeout_ms) {
     }
 
     lwip_fcntl(s, F_SETFL, old_flags & ~O_NONBLOCK);
-    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     inet_ntoa_r(dest.sin_addr, resolved_ip_, sizeof(resolved_ip_));
@@ -213,24 +286,53 @@ bool Pipe::ConnectOnce() {
     // 等 DHCP 拿到 IP 再尝试（避免 WiFi 连接前的无效重试）
     esp_netif_ip_info_t ip_info = {};
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (!netif || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK ||
-        ip_info.ip.addr == 0) {
+    if (!netif || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
         return false;
     }
 
     bool found = false;
+    bool cached_suspect = false;    // 缓存 IP 连上了但验证不是写字机（可能被 DHCP 改号顶替）
+    bool cached_slot_busy = false;  // 旧半开 Telnet 连接仍占唯一槽位，不是缓存失真
     uint32_t cached_ip = LoadCachedIp();
 
     // 0) NVS 缓存（上次发现的写字机，2s 超时容忍短暂不可达）
     if (cached_ip != 0) {
         std::lock_guard<std::mutex> lock(sock_mutex_);
         if (TryConnect(cached_ip, HUTUJI_PIPE_CACHED_TIMEOUT_MS)) {
-            ESP_LOGI(TAG, "缓存 IP 命中: %s", resolved_ip_);
-            found = true;
+            // 缓存命中也要验明正身：若 DHCP 把该 IP 分给了别的设备（可能开 :23），
+            // 不能把它当写字机连上。真正无效才清缓存；槽位忙保留并重试。
+            PeerCheck check = VerifyGrblPeer(sock_, kVerifyTimeoutMs);
+            if (check == PeerCheck::Valid) {
+                ESP_LOGI(TAG, "缓存 IP 命中: %s", resolved_ip_);
+                cached_slot_busy_count_ = 0;
+                found = true;
+            } else if (check == PeerCheck::ClosedBeforeBanner) {
+                cached_slot_busy = true;
+                if (cached_slot_busy_count_ < kCachedBusyRetriesBeforeScan) {
+                    ++cached_slot_busy_count_;
+                }
+                ESP_LOGW(TAG, "缓存 IP %s 的 Telnet 槽位忙（%u/%u），保留缓存", resolved_ip_,
+                         static_cast<unsigned>(cached_slot_busy_count_),
+                         static_cast<unsigned>(kCachedBusyRetriesBeforeScan));
+                close(sock_);
+                sock_ = -1;
+            } else {
+                ESP_LOGW(TAG, "缓存 IP %s 验证失败（非写字机），清除缓存并回落扫描", resolved_ip_);
+                cached_suspect = true;
+                cached_slot_busy_count_ = 0;
+                close(sock_);
+                sock_ = -1;
+            }
         }
     }
 
-    // 1) 子网扫描 Telnet:23（.1 ~ .254，50ms/地址）
+    // 槽位忙通常来自 S3 刚重启、Grbl 尚未通过 keepalive 回收旧半开连接。
+    // 前几次只重试缓存，避免每次都付出整段 /24 扫描；多次仍忙才扫描旁路。
+    if (cached_slot_busy && cached_slot_busy_count_ < kCachedBusyRetriesBeforeScan) {
+        return false;
+    }
+
+    // 1) 子网扫描 Telnet:23（.1 ~ .254，50ms/地址 + 命中的逐台等 banner）
     if (!found) {
         uint32_t base = ip_info.ip.addr & ip_info.netmask.addr;
         uint32_t self = ip_info.ip.addr;
@@ -238,19 +340,42 @@ bool Pipe::ConnectOnce() {
         std::lock_guard<std::mutex> lock(sock_mutex_);
         for (int host = 1; host < 255; ++host) {
             uint32_t target = base | htonl(host);
-            if (target == self) continue;
-            if (target == cached_ip) continue;
+            if (target == self)
+                continue;
+            if (target == cached_ip)
+                continue;
             if (TryConnect(target, HUTUJI_PIPE_SCAN_TIMEOUT_MS)) {
-                ESP_LOGI(TAG, "子网扫描发现写字机 %s", resolved_ip_);
-                found = true;
-                break;
+                // 只认真写字机：banner 校验不过就关掉继续扫，
+                // 否则路由器/打印机等开 :23 的主机会被当成写字机顶替（A）。
+                if (VerifyGrblPeer(sock_, kVerifyTimeoutMs) == PeerCheck::Valid) {
+                    ESP_LOGI(TAG, "子网扫描发现写字机 %s", resolved_ip_);
+                    cached_slot_busy_count_ = 0;
+                    found = true;
+                    break;
+                }
+                close(sock_);
+                sock_ = -1;
             }
         }
     }
 
-    if (!found) return false;
+    if (!found) {
+        if (cached_suspect) {
+            // 本轮没找回写字机，把失真的缓存清掉，避免下轮再被它带偏。
+            ESP_LOGW(TAG, "清除失真缓存 IP，下轮重扫");
+            nvs_handle_t h;
+            if (nvs_open(HUTUJI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+                nvs_erase_key(h, HUTUJI_NVS_KEY_IP);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+        }
+        return false;
+    }
 
-    // 缓存 IP 到 NVS（下次启动秒连，IP 未变时不写）
+    // 缓存 IP 到 NVS（下次启动秒连）。到这里两条路径都已通过 VerifyGrblPeer，
+    // 只缓存确认是写字机的 IP（A）。IP 未变时不写；变了（含缓存失真后扫到新址、
+    // 或写字机被 DHCP 改号）才写。
     struct sockaddr_in peer = {};
     socklen_t plen = sizeof(peer);
     if (getpeername(sock_, reinterpret_cast<struct sockaddr*>(&peer), &plen) == 0 &&
@@ -270,7 +395,7 @@ bool Pipe::ConnectOnce() {
     setsockopt(sock_, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
 
     // recv 超时驱动周期轮询：无数据 3s 后 recv 返回 EAGAIN，PipeTask 发 `?`
-    struct timeval recv_tv = { .tv_sec = kPollIntervalSec, .tv_usec = 0 };
+    struct timeval recv_tv = {.tv_sec = kPollIntervalSec, .tv_usec = 0};
     setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
     return true;
 }
@@ -374,11 +499,13 @@ void Pipe::ProcessLine(const std::string& line) {
             float ax, ay, az;
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
-                ax = mpos_x_; ay = mpos_y_; az = mpos_z_;
+                ax = mpos_x_;
+                ay = mpos_y_;
+                az = mpos_z_;
             }
             char buf[128];
-            std::snprintf(buf, sizeof(buf),
-                "写字机报警 ALARM:%d 位置 X=%.1f Y=%.1f Z=%.1f", code, ax, ay, az);
+            std::snprintf(buf, sizeof(buf), "写字机报警 ALARM:%d 位置 X=%.1f Y=%.1f Z=%.1f", code,
+                          ax, ay, az);
             NotifyCloud(buf);
         }
         return;
@@ -388,15 +515,37 @@ void Pipe::ProcessLine(const std::string& line) {
         authorized_.store(true);
     }
 
+    if (line.find("Paper=") != std::string::npos && line.find("Changing=") != std::string::npos) {
+        if (line.find("Changing=On") != std::string::npos) {
+            paper_changing_.store(PaperChangingState::On);
+        } else if (line.find("Changing=Off") != std::string::npos) {
+            paper_changing_.store(PaperChangingState::Off);
+        } else {
+            paper_changing_.store(PaperChangingState::Unknown);
+        }
+        paper_status_seq_.fetch_add(1);
+        return;
+    }
+
     if (line.rfind("[VER:", 0) == 0) {
-        ready_.store(true);
-        ESP_LOGI(TAG, "Grbl 探活成功（%s）", line.c_str());
+        // `$I` 只证明对端版本；商业固件的授权日志走 CLIENT_SERIAL，Telnet 看不到。
+        // ready_ 要等后续零位移授权探测完成，避免 draw 在授权态未知时抢跑。
+        ESP_LOGI(TAG, "Grbl 版本探活成功（%s），等待授权探测", line.c_str());
         return;
     }
 
     if (line.rfind("Grbl ", 0) == 0) {
+        reset_banner_seq_.fetch_add(1);
         ready_.store(false);
         authorized_.store(false);
+        const bool recover_abort = abort_reset_pending_.exchange(false);
+        if (recover_abort) {
+            auth_probe_stage_ = AuthProbeStage::WaitingAbortUnlockOk;
+        } else if (task_session_active_.load()) {
+            auth_probe_stage_ = AuthProbeStage::Idle;
+        } else {
+            auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
+        }
         // 对端软复位会丢弃其内部排队状态，我方遗留应答全部失效。
         DrainResponses();
         {
@@ -406,13 +555,23 @@ void Pipe::ProcessLine(const std::string& line) {
         }
         ESP_LOGW(TAG, "检测到对端复位，重新探活");
         std::lock_guard<std::mutex> lock(write_mutex_);
-        SendRawLocked("$I\n", 3);
+        if (recover_abort) {
+            // 仅处理本机刚发出的 abort reset 所产生的锁定；其它 Alarm 不自动解锁。
+            SendRawLocked("$X\n", 3);
+        } else if (!task_session_active_.load()) {
+            SendRawLocked("$I\n", 3);
+        } else {
+            ESP_LOGW(TAG, "绘图会话内检测到 reset banner，等待任务层断连分流");
+        }
         return;
     }
 
     // 只有 `ok` 与 `error:NN` 入应答队列。banner / `[VER:` / `<...>` 状态行
     // 都在上面提前 return —— 对应官方 stream.py 的「非应答行不消耗窗口」（R3）。
     if (line == "ok") {
+        if (HandleAuthProbeResponse(WaitResult::Ok, -1)) {
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_response_ = line;
@@ -421,6 +580,9 @@ void Pipe::ProcessLine(const std::string& line) {
         PushResponse(WaitResult::Ok, -1);
     } else if (line.rfind("error", 0) == 0) {
         int code = ParseErrorCode(line);
+        if (HandleAuthProbeResponse(code == 8 ? WaitResult::Deferred : WaitResult::Failed, code)) {
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_response_ = line;
@@ -437,8 +599,7 @@ void Pipe::ParseStatusReport(const std::string& line) {
     std::string content = line.substr(1, line.size() - 2);
 
     size_t pipe_pos = content.find('|');
-    std::string state_str = (pipe_pos != std::string::npos)
-        ? content.substr(0, pipe_pos) : content;
+    std::string state_str = (pipe_pos != std::string::npos) ? content.substr(0, pipe_pos) : content;
 
     // Hold:0 / Alarm:1 等带子码
     int sub_code = 0;
@@ -449,15 +610,24 @@ void Pipe::ParseStatusReport(const std::string& line) {
     }
 
     GrblState gs = GrblState::Unknown;
-    if (state_str == "Idle")       gs = GrblState::Idle;
-    else if (state_str == "Run")   gs = GrblState::Run;
-    else if (state_str == "Hold")  gs = GrblState::Hold;
-    else if (state_str == "Jog")   gs = GrblState::Jog;
-    else if (state_str == "Alarm") gs = GrblState::Alarm;
-    else if (state_str == "Door")  gs = GrblState::Door;
-    else if (state_str == "Check") gs = GrblState::Check;
-    else if (state_str == "Home")  gs = GrblState::Home;
-    else if (state_str == "Sleep") gs = GrblState::Sleep;
+    if (state_str == "Idle")
+        gs = GrblState::Idle;
+    else if (state_str == "Run")
+        gs = GrblState::Run;
+    else if (state_str == "Hold")
+        gs = GrblState::Hold;
+    else if (state_str == "Jog")
+        gs = GrblState::Jog;
+    else if (state_str == "Alarm")
+        gs = GrblState::Alarm;
+    else if (state_str == "Door")
+        gs = GrblState::Door;
+    else if (state_str == "Check")
+        gs = GrblState::Check;
+    else if (state_str == "Home")
+        gs = GrblState::Home;
+    else if (state_str == "Sleep")
+        gs = GrblState::Sleep;
 
     GrblState prev = grbl_state_.exchange(gs);
     if (prev != gs) {
@@ -465,20 +635,20 @@ void Pipe::ParseStatusReport(const std::string& line) {
         float nx, ny, nz;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            nx = mpos_x_; ny = mpos_y_; nz = mpos_z_;
+            nx = mpos_x_;
+            ny = mpos_y_;
+            nz = mpos_z_;
         }
         char buf[128];
         if (gs == GrblState::Alarm) {
-            std::snprintf(buf, sizeof(buf),
-                "写字机报警 ALARM:%d 位置 X=%.1f Y=%.1f Z=%.1f", sub_code, nx, ny, nz);
+            std::snprintf(buf, sizeof(buf), "写字机报警 ALARM:%d 位置 X=%.1f Y=%.1f Z=%.1f",
+                          sub_code, nx, ny, nz);
             NotifyCloud(buf);
         } else if (prev == GrblState::Run && gs == GrblState::Idle) {
-            std::snprintf(buf, sizeof(buf),
-                "写字机运动完成 (Run→Idle) 停在 X=%.1f Y=%.1f", nx, ny);
+            std::snprintf(buf, sizeof(buf), "写字机运动完成 (Run→Idle) 停在 X=%.1f Y=%.1f", nx, ny);
             NotifyCloud(buf);
         } else if (gs == GrblState::Hold) {
-            std::snprintf(buf, sizeof(buf),
-                "写字机暂停 (Hold) 位置 X=%.1f Y=%.1f", nx, ny);
+            std::snprintf(buf, sizeof(buf), "写字机暂停 (Hold) 位置 X=%.1f Y=%.1f", nx, ny);
             NotifyCloud(buf);
         }
     }
@@ -488,8 +658,34 @@ void Pipe::ParseStatusReport(const std::string& line) {
     if (mpos != std::string::npos) {
         float x = 0, y = 0, z = 0;
         if (std::sscanf(content.c_str() + mpos, "MPos:%f,%f,%f", &x, &y, &z) == 3) {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            mpos_x_ = x; mpos_y_ = y; mpos_z_ = z;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                mpos_x_ = x;
+                mpos_y_ = y;
+                mpos_z_ = z;
+            }
+            if (auth_probe_stage_ == AuthProbeStage::WaitingAbortLiftIdle &&
+                gs == GrblState::Idle) {
+                // Z 抬笔行的 ok 只表示进入 planner；实机上紧接着发 $I 会在 Run 态
+                // 收到 error:8。等新状态确认 Idle 后再继续探活。
+                auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
+                if (!SendLine("$I")) {
+                    auth_probe_stage_ = AuthProbeStage::Failed;
+                    ESP_LOGE(TAG, "abort 复位后探活发送失败");
+                }
+            } else if (auth_probe_stage_ == AuthProbeStage::WaitingPosition &&
+                       gs == GrblState::Idle) {
+                // 授权状态没有 Telnet 查询命令。先 M5 抬笔，再以机器坐标发送当前 X 的
+                // G1 零位移行：已授权回 ok，未授权在 Protocol.cpp 前置门回 error:110。
+                // 用 G1 而非 G0，避免当前位置恰为原点时触发商业固件的自动换纸语义。
+                char probe[64];
+                std::snprintf(probe, sizeof(probe), "G53 G1 X%.3f F1500", x);
+                auth_probe_stage_ = AuthProbeStage::WaitingMotionReply;
+                if (!SendLine(probe)) {
+                    auth_probe_stage_ = AuthProbeStage::Failed;
+                    ESP_LOGE(TAG, "授权探测发送失败");
+                }
+            }
         }
     }
 
@@ -497,21 +693,115 @@ void Pipe::ParseStatusReport(const std::string& line) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         alarm_code_ = sub_code;
     }
+    // 最后递增：等待方看到新序号时，上面的状态与坐标已经全部更新。
+    status_report_seq_.fetch_add(1);
+}
+
+bool Pipe::HandleAuthProbeResponse(WaitResult result, int error_code) {
+    switch (auth_probe_stage_) {
+        case AuthProbeStage::WaitingAbortUnlockOk:
+            if (result != WaitResult::Ok) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "abort 复位后解锁失败: error:%d", error_code);
+                return true;
+            }
+            // soft reset 已把主轴模态重置为 Off；此时单发 M5 会被当作无状态变化，
+            // 实机验证会留下 Z=5。用明确 Z 运动先抬笔，避免 M3->M5 在本来已抬笔时落点。
+            auth_probe_stage_ = AuthProbeStage::WaitingAbortLiftOk;
+            if (!SendLine("G1G90 Z0.0F10000")) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "abort 复位后抬笔发送失败");
+            }
+            return true;
+
+        case AuthProbeStage::WaitingAbortLiftOk:
+            if (result != WaitResult::Ok) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "abort 复位后抬笔失败: error:%d", error_code);
+                return true;
+            }
+            auth_probe_stage_ = AuthProbeStage::WaitingAbortLiftIdle;
+            if (!SendRealtime('?')) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "abort 复位后抬笔状态查询失败");
+            }
+            return true;
+
+        case AuthProbeStage::WaitingBuildInfoOk:
+            if (result != WaitResult::Ok) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "$I 探活应答失败: error:%d", error_code);
+                return true;
+            }
+            // 探测运动前先确定抬笔；M 指令不受授权门限制。
+            auth_probe_stage_ = AuthProbeStage::WaitingLiftOk;
+            if (!SendLine("M5")) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "授权探测抬笔发送失败");
+            }
+            return true;
+
+        case AuthProbeStage::WaitingLiftOk:
+            if (result != WaitResult::Ok) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "授权探测抬笔失败: error:%d", error_code);
+                return true;
+            }
+            auth_probe_stage_ = AuthProbeStage::WaitingPosition;
+            if (!SendRealtime('?')) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "授权探测位置查询失败");
+            }
+            return true;
+
+        case AuthProbeStage::WaitingMotionReply:
+            if (result == WaitResult::Ok) {
+                authorized_.store(true);
+                ready_.store(true);
+                auth_probe_stage_ = AuthProbeStage::Complete;
+                ESP_LOGI(TAG, "授权探测通过（抬笔后 G53 零位移）");
+            } else if (result == WaitResult::Failed && error_code == 110) {
+                authorized_.store(false);
+                ready_.store(true);
+                auth_probe_stage_ = AuthProbeStage::Complete;
+                ESP_LOGW(TAG, "写字机未授权（零位移探测返回 error:110）");
+            } else {
+                authorized_.store(false);
+                ready_.store(false);
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "授权探测失败: error:%d", error_code);
+            }
+            return true;
+
+        default:
+            return false;
+    }
 }
 
 const char* Pipe::GrblStateName(GrblState s) {
     switch (s) {
-        case GrblState::Unknown: return "Unknown";
-        case GrblState::Idle:    return "Idle";
-        case GrblState::Run:     return "Run";
-        case GrblState::Hold:    return "Hold";
-        case GrblState::Jog:     return "Jog";
-        case GrblState::Alarm:   return "Alarm";
-        case GrblState::Door:    return "Door";
-        case GrblState::Check:   return "Check";
-        case GrblState::Home:    return "Home";
-        case GrblState::Sleep:   return "Sleep";
-        default:                 return "?";
+        case GrblState::Unknown:
+            return "Unknown";
+        case GrblState::Idle:
+            return "Idle";
+        case GrblState::Run:
+            return "Run";
+        case GrblState::Hold:
+            return "Hold";
+        case GrblState::Jog:
+            return "Jog";
+        case GrblState::Alarm:
+            return "Alarm";
+        case GrblState::Door:
+            return "Door";
+        case GrblState::Check:
+            return "Check";
+        case GrblState::Home:
+            return "Home";
+        case GrblState::Sleep:
+            return "Sleep";
+        default:
+            return "?";
     }
 }
 
@@ -624,4 +914,4 @@ bool Pipe::WaitOk(uint32_t timeout_ms, std::string* response) {
     return WaitResponse(timeout_ms, response, nullptr) == WaitResult::Ok;
 }
 
-} // namespace hutuji
+}  // namespace hutuji

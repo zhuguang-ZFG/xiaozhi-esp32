@@ -33,6 +33,12 @@ enum class GrblState {
     Sleep,
 };
 
+enum class PaperChangingState {
+    Unknown = 0,
+    Off,
+    On,
+};
+
 /**
  * @brief hutuji 写字机哑管道（方案 E：WiFi Telnet TCP 客户端）
  *
@@ -87,13 +93,30 @@ public:
     bool IsConnected() const { return connected_.load(); }
     bool IsReady() const { return ready_.load(); }
     bool IsAuthorized() const { return authorized_.load(); }
+    /**
+     * 绘图会话存续期间，重连只验 Telnet banner，不自动发送授权运动探针。
+     * 任务层须先按 protocol §2.1 查询 Changing，再决定是否发受限 reset。
+     */
+    void SetTaskSessionActive(bool active) { task_session_active_.store(active); }
+    uint32_t GetConnectionSequence() const { return connection_seq_.load(); }
+    uint32_t GetResetBannerSequence() const { return reset_banner_seq_.load(); }
+    uint32_t GetPaperStatusSequence() const { return paper_status_seq_.load(); }
+    PaperChangingState GetPaperChangingState() const { return paper_changing_.load(); }
+
+    /** 标记下一次 Grbl reset banner 来自本机 abort；仅该次允许自动 `$X` 恢复。 */
+    void PrepareAbortReset() { abort_reset_pending_.store(true); }
+    /** reset 字符未发出去时撤销许可，防止下一次无关 banner 被自动解锁。 */
+    void CancelAbortReset() { abort_reset_pending_.store(false); }
 
     GrblState GetGrblState() const { return grbl_state_.load(); }
+    uint32_t GetStatusReportSequence() const { return status_report_seq_.load(); }
     static const char* GrblStateName(GrblState s);
 
     void GetMachinePos(float& x, float& y, float& z) const {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        x = mpos_x_; y = mpos_y_; z = mpos_z_;
+        x = mpos_x_;
+        y = mpos_y_;
+        z = mpos_z_;
     }
 
     int GetAlarmCode() const {
@@ -113,6 +136,25 @@ public:
     void ShutdownSocket();
 
 private:
+    enum class PeerCheck {
+        Valid,
+        ClosedBeforeBanner,
+        Invalid,
+    };
+
+    enum class AuthProbeStage {
+        Idle,
+        WaitingAbortUnlockOk,
+        WaitingAbortLiftOk,
+        WaitingAbortLiftIdle,
+        WaitingBuildInfoOk,
+        WaitingLiftOk,
+        WaitingPosition,
+        WaitingMotionReply,
+        Complete,
+        Failed,
+    };
+
     Pipe() = default;
     ~Pipe() = default;
     Pipe(const Pipe&) = delete;
@@ -122,6 +164,11 @@ private:
     void PipeTask();
     bool ConnectOnce();
     bool TryConnect(uint32_t ip_addr, int timeout_ms);  // sock_mutex_ 已持有
+    /**
+     * 校验对端确实是 Grbl 写字机（读 Telnet 连接 banner）。sock_mutex_ 已持有。
+     * 缓存命中与子网扫描共用此校验：只认真写字机，堵住「任意 :23 主机顶替」。
+     */
+    PeerCheck VerifyGrblPeer(int sock, int timeout_ms);
     void CloseSocket();
     bool SendRawLocked(const char* data, size_t len);  // 调用方已持 write_mutex_
 
@@ -130,12 +177,23 @@ private:
     void ParseStatusReport(const std::string& line);
     void NotifyCloud(const std::string& message);
     static int ParseErrorCode(const std::string& line);
+    bool HandleAuthProbeResponse(WaitResult result, int error_code);
 
     std::atomic<bool> started_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> authorized_{false};
+    std::atomic<bool> abort_reset_pending_{false};
+    std::atomic<bool> task_session_active_{false};
     std::atomic<GrblState> grbl_state_{GrblState::Unknown};
+    std::atomic<uint32_t> status_report_seq_{0};
+    std::atomic<uint32_t> connection_seq_{0};
+    std::atomic<uint32_t> reset_banner_seq_{0};
+    std::atomic<uint32_t> paper_status_seq_{0};
+    std::atomic<PaperChangingState> paper_changing_{PaperChangingState::Unknown};
+    // Grbl 的授权日志只发 CLIENT_SERIAL，Telnet `$I` 看不到。连接后用抬笔状态下的
+    // G53 零位移运动探测 error:110；探测完成前 ready_ 保持 false，禁止绘图抢跑。
+    AuthProbeStage auth_probe_stage_ = AuthProbeStage::Idle;
 
     TaskHandle_t pipe_task_ = nullptr;
 
@@ -158,7 +216,6 @@ private:
     /** 入队一条应答（仅 ProcessLine 的 ok/error 分支调用）。队列满时丢最老。 */
     void PushResponse(WaitResult result, int error_code);
 
-
     // 单写者：所有发送（行/实时）串行化
     std::mutex write_mutex_;
     std::mutex sock_mutex_;
@@ -174,8 +231,11 @@ private:
     int alarm_code_ = 0;
 
     char resolved_ip_[16] = {};
+    // Grbl 仅允许一个 Telnet 客户端。S3 重启后旧半开连接尚未回收时，
+    // 新连接会 TCP 成功后立即关闭；这不是缓存 IP 失真，先快速重试再回落扫描。
+    uint8_t cached_slot_busy_count_ = 0;
 };
 
-} // namespace hutuji
+}  // namespace hutuji
 
-#endif // HUTUJI_PIPE_H
+#endif  // HUTUJI_PIPE_H

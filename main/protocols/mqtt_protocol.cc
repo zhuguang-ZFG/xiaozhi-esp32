@@ -80,6 +80,13 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     auto username = settings.GetString("username");
     auto password = settings.GetString("password");
     int keepalive_interval = settings.GetInt("keepalive", 240);
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    // 本机家用网络约 60s 会回收空闲映射；云端工具通道随之形成半开连接，
+    // ESP-MQTT 仍自认为在线且不会触发重连。30s PING 在回收窗口前保活。
+    if (keepalive_interval <= 0 || keepalive_interval > 30) {
+        keepalive_interval = 30;
+    }
+#endif
     publish_topic_ = settings.GetString("publish_topic");
 
     if (endpoint.empty()) {
