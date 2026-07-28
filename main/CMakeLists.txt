@@ -1101,6 +1101,20 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE TEXT_FONT_SIZE=${TEXT_FONT_SIZE} TEXT_FONT_BPP=${TEXT_FONT_BPP}
                     )
 
+option(HUTUJI_AUTO_TEST_DRAW "Enable hutuji auto-test draw on lichuang-dev after pipe ready" OFF)
+set(HUTUJI_AUTO_TEST_DRAW_URL "" CACHE STRING "hutuji auto-test G-code URL; keep empty unless building a local test image")
+if(HUTUJI_AUTO_TEST_DRAW)
+    if(NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+        message(FATAL_ERROR "HUTUJI_AUTO_TEST_DRAW is only supported for lichuang-dev")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_DRAW)
+    if(HUTUJI_AUTO_TEST_DRAW_URL STREQUAL "")
+        message(WARNING "HUTUJI_AUTO_TEST_DRAW enabled with empty HUTUJI_AUTO_TEST_DRAW_URL")
+    else()
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_DRAW_URL="${HUTUJI_AUTO_TEST_DRAW_URL}")
+    endif()
+endif()
+
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}
