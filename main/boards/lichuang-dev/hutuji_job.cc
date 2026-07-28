@@ -27,6 +27,9 @@ constexpr uint32_t kOkTimeoutMs = 60000;
 constexpr uint32_t kPaperOkTimeoutMs = 90000;
 constexpr uint32_t kMotionOkTimeoutMs = 30000;
 constexpr uint32_t kJobIdleTimeoutMs = 30 * 60 * 1000;
+// Grbl fork 中 M3/M5 笔控会同步 planner 后才返回 ok。页尾 M5 可能排在整页
+// 运动队列之后，等待时间等同剩余绘图时间，不能按普通 M-code 的 60s 判超时。
+constexpr uint32_t kPlannerSyncOkTimeoutMs = kJobIdleTimeoutMs;
 constexpr uint32_t kPostPaperIdleTimeoutMs = 5000;
 constexpr uint32_t kReconnectReadyTimeoutMs = 2 * 60 * 1000;
 constexpr uint32_t kResetRecoveryTimeoutMs = 30000;
@@ -128,6 +131,23 @@ bool Job::LooksLikeMotionLine(const std::string& line) {
         if (line.size() == 2 || !std::isdigit(static_cast<unsigned char>(line[2]))) {
             return true;
         }
+    }
+    return false;
+}
+
+static bool LooksLikePlannerSyncLine(const std::string& line) {
+    if (line.size() < 2) {
+        return false;
+    }
+    char c = static_cast<char>(std::toupper(static_cast<unsigned char>(line[0])));
+    if (c != 'M') {
+        return false;
+    }
+    // MCP 产物中的笔控行为：M3=落笔，M5=抬笔。Grbl 侧会等待前序 planner
+    // 执行到该笔控点后才回 ok，因此行级等待窗口必须覆盖剩余绘图时间。
+    if ((line[1] == '3' || line[1] == '5') &&
+        (line.size() == 2 || !std::isdigit(static_cast<unsigned char>(line[2])))) {
+        return true;
     }
     return false;
 }
@@ -987,9 +1007,12 @@ bool Job::StreamToGrbl() {
                 }
             }
 
+            bool planner_sync_line = LooksLikePlannerSyncLine(line);
             uint32_t timeout =
                 paper_line ? kPaperOkTimeoutMs
-                           : (LooksLikeMotionLine(line) ? kMotionOkTimeoutMs : kOkTimeoutMs);
+                           : (planner_sync_line ? kPlannerSyncOkTimeoutMs
+                                                : (LooksLikeMotionLine(line) ? kMotionOkTimeoutMs
+                                                                             : kOkTimeoutMs));
             // 分段等，便于响应 abort
             WaitResult wr = WaitResult::Timeout;
             int err = -1;
