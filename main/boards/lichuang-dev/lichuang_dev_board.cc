@@ -12,7 +12,14 @@
 #include "hutuji_pipe.h"
 #include "hutuji_job.h"
 
+// 调试用：需要本地工程回归时，在编译参数里同时定义：
+//   HUTUJI_AUTO_TEST_DRAW
+//   HUTUJI_AUTO_TEST_DRAW_URL="http://<host>/files/<token>.gcode"
+// 默认关闭；禁止把一次性 URL 或真实凭据写进源码。
 // #define HUTUJI_AUTO_TEST_DRAW
+#ifndef HUTUJI_AUTO_TEST_DRAW_URL
+#define HUTUJI_AUTO_TEST_DRAW_URL ""
+#endif
 
 #include <cJSON.h>
 #include <esp_log.h>
@@ -344,9 +351,14 @@ private:
             }
             vTaskDelay(pdMS_TO_TICKS(3000));
             if (pipe.IsConnected() && pipe.IsReady()) {
+                const char* url = HUTUJI_AUTO_TEST_DRAW_URL;
+                if (url[0] == '\0') {
+                    ESP_LOGE("AutoTest", "已启用 HUTUJI_AUTO_TEST_DRAW，但未定义 HUTUJI_AUTO_TEST_DRAW_URL");
+                    vTaskDelete(nullptr);
+                    return;
+                }
                 ESP_LOGW("AutoTest", "触发自动测试绘图");
-                auto result = hutuji::Job::GetInstance().StartDraw(
-                    "http://117.72.118.95/files/draw_20260727_020557_SEZl2yhc19ANAqpK89F2Mw.gcode");
+                auto result = hutuji::Job::GetInstance().StartDraw(url);
                 ESP_LOGW("AutoTest", "StartDraw 返回: %s", result.c_str());
             }
             vTaskDelete(nullptr);
