@@ -18,6 +18,7 @@
 #include <cstring>
 
 #include <algorithm>
+#include <deque>
 #include <string>
 
 #define TAG "HutujiJob"
@@ -41,6 +42,8 @@ constexpr int kDeferredMaxRetries = 8;
 constexpr int kDisconnectReplayMaxRetries = 2;
 // 暂停上限：超过则自动放弃，避免 busy_ 被无限期占用导致所有工具返回 busy。
 constexpr uint32_t kMaxPauseMs = 10 * 60 * 1000;
+// S3 窗口化流控窗口（§3 取值：Telnet RX ①的 43%，约 21 行在途）。
+constexpr size_t kWindow = 512;
 
 // 设备侧出图只允许云端生成的 capability URL；scheme 限定 http/https，
 // 主机限定私有网段或 hutuji.donglicao.com。拦坏 url 在设备侧，
@@ -1015,8 +1018,7 @@ bool Job::StreamToGrbl() {
     stream_disconnected_ = false;
     stream_connection_seq_ = pipe.GetConnectionSequence();
 
-    // S2：先预解析成行索引，获得 peek 能力（窗口化流控前提）。
-    // 窗口仍 = 1（逐行等 ok），行为与改造前一致；打开窗口是 S3 的事。
+    // S2：预解析成行索引，获得 peek 能力（窗口化流控前提）。
     const std::vector<LineSpan> spans = ParseLines();
     lines_total_ = spans.size();
     lines_sent_ = 0;
@@ -1025,20 +1027,37 @@ bool Job::StreamToGrbl() {
     UpdateDisplayProgress();
     TickType_t last_notify_tick = xTaskGetTickCount();
 
-    for (size_t idx = 0; idx < spans.size(); ++idx) {
-        if (abort_requested_.load()) {
+    // S3：打开窗口化模式 — SendLine 不再清残留应答，在途应答是合法凭据。
+    // 函数退出前（无论成功/失败/abort）必须复原为逐行模式，避免影响后续
+    // status/pen_test 等单命令调用点。
+    pipe.SetWindowed(true);
+    struct WindowGuard {
+        Pipe& pipe_ref;
+        ~WindowGuard() { pipe_ref.SetWindowed(false); }
+    } window_guard{pipe};
+
+    // 照抄官方 stream.py 的 c_line / g_count 结构（§4.2）
+    std::deque<size_t> c_line;       // 在途各行字节数（含 +1 换行，R1）
+    size_t c_line_bytes_sum = 0;     // 在途字节数累加
+    size_t next_ = 0;                // 下一条待发
+
+    // paper_pending：遇到换纸行时先排空 c_line，排空后在此标记下走逐行模式。
+    // 理由：换纸期主循环阻塞，若在途字节涌入会撑满 InputBuffer ②导致静默丢
+    // 字节（§3）；换纸行 ok 等数十秒且期间禁发 G0–G3（§4.3 第一条）。
+    bool paper_pending = false;
+
+    // TODO(S4/Bf)：实机出图期周期性 ?，若 Telnet Bf 余量 < 300 则临时收窄窗口。
+    //   自适应反压（§3.1）本次不做，S3 核心是 window=512 + 换纸行排空。
+
+    while (next_ < spans.size() || !c_line.empty()) {
+        // === 检查点（§4.3：abort/ALARM/链路从「每行」变成「每次灌/收循环」）===
+        if (abort_requested_.load() && !paper_active_.load()) {
+            // abort 后在途计数残留：c_line 随函数返回整体销毁，不需显式清零。
             last_error_ = "aborted";
             return false;
         }
-        // 暂停门：停在行边界，不切断已发出的行。Grbl 侧由 `!` 做进给保持，
-        // 这里只是不再灌新行，避免暂停期间 planner 继续被填满。
-        if (!WaitWhilePaused()) {
-            if (last_error_.empty())
-                last_error_ = "aborted";
-            return false;
-        }
-        if (abort_requested_.load()) {
-            last_error_ = "aborted";
+        if (pipe.GetGrblState() == GrblState::Alarm) {
+            last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
             return false;
         }
         if (!pipe.IsConnected() || !pipe.IsReady() ||
@@ -1047,59 +1066,30 @@ bool Job::StreamToGrbl() {
             last_error_ = "转发中链路丢失";
             return false;
         }
-        if (pipe.GetGrblState() == GrblState::Alarm) {
-            last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
-            return false;
-        }
 
-        // 只为当前要发的这一行做一次拷贝；索引表本身零拷贝指向 buffer_。
-        const std::string line(LineAt(spans[idx]));
-
-        bool paper_line = LooksLikePaperLine(line);
-        if (paper_line) {
-            paper_active_.store(true);
-            SetState("paper_change");
-        }
-
-        int retries = 0;
-        while (true) {
-            // 行已经解析但尚未写入时也可能收到 pause；在这里等待而不是忙等重试。
+        // === 暂停（§4.3：停止灌新行，但必须继续收在途 ok）===
+        // 暂停且无在途 → 阻塞等恢复；有在途 → 落入收分支排空（不调 WaitWhilePaused，
+        // 收分支不阻塞 — 否则 c_line 永不释放）。
+        if (paused_.load() && !paper_active_.load() && !paper_pending &&
+            c_line.empty() && next_ < spans.size()) {
             if (!WaitWhilePaused()) {
                 if (last_error_.empty())
                     last_error_ = "aborted";
                 return false;
             }
-            if (abort_requested_.load() && !paper_active_.load()) {
-                last_error_ = "aborted";
-                return false;
-            }
-            {
-                // 与 RequestPause() 同步：暂停命令发出后，本行不能再进入 planner。
-                std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-                if (paused_.load()) {
-                    continue;
-                }
-                if (!pipe.SendLine(line)) {
-                    stream_disconnected_ = !pipe.IsConnected() ||
-                                           pipe.GetConnectionSequence() != stream_connection_seq_;
-                    last_error_ = stream_disconnected_ ? "转发中链路丢失" : "SendLine 失败";
-                    return false;
-                }
-            }
+            continue;
+        }
 
-            bool planner_sync_line = LooksLikePlannerSyncLine(line);
-            uint32_t timeout =
-                paper_line ? kPaperOkTimeoutMs
-                           : (planner_sync_line ? kPlannerSyncOkTimeoutMs
-                                                : (LooksLikeMotionLine(line) ? kMotionOkTimeoutMs
-                                                                             : kOkTimeoutMs));
-            // 分段等，便于响应 abort
-            WaitResult wr = WaitResult::Timeout;
-            int err = -1;
-            uint32_t waited = 0;
-            const uint32_t slice = 1000;
-            while (waited < timeout) {
-                // 当前行已发送时也要冻结等待超时；否则暂停超过 timeout 会被误判为转发失败。
+        // === 换纸行：c_line 已排空，走逐行模式（§4.3 第一条）===
+        if (paper_pending && c_line.empty()) {
+            paper_pending = false;
+            const std::string line(LineAt(spans[next_]));
+            paper_active_.store(true);
+            SetState("paper_change");
+
+            int retries = 0;
+            while (true) {
+                // 行已解析但尚未写入时也可能收到 pause；在这里等待而不是忙等重试。
                 if (!WaitWhilePaused()) {
                     if (last_error_.empty())
                         last_error_ = "aborted";
@@ -1109,74 +1099,212 @@ bool Job::StreamToGrbl() {
                     last_error_ = "aborted";
                     return false;
                 }
-                if (!pipe.IsConnected() || !pipe.IsReady() ||
-                    pipe.GetConnectionSequence() != stream_connection_seq_) {
-                    stream_disconnected_ = true;
-                    last_error_ = "等待应答时链路丢失";
-                    return false;
+                {
+                    // 与 RequestPause() 同步：暂停命令发出后，本行不能再进入 planner。
+                    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+                    if (paused_.load()) {
+                        continue;
+                    }
+                    if (!pipe.SendLine(line)) {
+                        stream_disconnected_ = !pipe.IsConnected() ||
+                                               pipe.GetConnectionSequence() != stream_connection_seq_;
+                        last_error_ = stream_disconnected_ ? "转发中链路丢失" : "SendLine 失败";
+                        return false;
+                    }
                 }
-                if (pipe.GetGrblState() == GrblState::Alarm) {
-                    last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
-                    return false;
-                }
-                uint32_t step = (timeout - waited > slice) ? slice : (timeout - waited);
-                wr = pipe.WaitResponse(step, nullptr, &err);
-                if (wr != WaitResult::Timeout) {
-                    break;
-                }
-                waited += step;
-            }
 
-            if (wr == WaitResult::Ok) {
-                ++lines_sent_;
-                if (paper_line) {
+                // 换纸行 ok 可能等数十秒，分段等便于响应 abort
+                WaitResult wr = WaitResult::Timeout;
+                int err = -1;
+                uint32_t waited = 0;
+                const uint32_t slice = 1000;
+                while (waited < kPaperOkTimeoutMs) {
+                    if (!WaitWhilePaused()) {
+                        if (last_error_.empty())
+                            last_error_ = "aborted";
+                        return false;
+                    }
+                    if (abort_requested_.load() && !paper_active_.load()) {
+                        last_error_ = "aborted";
+                        return false;
+                    }
+                    if (!pipe.IsConnected() || !pipe.IsReady() ||
+                        pipe.GetConnectionSequence() != stream_connection_seq_) {
+                        stream_disconnected_ = true;
+                        last_error_ = "等待换纸 ok 时链路丢失";
+                        return false;
+                    }
+                    if (pipe.GetGrblState() == GrblState::Alarm) {
+                        last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
+                        return false;
+                    }
+                    uint32_t step = (kPaperOkTimeoutMs - waited > slice)
+                                        ? slice : (kPaperOkTimeoutMs - waited);
+                    wr = pipe.TakeResponse(step, &err);
+                    if (wr != WaitResult::Timeout) {
+                        break;
+                    }
+                    waited += step;
+                }
+
+                if (wr == WaitResult::Ok) {
+                    ++lines_sent_;
                     paper_active_.store(false);
                     // 换纸期间用户可能已按暂停：别把 paused 覆盖成 streaming。
                     SetState(paused_.load() ? "paused" : "streaming");
+                    UpdateDisplayProgress();
                     if (abort_requested_.load()) {
                         last_error_ = "aborted";
                         return false;
                     }
+                    break;
                 }
-                UpdateDisplayProgress();
-                // 每 5s 向云端推送一次进度
-                TickType_t now = xTaskGetTickCount();
-                if ((now - last_notify_tick) >= pdMS_TO_TICKS(5000)) {
-                    last_notify_tick = now;
-                    float mx, my, mz;
-                    pipe.GetMachinePos(mx, my, mz);
-                    int pct =
-                        lines_total_ > 0 ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
-                    char buf[128];
-                    snprintf(buf, sizeof(buf), "出图进度: %d%% (%zu/%zu行) 位置 X=%.1f Y=%.1f", pct,
-                             lines_sent_, lines_total_, mx, my);
-                    Notify(buf);
+                if (wr == WaitResult::Deferred) {
+                    // error:8：暂停后重发本行（§4.3：只在逐行模式可定位重发）
+                    paper_active_.store(true);
+                    SetState("paper_change");
+                    ++retries;
+                    if (retries > kDeferredMaxRetries) {
+                        last_error_ = "error:8 重试耗尽";
+                        return false;
+                    }
+                    ESP_LOGW(TAG, "error:8，%d 次重发: %s", retries, line.c_str());
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    continue;
                 }
-                break;
-            }
-            if (wr == WaitResult::Deferred) {
-                // error:8：暂停后重发本行
-                paper_active_.store(true);
-                SetState("paper_change");
-                ++retries;
-                if (retries > kDeferredMaxRetries) {
-                    last_error_ = "error:8 重试耗尽";
+                if (wr == WaitResult::Failed) {
+                    last_error_ = "error:" + std::to_string(err);
                     return false;
                 }
-                ESP_LOGW(TAG, "error:8，%d 次重发: %s", retries, line.c_str());
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                continue;
-            }
-            if (wr == WaitResult::Failed) {
-                last_error_ = "error:" + std::to_string(err);
+                // Timeout：发 ? 探活一次再判失败
+                pipe.SendRealtime('?');
+                ESP_LOGE(TAG, "换纸行等 ok 超时: %s", line.c_str());
+                last_error_ = "换纸行等 ok 超时";
                 return false;
             }
-            // Timeout：发 ? 探活一次再判失败
+
+            ++next_;
+            continue;  // 换纸行完成，继续窗口化
+        }
+
+        // === 灌分支 ===
+        if (!paper_pending && next_ < spans.size() && !paused_.load()) {
+            const std::string line(LineAt(spans[next_]));
+
+            if (LooksLikePaperLine(line)) {
+                // 标记 paper_pending：下一轮起收分支会排空 c_line
+                paper_pending = true;
+                if (c_line.empty())
+                    continue;  // c_line 已空，下一轮直接走逐行模式
+                // 否则落入收分支排空
+            } else {
+                // 普通行窗口化灌
+                size_t need = line.size() + 1;  // R1：含换行符
+                if (c_line_bytes_sum + need < kWindow || c_line.empty()) {
+                    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+                    if (paused_.load()) {
+                        continue;
+                    }
+                    if (!pipe.SendLine(line)) {
+                        stream_disconnected_ = !pipe.IsConnected() ||
+                                               pipe.GetConnectionSequence() != stream_connection_seq_;
+                        last_error_ = stream_disconnected_ ? "转发中链路丢失" : "SendLine 失败";
+                        return false;
+                    }
+                    c_line.push_back(need);
+                    c_line_bytes_sum += need;
+                    ++next_;
+                    continue;
+                }
+                // 窗口满 → 落入收分支
+            }
+        }
+
+        // === 收分支（R2：ok/error 都释放窗口）===
+        if (c_line.empty()) {
+            // 无在途且无法灌（暂停/paper_pending 排空后逐行尚未进入/全部发完）
+            if (next_ >= spans.size() && !paper_pending)
+                break;  // R4 收尾完成
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // 按队首行类型选 timeout（§4.4：超时含义是「最老那条等了 timeout」）
+        // c_line 队首对应 spans[lines_sent_]：FIFO + 每次 pop 即 ++lines_sent_，
+        // 换纸行不在 c_line 但同样 ++lines_sent_，索引始终对齐。
+        std::string_view front_sv = LineAt(spans[lines_sent_]);
+        uint32_t timeout = kOkTimeoutMs;
+        {
+            std::string front_line(front_sv);
+            if (LooksLikePlannerSyncLine(front_line))
+                timeout = kPlannerSyncOkTimeoutMs;
+            else if (LooksLikeMotionLine(front_line))
+                timeout = kMotionOkTimeoutMs;
+        }
+
+        // 分段等，便于响应 abort/ALARM/链路丢失
+        WaitResult wr = WaitResult::Timeout;
+        int err = -1;
+        uint32_t waited = 0;
+        const uint32_t slice = 1000;
+        while (waited < timeout) {
+            if (abort_requested_.load() && !paper_active_.load()) {
+                last_error_ = "aborted";
+                return false;
+            }
+            if (pipe.GetGrblState() == GrblState::Alarm) {
+                last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
+                return false;
+            }
+            if (!pipe.IsConnected() || !pipe.IsReady() ||
+                pipe.GetConnectionSequence() != stream_connection_seq_) {
+                stream_disconnected_ = true;
+                last_error_ = "等待应答时链路丢失";
+                return false;
+            }
+            uint32_t step = (timeout - waited > slice) ? slice : (timeout - waited);
+            wr = pipe.TakeResponse(step, &err);
+            if (wr != WaitResult::Timeout) {
+                break;
+            }
+            waited += step;
+        }
+
+        if (wr == WaitResult::Ok || wr == WaitResult::Failed) {
+            c_line_bytes_sum -= c_line.front();
+            c_line.pop_front();
+            ++lines_sent_;  // R2：ok 与 error 都释放窗口
+
+            UpdateDisplayProgress();
+            // 进度推送用 lines_sent_（已确认数），不是 next_（已发数）——已发≠已画
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_notify_tick) >= pdMS_TO_TICKS(5000)) {
+                last_notify_tick = now;
+                float mx, my, mz;
+                pipe.GetMachinePos(mx, my, mz);
+                int pct =
+                    lines_total_ > 0 ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "出图进度: %d%% (%zu/%zu行) 位置 X=%.1f Y=%.1f", pct,
+                         lines_sent_, lines_total_, mx, my);
+                Notify(buf);
+            }
+        } else if (wr == WaitResult::Deferred) {
+            // §4.3：窗口化普通行不应收到 error:8（换纸期禁发 G0–G3，普通行不会撞
+            // error:8）。若意外收到，按 Failed 处理并记日志（不应发生）。
+            ESP_LOGW(TAG, "窗口化分支意外收到 error:8（err=%d），按失败处理", err);
+            last_error_ = "error:8（窗口化不应发生）";
+            return false;
+        } else {
+            // Timeout（§4.4：日志带 c_line 队首对应行内容，否则排障时行号是错的）
+            ESP_LOGE(TAG, "等 ok 超时，队首在途行 [%zu]: %.*s",
+                     lines_sent_, (int)front_sv.size(), front_sv.data());
             pipe.SendRealtime('?');
             last_error_ = "等 ok 超时";
             return false;
         }
     }
+
     return true;
 }
 
