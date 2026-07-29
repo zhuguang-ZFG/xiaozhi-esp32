@@ -446,6 +446,19 @@ std::string Job::StatusJson() const {
         cJSON_AddNumberToObject(root, "alarm_code", pipe.GetAlarmCode());
     }
     cJSON_AddStringToObject(root, "last_line", pipe.GetLastLine().c_str());
+    // 净作画时长与 ETA（对齐奎享 f.java:j()/h()）。仅 streaming/paused/paper_change
+    // 有意义；下载/校验/idle 不报，避免误导。
+    if (draw_start_tick_ != 0 && lines_total_ > 0) {
+        uint32_t elapsed_ms = static_cast<uint32_t>(
+            (xTaskGetTickCount() - draw_start_tick_) * portTICK_PERIOD_MS);
+        uint32_t net_ms = elapsed_ms > paused_accum_ms_ ? elapsed_ms - paused_accum_ms_ : 0;
+        cJSON_AddNumberToObject(root, "elapsed_ms", net_ms);
+        if (lines_sent_ > 0) {
+            uint32_t eta_ms = static_cast<uint32_t>(
+                static_cast<uint64_t>(net_ms) * lines_total_ / lines_sent_);
+            cJSON_AddNumberToObject(root, "eta_ms", eta_ms);
+        }
+    }
     char* str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     std::string json = str ? str : "{}";
@@ -699,6 +712,7 @@ bool Job::WaitWhilePaused() {
     }
     auto& pipe = Pipe::GetInstance();
     TickType_t began = xTaskGetTickCount();
+    pause_segment_start_ = began;
     while (paused_.load() && !abort_requested_.load()) {
         if (!pipe.IsConnected() || !pipe.IsReady()) {
             last_error_ = "暂停中链路丢失";
@@ -715,6 +729,9 @@ bool Job::WaitWhilePaused() {
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+    // 累加本次暂停段，供 ETA 扣减（对齐奎享 g 字段）。
+    paused_accum_ms_ += static_cast<uint32_t>(
+        (xTaskGetTickCount() - pause_segment_start_) * portTICK_PERIOD_MS);
     return !abort_requested_.load();
 }
 
@@ -1003,6 +1020,8 @@ bool Job::StreamToGrbl() {
     const std::vector<LineSpan> spans = ParseLines();
     lines_total_ = spans.size();
     lines_sent_ = 0;
+    paused_accum_ms_ = 0;
+    draw_start_tick_ = xTaskGetTickCount();
     UpdateDisplayProgress();
     TickType_t last_notify_tick = xTaskGetTickCount();
 

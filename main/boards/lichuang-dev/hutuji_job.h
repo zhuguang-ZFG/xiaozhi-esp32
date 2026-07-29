@@ -127,6 +127,14 @@ private:
 
     size_t lines_total_ = 0;
     size_t lines_sent_ = 0;
+
+    // 净作画时长与 ETA（对齐奎享 f.java:18-20 的 f/g/h 字段）。
+    // draw_start_tick_ 在 StreamToGrbl 起点记；paused_accum_ms_ 在 WaitWhilePaused
+    // 出口累加本次暂停段；ETA = 净时长 ÷ 进度（lines_sent/lines_total）。
+    // 用 uint32_t 存 tick，避免头文件依赖 FreeRTOS 的 TickType_t。
+    uint32_t draw_start_tick_ = 0;
+    uint32_t paused_accum_ms_ = 0;
+    uint32_t pause_segment_start_ = 0;
 };
 
 }  // namespace hutuji
