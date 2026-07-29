@@ -127,6 +127,11 @@ void Pipe::PipeTask() {
             std::lock_guard<std::mutex> lock(write_mutex_);
             SendRawLocked("$I\n", 3);
         }
+
+        // 新连接重建时先关闭「对端正长阻塞」标记：当前仅凭 banner 不能判定是否换纸。
+        // 若 Job 随后 `[ESP901]` 查到 Changing=On，会显式打开，避免换纸期 silent-poll
+        // 误杀 TCP。
+        expect_blocking_peer_.store(false);
         // 队列和探测阶段全部初始化后才向 Job 发布新 session，避免任务刚看到
         // connection_seq 变化就发 `[ESP901]`，随后又被这里的 DrainResponses 清掉。
         connection_seq_.fetch_add(1);
@@ -161,9 +166,15 @@ void Pipe::PipeTask() {
                     // 主循环假死（不回 `?`），keepalive 不触发，这里必须自己判死，
                     // 否则本循环会永远转圈。参考奎享 grbl/a.java:382-404 的同类机制。
                     if (++silent_polls >= kSilentPollLimit) {
-                        ESP_LOGW(TAG, "连续 %d 次探活无应答（约 %ds），判定链路假死", silent_polls,
-                                 silent_polls * kPollIntervalSec);
-                        break;
+                        if (expect_blocking_peer_.load()) {
+                            // 已知对端正长阻塞（如换纸）：不会回 `?` 属预期，不判死。
+                            // 真死连由 TCP keepalive 兜底。
+                            silent_polls = kSilentPollLimit;
+                        } else {
+                            ESP_LOGW(TAG, "连续 %d 次探活无应答（约 %ds），判定链路假死",
+                                     silent_polls, silent_polls * kPollIntervalSec);
+                            break;
+                        }
                     }
                     std::lock_guard<std::mutex> wlock(write_mutex_);
                     SendRawLocked("?", 1);
@@ -179,6 +190,7 @@ void Pipe::PipeTask() {
         ready_.store(false);
         authorized_.store(false);
         paper_changing_.store(PaperChangingState::Unknown);
+        expect_blocking_peer_.store(false);
         auth_probe_stage_ = AuthProbeStage::Idle;
         grbl_state_.store(GrblState::Unknown);
         NotifyCloud("写字机连接断开");

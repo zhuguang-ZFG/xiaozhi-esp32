@@ -98,6 +98,15 @@ public:
      * 任务层须先按 protocol §2.1 查询 Changing，再决定是否发受限 reset。
      */
     void SetTaskSessionActive(bool active) { task_session_active_.store(active); }
+
+    /**
+     * 对端可能长时间阻塞且不泵 Telnet RX（典型：Grbl paper_auto_change）。
+     * 此期间 S3 发 `?` 也收不到状态行；若仍按 silent-poll≈21s 掐链，会在等 M30
+     * ok（最长 90s）时误杀 TCP。打开后：仍靠 TCP keepalive 发现真死连，但不再
+     * 因「无字节」自行 CloseSocket。任务结束 / 断连必须清回 false。
+     */
+    void SetExpectBlockingPeer(bool expect) { expect_blocking_peer_.store(expect); }
+    bool ExpectBlockingPeer() const { return expect_blocking_peer_.load(); }
     uint32_t GetConnectionSequence() const { return connection_seq_.load(); }
     uint32_t GetResetBannerSequence() const { return reset_banner_seq_.load(); }
     uint32_t GetPaperStatusSequence() const { return paper_status_seq_.load(); }
@@ -185,6 +194,7 @@ private:
     std::atomic<bool> authorized_{false};
     std::atomic<bool> abort_reset_pending_{false};
     std::atomic<bool> task_session_active_{false};
+    std::atomic<bool> expect_blocking_peer_{false};
     std::atomic<GrblState> grbl_state_{GrblState::Unknown};
     std::atomic<uint32_t> status_report_seq_{0};
     std::atomic<uint32_t> connection_seq_{0};

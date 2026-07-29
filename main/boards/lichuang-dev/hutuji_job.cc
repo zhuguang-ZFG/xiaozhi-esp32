@@ -17,6 +17,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <algorithm>
+#include <string>
+
 #define TAG "HutujiJob"
 
 namespace hutuji {
@@ -38,6 +41,52 @@ constexpr int kDeferredMaxRetries = 8;
 constexpr int kDisconnectReplayMaxRetries = 2;
 // 暂停上限：超过则自动放弃，避免 busy_ 被无限期占用导致所有工具返回 busy。
 constexpr uint32_t kMaxPauseMs = 10 * 60 * 1000;
+
+// 设备侧出图只允许云端生成的 capability URL；scheme 限定 http/https，
+// 主机限定私有网段或 hutuji.donglicao.com。拦坏 url 在设备侧，
+// 避免 MCP 回调被诱发出站拉取任意内网/公网地址。
+static bool IsValidDrawUrl(const std::string& url) {
+    const std::string kHttps = "https://";
+    const std::string kHttp = "http://";
+    std::string rest;
+    if (url.rfind(kHttps, 0) == 0) {
+        rest = url.substr(kHttps.size());
+    } else if (url.rfind(kHttp, 0) == 0) {
+        rest = url.substr(kHttp.size());
+    } else {
+        return false;
+    }
+    const size_t slash = rest.find('/');
+    const std::string hostport = rest.substr(0, slash);
+    if (hostport.empty()) {
+        return false;
+    }
+    std::string host = hostport;
+    const size_t colon = host.find(':');
+    if (colon != std::string::npos) {
+        host = host.substr(0, colon);
+    }
+    if (host.empty()) {
+        return false;
+    }
+    std::string lowhost = host;
+    std::transform(lowhost.begin(), lowhost.end(), lowhost.begin(), ::tolower);
+    if (lowhost == "hutuji.donglicao.com") {
+        return true;
+    }
+    unsigned a, b, c, d;
+    char tail;
+    if (std::sscanf(host.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) {
+        return false;
+    }
+    if (a > 255 || b > 255 || c > 255 || d > 255) {
+        return false;
+    }
+    if (a == 10) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    return false;
+}
 
 std::string JsonString(const char* value) {
     cJSON* root = cJSON_CreateString(value);
@@ -155,6 +204,9 @@ static bool LooksLikePlannerSyncLine(const std::string& line) {
 std::string Job::StartDraw(const std::string& url) {
     if (url.empty()) {
         return "{\"error\":\"url 不能为空\"}";
+    }
+    if (!IsValidDrawUrl(url)) {
+        return "{\"error\":\"url 必须是 http(s)://<私有IP或hutuji.donglicao.com>/... 的 capability 地址\"}";
     }
     if (busy_.exchange(true)) {
         return JsonString("busy");
@@ -368,10 +420,9 @@ std::string Job::RequestPenTest() {
 
 std::string Job::StatusJson() const {
     auto& pipe = Pipe::GetInstance();
-    // 发 ? 查最新状态，等 150ms 让 PipeTask 收到并解析响应
+    // 发 ? 触发后台更新，不在 MCP 回调里 sleep 等待；直接返回当前缓存状态。
     if (pipe.IsConnected()) {
         pipe.SendRealtime('?');
-        vTaskDelay(pdMS_TO_TICKS(150));
     }
 
     std::string state;
@@ -515,6 +566,7 @@ void Job::Run() {
         ReleaseBuffer();
     }
     paper_active_.store(false);
+    Pipe::GetInstance().SetExpectBlockingPeer(false);
     Pipe::GetInstance().SetTaskSessionActive(false);
     paused_.store(false);
     repeat_mode_.store(false);
@@ -761,6 +813,8 @@ bool Job::RecoverDisconnectedDraw() {
         Notify(last_error_);
         // 不发 reset/M30。保留会话保护并轮询到换纸退出，使 Pipe 不会在
         // Changing=On 时自动跑 G1 授权探针；任务仍以 error 结束，不会续画。
+        // 换纸窗口内同样打开 blocking 标记，避免等待期间 silent-poll 误杀 TCP。
+        pipe.SetExpectBlockingPeer(true);
         const TickType_t changing_began = xTaskGetTickCount();
         while (pipe.IsConnected() &&
                (xTaskGetTickCount() - changing_began) < pdMS_TO_TICKS(kPaperOkTimeoutMs)) {
@@ -838,7 +892,11 @@ bool Job::ChangePaperAfterDraw() {
 
         // M30 是 S3 的页结束编排命令，不属于云端下载并校验的 G-code 文件。
         // SendLine 会清理旧响应，随后只等待这一条 M30 的最终 ok/error。
+        // 换纸期间 Grbl 主循环不转，PipeTask 的 `?` 收不到状态行；
+        // 提前打开 blocking 标记，避免 silent-poll≈21s 误杀 TCP。
+        pipe.SetExpectBlockingPeer(true);
         if (!pipe.SendLine("M30")) {
+            pipe.SetExpectBlockingPeer(false);
             paper_active_.store(false);
             last_error_ = "自动换纸命令发送失败";
             return false;
@@ -877,6 +935,7 @@ bool Job::ChangePaperAfterDraw() {
             pipe.SendRealtime('?');
             last_error_ = "等待自动换纸完成超时";
         }
+        pipe.SetExpectBlockingPeer(false);
         paper_active_.store(false);
         return false;
     }
@@ -885,10 +944,12 @@ bool Job::ChangePaperAfterDraw() {
     // 确认写字机确实回到 Idle 后才允许任务进入 done。
     if (!WaitForIdle(false, kPostPaperIdleTimeoutMs)) {
         last_error_ = "自动换纸后未确认 Idle: " + last_error_;
+        pipe.SetExpectBlockingPeer(false);
         paper_active_.store(false);
         return false;
     }
 
+    pipe.SetExpectBlockingPeer(false);
     paper_active_.store(false);
     if (abort_requested_.load()) {
         last_error_ = "aborted";
