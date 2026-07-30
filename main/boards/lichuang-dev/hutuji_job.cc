@@ -854,6 +854,17 @@ bool Job::WaitWhilePaused() {
             abort_requested_.store(true);
             last_error_ = "暂停超时自动取消";
             Notify("暂停超过 10 分钟，已自动取消这幅画；想画的话跟我说一声");
+            // Grbl 仍在 Hold（RequestPause 发的 !），planner 满且笔可能压在纸上。
+            // 必须冲掉 planner 否则后续 PreparePenOrigin 永远等不到 Idle。
+            pipe.SendRealtime('!');
+            for (int i = 0; i < 40; ++i) {
+                pipe.SendRealtime('?');
+                vTaskDelay(pdMS_TO_TICKS(100));
+                GrblState st = pipe.GetGrblState();
+                if (st == GrblState::Hold || st == GrblState::Idle) break;
+            }
+            pipe.PrepareAbortReset();
+            pipe.SendRealtime(static_cast<char>(0x18));
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
