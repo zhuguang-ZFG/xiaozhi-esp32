@@ -396,6 +396,15 @@ bool Pipe::ConnectOnce() {
         ESP_LOGI(TAG, "写字机 IP 已缓存到 NVS");
     }
 
+    // 每条 G-code 都是小包；关闭 Nagle，避免 Z5 已执行并在 `$1=25ms` 后失能，
+    // 下一条 XY 仍因等待前包 ACK 滞留，造成“轨迹走但笔已回弹”。
+    int no_delay = 1;
+    if (setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay)) != 0) {
+        ESP_LOGE(TAG, "设置 TCP_NODELAY 失败: errno=%d (%s)", errno, strerror(errno));
+        CloseSocket();
+        return false;
+    }
+
     // keepalive: 10s 空闲 + 3s×3 次探测 ≈ 19s 发现死连
     int keepalive = 1;
     setsockopt(sock_, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
@@ -435,8 +444,12 @@ bool Pipe::SendRawLocked(const char* data, size_t len) {
     size_t sent = 0;
     while (sent < len) {
         int n = send(sock_, data + sent, len - sent, 0);
-        if (n < 0) {
-            ESP_LOGE(TAG, "send 失败: errno=%d (%s)", errno, strerror(errno));
+        if (n <= 0) {
+            ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", n, errno,
+                     strerror(errno));
+            // 可能已经写出半条命令；半关连接唤醒 recv 泵并强制重连，绝不让下一条
+            // 命令与对端残留半行拼接。sock_mutex_ 已持有，不能调用 ShutdownSocket()。
+            shutdown(sock_, SHUT_RDWR);
             return false;
         }
         sent += static_cast<size_t>(n);

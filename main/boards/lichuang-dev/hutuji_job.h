@@ -36,7 +36,7 @@ public:
      */
     std::string RequestRepeat();
 
-    /** 笔测试：M3 落笔 → 停 1s → M5 抬笔，确认笔能触纸。 */
+    /** 笔测试：弹簧回位校准 Z0 → Z5 触纸 → Z0 抬笔。 */
     std::string RequestPenTest();
 
     /** status JSON：connected/ready/authorized/state/last_line */
@@ -50,10 +50,34 @@ private:
     static void TaskEntry(void* arg);
     void Run();
 
+    /**
+     * S2：一行在 buffer_ 里的位置（剥注释/首尾空白之后的内容 span）。
+     *
+     * 存 {offset,len} 而不是 std::string：512KB buffer 上限可含 ~24k 行，
+     * 每行一个堆 string 会产生 ~24k 次 30 字节小分配。本板
+     * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048 把 2048 字节以下的分配
+     * 强制放内部 RAM，而 ESP32-S3 内部 RAM 仅 ~512KB 且已被 WiFi/LVGL/音频
+     * 占去大半 —— 会 OOM。索引表最终约 ~192KB，其大块存储超过阈值后落 PSRAM。
+     */
+    struct LineSpan {
+        uint32_t offset;  // 相对 buffer_ 的字节偏移
+        uint32_t len;     // 行长度（不含换行/注释/首尾空白）
+    };
+
     bool DownloadToPsram(const std::string& url);
     bool VerifyCrc();
     bool StreamToGrbl();
+    /** 等待弹簧自然回位后，以受控旁路命令把当前抬笔位声明为 Z0。 */
+    bool PreparePenOrigin();
     bool WaitForIdle(bool honor_abort, uint32_t timeout_ms);
+    /**
+     * 等 ok 超时后的兜底判定：Grbl WebUI Telnet 输出无 TX 缓冲，`ok` 与 `?` 状态
+     * 报告在同核并发写同一 socket，被抢占的部分写会静默吃掉一个 `ok`（不产生
+     * error）。此时机器其实已经把在途行走完。取一份 `?` 之后的新状态报告，若为
+     * Idle 且 MPos 已达 spans[from,to) 里最后出现的 X/Y 目标，则认定这批在途行
+     * 全部完成。Run/Hold、坐标不符或拿不到新报告一律返回 false（fail closed）。
+     */
+    bool ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t from, size_t to);
     bool ChangePaperAfterDraw();
     bool RecoverDisconnectedDraw();
     void ReleaseBuffer();
@@ -73,20 +97,6 @@ private:
      * @return true 可继续转发；false 应终止（原因已写入 last_error_）
      */
     bool WaitWhilePaused();
-
-    /**
-     * S2：一行在 buffer_ 里的位置（剥注释/首尾空白之后的内容 span）。
-     *
-     * 存 {offset,len} 而不是 std::string：512KB buffer 上限可含 ~24k 行，
-     * 每行一个堆 string 会产生 ~24k 次 30 字节小分配。本板
-     * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048 把 2048 字节以下的分配
-     * 强制放内部 RAM，而 ESP32-S3 内部 RAM 仅 ~512KB 且已被 WiFi/LVGL/音频
-     * 占去大半 —— 会 OOM。索引表最终约 ~192KB，其大块存储超过阈值后落 PSRAM。
-     */
-    struct LineSpan {
-        uint32_t offset;  // 相对 buffer_ 的字节偏移
-        uint32_t len;     // 行长度（不含换行/注释/首尾空白）
-    };
 
     /**
      * 把 buffer_ 预解析成行索引，供 StreamToGrbl 预取下一行长度
@@ -119,7 +129,7 @@ private:
     std::atomic<bool> repeat_mode_{false};
     // buffer_ 是否留存着可重画的 G-code（出图成功后不释放）
     std::atomic<bool> buffer_replayable_{false};
-    // 试笔期间不接受暂停/恢复，避免 M3/M5 被实时进给保持打断。
+    // 试笔期间不接受暂停/恢复；abort 只置标志，不并发 reset 抢占 Z 运动应答。
     std::atomic<bool> pen_test_active_{false};
 
     bool stream_disconnected_ = false;

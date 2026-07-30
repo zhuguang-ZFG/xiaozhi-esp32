@@ -14,6 +14,7 @@
 #include <freertos/task.h>
 
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -35,6 +36,17 @@ constexpr uint32_t kJobIdleTimeoutMs = 30 * 60 * 1000;
 // 运动队列之后，等待时间等同剩余绘图时间，不能按普通 M-code 的 60s 判超时。
 constexpr uint32_t kPlannerSyncOkTimeoutMs = kJobIdleTimeoutMs;
 constexpr uint32_t kPostPaperIdleTimeoutMs = 5000;
+constexpr uint32_t kPenOriginIdleTimeoutMs = 5000;
+// 等 ok 超时后的状态兜底探测：只要一份新状态报告，2s 足够（`?` 是实时命令，
+// 不排 planner 队列）。
+constexpr uint32_t kOkFallbackIdleTimeoutMs = 2000;
+// 兜底次数上限。Telnet 偶发吃 ok 每页最多出现个别次；真丢行/真卡死必须暴露成
+// 失败，不能被兜底无限掩盖。
+constexpr int kMaxOkFallback = 3;
+// MPos 与在途行终点的比较容差（mm）。Grbl 报告保留 3 位小数。
+constexpr float kOkFallbackPosTolMm = 0.05f;
+// 本机 $1=25ms：Idle 后等待驱动失能和弹簧回到自然抬笔位，再声明 Z0。
+constexpr uint32_t kPenSpringReturnMs = 100;
 constexpr uint32_t kReconnectReadyTimeoutMs = 2 * 60 * 1000;
 constexpr uint32_t kResetRecoveryTimeoutMs = 30000;
 constexpr uint32_t kPaperStatusTimeoutMs = 5000;
@@ -85,9 +97,12 @@ static bool IsValidDrawUrl(const std::string& url) {
     if (a > 255 || b > 255 || c > 255 || d > 255) {
         return false;
     }
-    if (a == 10) return true;
-    if (a == 172 && b >= 16 && b <= 31) return true;
-    if (a == 192 && b == 168) return true;
+    if (a == 10)
+        return true;
+    if (a == 172 && b >= 16 && b <= 31)
+        return true;
+    if (a == 192 && b == 168)
+        return true;
     return false;
 }
 
@@ -187,6 +202,42 @@ bool Job::LooksLikeMotionLine(const std::string& line) {
     return false;
 }
 
+/**
+ * 从一行 G-code 里取某个字母词的数值（注释与首尾空白已由 ParseLines 剥掉）。
+ * @return true 找到并解析成功
+ */
+static bool ExtractGcodeWord(std::string_view line, char letter, float& out) {
+    const char* end = line.data() + line.size();
+    for (size_t i = 0; i < line.size(); ++i) {
+        if (static_cast<char>(std::toupper(static_cast<unsigned char>(line[i]))) != letter) {
+            continue;
+        }
+        const char* p = line.data() + i + 1;
+        while (p < end && *p == ' ') {
+            ++p;
+        }
+        char buf[32];
+        size_t n = 0;
+        while (p < end && n + 1 < sizeof(buf) &&
+               (std::isdigit(static_cast<unsigned char>(*p)) || *p == '+' || *p == '-' ||
+                *p == '.')) {
+            buf[n++] = *p++;
+        }
+        if (n == 0) {
+            continue;
+        }
+        buf[n] = '\0';
+        char* endp = nullptr;
+        float v = std::strtof(buf, &endp);
+        if (endp == buf) {
+            continue;
+        }
+        out = v;
+        return true;
+    }
+    return false;
+}
+
 static bool LooksLikePlannerSyncLine(const std::string& line) {
     if (line.size() < 2) {
         return false;
@@ -209,7 +260,8 @@ std::string Job::StartDraw(const std::string& url) {
         return "{\"error\":\"url 不能为空\"}";
     }
     if (!IsValidDrawUrl(url)) {
-        return "{\"error\":\"url 必须是 http(s)://<私有IP或hutuji.donglicao.com>/... 的 capability 地址\"}";
+        return "{\"error\":\"url 必须是 http(s)://<私有IP或hutuji.donglicao.com>/... 的 capability "
+               "地址\"}";
     }
     if (busy_.exchange(true)) {
         return JsonString("busy");
@@ -243,16 +295,22 @@ std::string Job::StartDraw(const std::string& url) {
 }
 
 std::string Job::RequestAbort() {
-    if (!busy_.load()) {
-        return JsonString("ok");
-    }
+    bool pen_test_active = false;
     bool paper_active = false;
     {
-        // 与 ChangePaperAfterDraw() 的 M30 提交点互斥：要么 abort 先占位，
-        // 要么 M30 已进入不可即停的换纸阶段，不能在两者之间误发软复位。
+        // busy/试笔/换纸与 abort 在同一提交锁下取快照，避免试笔启停窗口误走 0x18。
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (!busy_.load()) {
+            return JsonString("ok");
+        }
         abort_requested_.store(true);
+        pen_test_active = pen_test_active_.load();
         paper_active = paper_active_.load();
+    }
+    // 试笔只有一组已界定的短 Z 运动。若已整批提交，让它完成 Z0 抬笔比并发
+    // 0x18、触发授权探测抢应答更安全。
+    if (pen_test_active) {
+        return JsonString("试笔即将停止");
     }
     std::string state;
     {
@@ -296,6 +354,8 @@ std::string Job::RequestAbort() {
 }
 
 std::string Job::RequestPause() {
+    // busy/试笔/换纸与暂停提交在同一快照下判断；`!` 发出后不能再有普通行入 planner。
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
     }
@@ -305,8 +365,6 @@ std::string Job::RequestPause() {
     if (paper_active_.load()) {
         return JsonString("换纸中无法暂停，换纸完成后可再试");
     }
-    // 与 SendLine 持同一把锁：`!` 发出后不能再有下一行进入 planner。
-    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (paused_.exchange(true)) {
         return JsonString("已经是暂停状态");
     }
@@ -325,6 +383,7 @@ std::string Job::RequestPause() {
 }
 
 std::string Job::RequestResume() {
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
     }
@@ -382,37 +441,90 @@ std::string Job::RequestRepeat() {
 }
 
 std::string Job::RequestPenTest() {
-    // 试笔也必须独占 Telnet 写入，避免与新出图的首行或重画交错。
-    if (busy_.exchange(true)) {
-        return JsonString("busy");
-    }
     auto& pipe = Pipe::GetInstance();
-    if (!pipe.IsConnected() || !pipe.IsReady()) {
-        busy_.store(false);
-        return "{\"error\":\"写字机未连接或未就绪\"}";
+    {
+        // 试笔状态与 busy 一起发布，RequestAbort 在同一把锁下分流，不能看到半成品状态。
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (busy_.load()) {
+            return JsonString("busy");
+        }
+        if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
+            return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
+        }
+        abort_requested_.store(false);
+        busy_.store(true);
+        pen_test_active_.store(true);
+        stream_connection_seq_ = pipe.GetConnectionSequence();
+        SetState("pen_test");
     }
-    SetState("pen_test");
-    pen_test_active_.store(true);
-    // 不在 MCP 回调里 sleep：独立短任务做 M5 → M3 → 1s → M5
+
+    // 不在 MCP 回调里阻塞：独立短任务按奎享 Stepper 链路做 Z0 校准 → Z5 → Z0。
     BaseType_t created = xTaskCreate(
         [](void*) {
             auto& p = Pipe::GetInstance();
             auto& job = Job::GetInstance();
-            bool ok = false;
-            // 先抬笔建立确定的起点；随后一次明确的 M3 落笔必然可在纸上留下点迹。
-            if (p.SendLine("M5") && p.WaitOk(3000) && p.SendLine("M3 S1000") && p.WaitOk(3000)) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                ok = p.SendLine("M5") && p.WaitOk(3000);
+            bool ok = job.PreparePenOrigin();
+            bool motion_attempted = false;
+            int submitted = 0;
+            if (ok) {
+                // Z5 用 F1000（约 300ms）而不是 F10000 的机械瞬时：两条普通行仍一次
+                // 一个应答，但抬笔行能在 25ms 失能窗口前进入 planner。
+                p.DrainResponses();
+                p.SetWindowed(true);
+                struct WindowGuard {
+                    Pipe& pipe;
+                    ~WindowGuard() { pipe.SetWindowed(false); }
+                } guard{p};
+                {
+                    std::lock_guard<std::mutex> stream_lock(job.stream_mutex_);
+                    if (job.abort_requested_.load()) {
+                        ok = false;
+                    } else if (!p.IsConnected() || !p.IsReady() || !p.IsAuthorized() ||
+                               p.GetConnectionSequence() != job.stream_connection_seq_) {
+                        ok = false;
+                    } else {
+                        motion_attempted = true;
+                        if (p.SendLine("G1G90 Z5.0F1000")) {
+                            ++submitted;
+                            if (p.SendLine("G1G90 Z0.0F10000")) {
+                                ++submitted;
+                            } else {
+                                ok = false;
+                            }
+                        } else {
+                            ok = false;
+                        }
+                    }
+                }
+                for (int i = 0; i < submitted; ++i) {
+                    if (p.TakeResponse(3000) != WaitResult::Ok) {
+                        ok = false;
+                    }
+                }
             }
-            job.Notify(ok ? "笔测试完成：已落笔停 1 秒再抬笔，请看纸上有没有点"
-                          : "笔测试失败：写字机没正常应答");
-            job.SetState(ok ? "done" : "error");
-            job.pen_test_active_.store(false);
-            job.busy_.store(false);
+            // 已尝试运动时即使用户随后 abort，也等 Z0 收尾完成/链路失效；RequestAbort
+            // 不会对试笔并发软复位，这里只等待，不再发送普通命令。
+            if (motion_attempted) {
+                ok = job.WaitForIdle(false, kPenOriginIdleTimeoutMs) && ok;
+            }
+
+            bool aborted;
+            {
+                // 状态与 busy 一起撤销，杜绝 abort 在收尾缝隙误走普通绘图的 0x18 路径。
+                std::lock_guard<std::mutex> stream_lock(job.stream_mutex_);
+                aborted = job.abort_requested_.load();
+                job.SetState(aborted ? "aborted" : ok ? "done" : "error");
+                job.pen_test_active_.store(false);
+                job.busy_.store(false);
+            }
+            job.Notify(aborted ? "笔测试已停止"
+                       : ok    ? "笔测试完成：请确认笔头完成一次触纸再抬起"
+                               : "笔测试失败：写字机没正常应答");
             vTaskDelete(nullptr);
         },
         "hutuji_pentest", 3072, nullptr, 5, nullptr);
     if (created != pdTRUE) {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         pen_test_active_.store(false);
         busy_.store(false);
         SetState("idle");
@@ -452,13 +564,13 @@ std::string Job::StatusJson() const {
     // 净作画时长与 ETA（对齐奎享 f.java:j()/h()）。仅 streaming/paused/paper_change
     // 有意义；下载/校验/idle 不报，避免误导。
     if (draw_start_tick_ != 0 && lines_total_ > 0) {
-        uint32_t elapsed_ms = static_cast<uint32_t>(
-            (xTaskGetTickCount() - draw_start_tick_) * portTICK_PERIOD_MS);
+        uint32_t elapsed_ms =
+            static_cast<uint32_t>((xTaskGetTickCount() - draw_start_tick_) * portTICK_PERIOD_MS);
         uint32_t net_ms = elapsed_ms > paused_accum_ms_ ? elapsed_ms - paused_accum_ms_ : 0;
         cJSON_AddNumberToObject(root, "elapsed_ms", net_ms);
         if (lines_sent_ > 0) {
-            uint32_t eta_ms = static_cast<uint32_t>(
-                static_cast<uint64_t>(net_ms) * lines_total_ / lines_sent_);
+            uint32_t eta_ms =
+                static_cast<uint32_t>(static_cast<uint64_t>(net_ms) * lines_total_ / lines_sent_);
             cJSON_AddNumberToObject(root, "eta_ms", eta_ms);
         }
     }
@@ -518,8 +630,9 @@ void Job::Run() {
         // 从这里到任务收尾保护整个绘图会话：若中途 TCP 重连，Pipe 只能验 banner，
         // 禁止在旧 planner/换纸状态未知时自动发送 M5/G1 授权探针。
         pipe.SetTaskSessionActive(true);
-        if (!pipe.IsReady()) {
-            last_error_ = "写字机未就绪";
+        const uint32_t session_seq = pipe.GetConnectionSequence();
+        if (!pipe.IsConnected() || !pipe.IsReady() || pipe.GetConnectionSequence() != session_seq) {
+            last_error_ = "写字机未就绪或连接正在切换";
             SetState("error");
             Notify(last_error_);
             break;
@@ -530,13 +643,26 @@ void Job::Run() {
             Notify(last_error_);
             break;
         }
+        // 双读序号包住 ready/authorized 检查，防止采到刚重连但尚未探活的新 session。
+        if (pipe.GetConnectionSequence() != session_seq) {
+            last_error_ = "写字机连接在任务启动时发生切换";
+            SetState("error");
+            Notify(last_error_);
+            break;
+        }
+        stream_connection_seq_ = session_seq;
         // 授权探测已在 Pipe 建链时完成；未授权任务在这里停止，绘图载荷零字节下发。
         // 下载/校验期间就被暂停时，不能把状态改回 streaming——否则 status 谎报
         // 正在画，实际转发循环一进去就卡在暂停门上。
         int disconnect_replays = 0;
         while (true) {
             SetStreamingOrPaused();
-            ok = StreamToGrbl();
+            // 奎享完整会话会在首个笔控前旁路 G92 Z0；下载文件本身仍不含 G92。
+            // 每轮重画也必须重做：电机失能后弹簧已回位，Grbl 旧 Z 计数不再可信。
+            ok = PreparePenOrigin();
+            if (ok) {
+                ok = StreamToGrbl();
+            }
             if (ok) {
                 ok = WaitForIdle(true, kJobIdleTimeoutMs);
             }
@@ -733,9 +859,135 @@ bool Job::WaitWhilePaused() {
         vTaskDelay(pdMS_TO_TICKS(200));
     }
     // 累加本次暂停段，供 ETA 扣减（对齐奎享 g 字段）。
-    paused_accum_ms_ += static_cast<uint32_t>(
-        (xTaskGetTickCount() - pause_segment_start_) * portTICK_PERIOD_MS);
+    paused_accum_ms_ +=
+        static_cast<uint32_t>((xTaskGetTickCount() - pause_segment_start_) * portTICK_PERIOD_MS);
     return !abort_requested_.load();
+}
+
+bool Job::PreparePenOrigin() {
+    auto& pipe = Pipe::GetInstance();
+    stream_disconnected_ = false;
+
+    while (!abort_requested_.load()) {
+        if (!WaitForIdle(true, kPenOriginIdleTimeoutMs)) {
+            if (last_error_.empty()) {
+                last_error_ = "校准 Z0 前未确认写字机 Idle";
+            } else if (last_error_ != "aborted") {
+                last_error_ = "校准 Z0 前未确认写字机 Idle: " + last_error_;
+            }
+            return false;
+        }
+
+        // `$1=25` 会在 Idle 25ms 后关闭驱动；再留足时间让弹簧回到自然抬笔位。
+        vTaskDelay(pdMS_TO_TICKS(kPenSpringReturnMs));
+        bool retry_after_pause = false;
+        {
+            // 与 RequestPause/RequestAbort 共用提交锁：若 `!`/abort 先发生，本轮不得再发 G92。
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            if (abort_requested_.load()) {
+                last_error_ = "aborted";
+                return false;
+            }
+            if (paused_.load()) {
+                retry_after_pause = true;
+            } else if (!pipe.IsConnected() || !pipe.IsReady() ||
+                       pipe.GetConnectionSequence() != stream_connection_seq_) {
+                stream_disconnected_ = true;
+                last_error_ = "校准 Z0 前链路丢失";
+                return false;
+            } else if (!pipe.SendLine("G92 Z0")) {
+                stream_disconnected_ = true;
+                last_error_ = "发送 Z0 校准命令失败";
+                return false;
+            }
+        }
+        if (retry_after_pause) {
+            if (!WaitWhilePaused()) {
+                stream_disconnected_ = !pipe.IsConnected() || !pipe.IsReady() ||
+                                       pipe.GetConnectionSequence() != stream_connection_seq_;
+                if (abort_requested_.load()) {
+                    last_error_ = "aborted";
+                }
+                return false;
+            }
+            continue;
+        }
+
+        int error_code = -1;
+        const WaitResult wr = pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &error_code);
+        if (wr != WaitResult::Ok) {
+            stream_disconnected_ = !pipe.IsConnected() || !pipe.IsReady() ||
+                                   pipe.GetConnectionSequence() != stream_connection_seq_;
+            last_error_ = wr == WaitResult::Timeout
+                              ? "等待 Z0 校准应答超时"
+                              : "Z0 校准被 Grbl 拒绝 (error:" + std::to_string(error_code) + ")";
+            return false;
+        }
+        ESP_LOGI(TAG, "弹簧回位后已校准 G92 Z0");
+        return true;
+    }
+
+    last_error_ = "aborted";
+    return false;
+}
+
+bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t from, size_t to) {
+    auto& pipe = Pipe::GetInstance();
+    if (from >= to || to > spans.size()) {
+        return false;
+    }
+    if (!pipe.IsConnected() || !pipe.IsReady() ||
+        pipe.GetConnectionSequence() != stream_connection_seq_) {
+        return false;
+    }
+
+    // 必须是 `?` 之后新解析出来的报告，否则会沿用超时前的旧 Idle。
+    const uint32_t status_seq = pipe.GetStatusReportSequence();
+    if (!pipe.SendRealtime('?')) {
+        return false;
+    }
+    const TickType_t began = xTaskGetTickCount();
+    while (pipe.GetStatusReportSequence() == status_seq) {
+        if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(kOkFallbackIdleTimeoutMs)) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (pipe.GetGrblState() != GrblState::Idle) {
+        return false;  // 还在 Run/Hold：ok 没丢，是真没执行完
+    }
+
+    // 在途行里最后出现的 X / Y 目标（下载文件恒为 G90 绝对坐标，protocol §5）。
+    bool have_x = false, have_y = false;
+    float tx = 0.0f, ty = 0.0f;
+    for (size_t i = to; i > from; --i) {
+        const std::string_view sv = LineAt(spans[i - 1]);
+        float v = 0.0f;
+        if (!have_x && ExtractGcodeWord(sv, 'X', v)) {
+            tx = v;
+            have_x = true;
+        }
+        if (!have_y && ExtractGcodeWord(sv, 'Y', v)) {
+            ty = v;
+            have_y = true;
+        }
+        if (have_x && have_y) {
+            break;
+        }
+    }
+    if (!have_x && !have_y) {
+        return true;  // 纯 Z / M / 模态行：Idle 本身就证明 planner 已排空
+    }
+
+    float mx = 0.0f, my = 0.0f, mz = 0.0f;
+    pipe.GetMachinePos(mx, my, mz);
+    if (have_x && std::fabs(mx - tx) > kOkFallbackPosTolMm) {
+        return false;
+    }
+    if (have_y && std::fabs(my - ty) > kOkFallbackPosTolMm) {
+        return false;
+    }
+    return true;
 }
 
 bool Job::WaitForIdle(bool honor_abort, uint32_t timeout_ms) {
@@ -744,8 +996,11 @@ bool Job::WaitForIdle(bool honor_abort, uint32_t timeout_ms) {
 
     while (!honor_abort || !abort_requested_.load()) {
         if (honor_abort && !WaitWhilePaused()) {
-            if (last_error_.empty())
-                last_error_ = "aborted";
+            stream_disconnected_ = !pipe.IsConnected() || !pipe.IsReady() ||
+                                   pipe.GetConnectionSequence() != stream_connection_seq_;
+            if (last_error_.empty()) {
+                last_error_ = abort_requested_.load() ? "aborted" : "等待暂停恢复失败";
+            }
             return false;
         }
         if (!pipe.IsConnected() || !pipe.IsReady() ||
@@ -764,6 +1019,9 @@ bool Job::WaitForIdle(bool honor_abort, uint32_t timeout_ms) {
         // 固定 sleep 后直接读状态会在 WiFi/任务调度超过该延迟时沿用旧 Idle。
         const uint32_t status_seq = pipe.GetStatusReportSequence();
         if (!pipe.SendRealtime('?')) {
+            if (honor_abort) {
+                stream_disconnected_ = true;
+            }
             last_error_ = "查询运动完成状态失败";
             return false;
         }
@@ -891,6 +1149,13 @@ bool Job::RecoverDisconnectedDraw() {
         }
         return false;
     }
+    const uint32_t recovered_seq = pipe.GetConnectionSequence();
+    if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized() ||
+        pipe.GetConnectionSequence() != recovered_seq) {
+        last_error_ = "断连恢复完成时连接再次切换";
+        return false;
+    }
+    stream_connection_seq_ = recovered_seq;
     stream_disconnected_ = false;
     Notify("写字机已恢复，正在从头重画");
     return true;
@@ -1016,7 +1281,8 @@ std::vector<Job::LineSpan> Job::ParseLines() const {
 bool Job::StreamToGrbl() {
     auto& pipe = Pipe::GetInstance();
     stream_disconnected_ = false;
-    stream_connection_seq_ = pipe.GetConnectionSequence();
+    // stream_connection_seq_ 由 PreparePenOrigin() 在 G92 前锁定；这里不能覆盖，
+    // 否则校准后发生的重连会被误认成同一会话。
 
     // S2：预解析成行索引，获得 peek 能力（窗口化流控前提）。
     const std::vector<LineSpan> spans = ParseLines();
@@ -1037,14 +1303,18 @@ bool Job::StreamToGrbl() {
     } window_guard{pipe};
 
     // 照抄官方 stream.py 的 c_line / g_count 结构（§4.2）
-    std::deque<size_t> c_line;       // 在途各行字节数（含 +1 换行，R1）
-    size_t c_line_bytes_sum = 0;     // 在途字节数累加
-    size_t next_ = 0;                // 下一条待发
+    std::deque<size_t> c_line;    // 在途各行字节数（含 +1 换行，R1）
+    size_t c_line_bytes_sum = 0;  // 在途字节数累加
+    size_t next_ = 0;             // 下一条待发
 
     // paper_pending：遇到换纸行时先排空 c_line，排空后在此标记下走逐行模式。
     // 理由：换纸期主循环阻塞，若在途字节涌入会撑满 InputBuffer ②导致静默丢
     // 字节（§3）；换纸行 ok 等数十秒且期间禁发 G0–G3（§4.3 第一条）。
     bool paper_pending = false;
+    // 等 ok 超时后靠状态报告兜底的次数。Grbl WebUI Telnet 输出无 TX 缓冲，`ok` 与
+    // `?` 报告同核并发写同一 socket，偶发被抢占会静默吞掉一个 `ok`。超上限仍失败，
+    // 避免真丢行/真卡死被无限掩盖。
+    int ok_fallback_count = 0;
 
     // TODO(S4/Bf)：实机出图期周期性 ?，若 Telnet Bf 余量 < 300 则临时收窄窗口。
     //   自适应反压（§3.1）本次不做，S3 核心是 window=512 + 换纸行排空。
@@ -1070,8 +1340,8 @@ bool Job::StreamToGrbl() {
         // === 暂停（§4.3：停止灌新行，但必须继续收在途 ok）===
         // 暂停且无在途 → 阻塞等恢复；有在途 → 落入收分支排空（不调 WaitWhilePaused，
         // 收分支不阻塞 — 否则 c_line 永不释放）。
-        if (paused_.load() && !paper_active_.load() && !paper_pending &&
-            c_line.empty() && next_ < spans.size()) {
+        if (paused_.load() && !paper_active_.load() && !paper_pending && c_line.empty() &&
+            next_ < spans.size()) {
             if (!WaitWhilePaused()) {
                 if (last_error_.empty())
                     last_error_ = "aborted";
@@ -1106,8 +1376,9 @@ bool Job::StreamToGrbl() {
                         continue;
                     }
                     if (!pipe.SendLine(line)) {
-                        stream_disconnected_ = !pipe.IsConnected() ||
-                                               pipe.GetConnectionSequence() != stream_connection_seq_;
+                        stream_disconnected_ =
+                            !pipe.IsConnected() ||
+                            pipe.GetConnectionSequence() != stream_connection_seq_;
                         last_error_ = stream_disconnected_ ? "转发中链路丢失" : "SendLine 失败";
                         return false;
                     }
@@ -1135,11 +1406,12 @@ bool Job::StreamToGrbl() {
                         return false;
                     }
                     if (pipe.GetGrblState() == GrblState::Alarm) {
-                        last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
+                        last_error_ =
+                            "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
                         return false;
                     }
-                    uint32_t step = (kPaperOkTimeoutMs - waited > slice)
-                                        ? slice : (kPaperOkTimeoutMs - waited);
+                    uint32_t step =
+                        (kPaperOkTimeoutMs - waited > slice) ? slice : (kPaperOkTimeoutMs - waited);
                     wr = pipe.TakeResponse(step, &err);
                     if (wr != WaitResult::Timeout) {
                         break;
@@ -1198,17 +1470,23 @@ bool Job::StreamToGrbl() {
                     continue;  // c_line 已空，下一轮直接走逐行模式
                 // 否则落入收分支排空
             } else {
-                // 普通行窗口化灌
-                size_t need = line.size() + 1;  // R1：含换行符
+                // 普通行窗口化灌：一行一个 Grbl 应答。不要把多行合并成同一 TCP 包；
+                // 当前商业固件链路实测会出现少应答，窗口计数会永久漂移。
+                const size_t need = line.size() + 1;  // R1：含换行符
                 if (c_line_bytes_sum + need < kWindow || c_line.empty()) {
                     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+                    if (abort_requested_.load()) {
+                        last_error_ = "aborted";
+                        return false;
+                    }
                     if (paused_.load()) {
                         continue;
                     }
                     if (!pipe.SendLine(line)) {
-                        stream_disconnected_ = !pipe.IsConnected() ||
-                                               pipe.GetConnectionSequence() != stream_connection_seq_;
-                        last_error_ = stream_disconnected_ ? "转发中链路丢失" : "SendLine 失败";
+                        // SendRawLocked 已半关 socket；即使接收泵尚未来得及更新原子状态，
+                        // 也必须按断连恢复，不能复用可能残留半行的 session。
+                        stream_disconnected_ = true;
+                        last_error_ = "转发中链路丢失";
                         return false;
                     }
                     c_line.push_back(need);
@@ -1270,10 +1548,10 @@ bool Job::StreamToGrbl() {
             waited += step;
         }
 
-        if (wr == WaitResult::Ok || wr == WaitResult::Failed) {
+        if (wr == WaitResult::Ok) {
             c_line_bytes_sum -= c_line.front();
             c_line.pop_front();
-            ++lines_sent_;  // R2：ok 与 error 都释放窗口
+            ++lines_sent_;
 
             UpdateDisplayProgress();
             // 进度推送用 lines_sent_（已确认数），不是 next_（已发数）——已发≠已画
@@ -1282,13 +1560,17 @@ bool Job::StreamToGrbl() {
                 last_notify_tick = now;
                 float mx, my, mz;
                 pipe.GetMachinePos(mx, my, mz);
-                int pct =
-                    lines_total_ > 0 ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
+                int pct = lines_total_ > 0 ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
                 char buf[128];
                 snprintf(buf, sizeof(buf), "出图进度: %d%% (%zu/%zu行) 位置 X=%.1f Y=%.1f", pct,
                          lines_sent_, lines_total_, mx, my);
                 Notify(buf);
             }
+        } else if (wr == WaitResult::Failed) {
+            // error 同样对应并释放一条在途响应，但当前任务必须 fail closed，不能把
+            // 被拒的 Z5/XY 当成已完成继续到 M30/done。
+            last_error_ = "error:" + std::to_string(err);
+            return false;
         } else if (wr == WaitResult::Deferred) {
             // §4.3：窗口化普通行不应收到 error:8（换纸期禁发 G0–G3，普通行不会撞
             // error:8）。若意外收到，按 Failed 处理并记日志（不应发生）。
@@ -1296,9 +1578,28 @@ bool Job::StreamToGrbl() {
             last_error_ = "error:8（窗口化不应发生）";
             return false;
         } else {
-            // Timeout（§4.4：日志带 c_line 队首对应行内容，否则排障时行号是错的）
-            ESP_LOGE(TAG, "等 ok 超时，队首在途行 [%zu]: %.*s",
-                     lines_sent_, (int)front_sv.size(), front_sv.data());
+            // Timeout：Grbl WebUI Telnet 输出无 TX 缓冲，`ok`（loopTask）与 `?` 状态报告
+            // （clientCheckTask）同核同优先级无锁并发写同一 socket，偶发部分写被抢占会
+            // 静默吞掉一个 `ok`（既不推进也不报 error）。fail 前先用一份新状态报告兜底：
+            // 若 Grbl 已 Idle 且 MPos 到达在途批次末行 X/Y 目标，则这批在途行确已执行完，
+            // 整窗释放继续；否则仍 fail closed（限次数，避免真卡死/真丢行被无限掩盖）。
+            if (ok_fallback_count < kMaxOkFallback &&
+                ConfirmInFlightDoneByStatus(spans, lines_sent_, lines_sent_ + c_line.size())) {
+                ++ok_fallback_count;
+                const size_t released = c_line.size();
+                ESP_LOGW(TAG,
+                         "等 ok 超时但状态报告确认在途 %zu 行已执行完（Idle+到位），靠状态"
+                         "兜底释放整窗继续（第 %d/%d 次）",
+                         released, ok_fallback_count, kMaxOkFallback);
+                lines_sent_ += released;
+                c_line.clear();
+                c_line_bytes_sum = 0;
+                UpdateDisplayProgress();
+                continue;
+            }
+            // §4.4：日志带 c_line 队首对应行内容，否则排障时行号是错的。
+            ESP_LOGE(TAG, "等 ok 超时，队首在途行 [%zu]: %.*s", lines_sent_, (int)front_sv.size(),
+                     front_sv.data());
             pipe.SendRealtime('?');
             last_error_ = "等 ok 超时";
             return false;
