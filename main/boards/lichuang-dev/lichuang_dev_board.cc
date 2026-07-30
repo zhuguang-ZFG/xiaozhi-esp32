@@ -21,6 +21,12 @@
 #define HUTUJI_AUTO_TEST_DRAW_URL ""
 #endif
 
+// bringup §8.5（换纸中调 abort）取证镜像专用：
+//   HUTUJI_AUTO_TEST_ABORT_ON_PAPER
+// 换纸保护窗只有约 10s，云端/人手下发都难稳定命中，故由本地在窗口开启的第一时间
+// 调 hutuji.abort 等价入口。需与 HUTUJI_AUTO_TEST_DRAW 搭配才会自动产生窗口。
+// 默认关闭；取证完成后必须回刷不带此宏的镜像，别让脚手架进产品镜像。
+
 #include <cJSON.h>
 #include <esp_log.h>
 #include <stdexcept>
@@ -363,6 +369,33 @@ private:
             }
             vTaskDelete(nullptr);
         }, "auto_test", 4096, nullptr, 3, nullptr);
+#endif
+
+#ifdef HUTUJI_AUTO_TEST_ABORT_ON_PAPER
+        // bringup §8.5（换纸中调 abort）专用脚手架。设备侧 abort 唯一入口是云端
+        // MCP 工具 hutuji.abort，而换纸保护窗只有约 10s（B-13 实测 0.14s→10.11s），
+        // 语音/控制台下发都难稳定命中；这里在 paper_active 翻真的第一时间本地调用。
+        // 默认不定义此宏，正常镜像行为不变；取证后必须回刷不带宏的镜像。
+        // 注意：paper_active 也覆盖断连恢复保护窗，故触发前后都打 status 自证窗口类型。
+        xTaskCreate([](void*) {
+            auto& job = hutuji::Job::GetInstance();
+            // ponytail: 50ms 轮询、20 分钟上限，够覆盖单张 A4 出图到页尾换纸；
+            // 超时即退出，不让脚手架任务常驻。上限不够就调大循环次数。
+            for (int i = 0; i < 24000; ++i) {
+                if (job.IsPaperActive()) {
+                    ESP_LOGW("AutoTest", "换纸窗口命中，abort 前 status: %s",
+                             job.StatusJson().c_str());
+                    auto result = job.RequestAbort();
+                    ESP_LOGW("AutoTest", "换纸中 abort 返回: %s", result.c_str());
+                    ESP_LOGW("AutoTest", "abort 后 status: %s", job.StatusJson().c_str());
+                    vTaskDelete(nullptr);
+                    return;
+                }
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            ESP_LOGW("AutoTest", "20 分钟内未观察到换纸窗口，abort 脚手架退出");
+            vTaskDelete(nullptr);
+        }, "auto_test_abort", 3072, nullptr, 4, nullptr);
 #endif
     }
 

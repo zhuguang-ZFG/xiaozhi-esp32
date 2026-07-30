@@ -1115,6 +1115,17 @@ if(HUTUJI_AUTO_TEST_DRAW)
     endif()
 endif()
 
+option(HUTUJI_AUTO_TEST_ABORT_ON_PAPER "Enable hutuji bringup 8.5 scaffold: call abort as soon as paper-change window opens" OFF)
+if(HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
+    if(NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+        message(FATAL_ERROR "HUTUJI_AUTO_TEST_ABORT_ON_PAPER is only supported for lichuang-dev")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
+    if(NOT HUTUJI_AUTO_TEST_DRAW)
+        message(WARNING "HUTUJI_AUTO_TEST_ABORT_ON_PAPER without HUTUJI_AUTO_TEST_DRAW: paper window only opens if a draw is triggered from the cloud")
+    endif()
+endif()
+
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}
