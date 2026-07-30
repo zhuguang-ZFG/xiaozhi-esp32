@@ -42,7 +42,8 @@ constexpr int kPollIntervalSec = 3;
 // TCP keepalive（10/3/3 ≈ 19s）只能发现「TCP 层断了」；若对端 TCP 栈活着而 Grbl
 // 主循环假死（不回 `?`、不回状态行），keepalive 不触发，原先的无条件 continue 会
 // 永远转圈。参考奎享同类兜底：Grbl WiFi 侧 1s 发 `?`、累计 20 拍收不到状态行即断链
-// （machine/grbl/a.java:382-404），串口侧两级静默 5s+5s（machine/b/b.java:20-28）。
+// （machine/grbl/a.java:379-408），串口侧两级静默 5s + 约 1s（machine/b/b.java:20-28；
+//  第一级发 `?` 后 o 不刷新，下一 tick 即判死，见 docs/kxnx/findings/21 §2.1）。
 // 本机 kPollIntervalSec=3s，取 7 次 ≈ 21s，与 keepalive 的 19s 同量级互为补充。
 constexpr int kSilentPollLimit = 7;
 
@@ -164,7 +165,7 @@ void Pipe::PipeTask() {
                     // recv 超时：发 ? 轮询 Grbl 状态。
                     // TCP keepalive 只能发现「TCP 层死了」；若对端协议栈活着而 Grbl
                     // 主循环假死（不回 `?`），keepalive 不触发，这里必须自己判死，
-                    // 否则本循环会永远转圈。参考奎享 grbl/a.java:382-404 的同类机制。
+                    // 否则本循环会永远转圈。参考奎享 grbl/a.java:379-408 的同类机制。
                     if (++silent_polls >= kSilentPollLimit) {
                         if (expect_blocking_peer_.load()) {
                             // 已知对端正长阻塞（如换纸）：不会回 `?` 属预期，不判死。
