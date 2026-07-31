@@ -46,15 +46,23 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 using hutuji::IsResetSessionReady;
                 using hutuji::FinishStream;
                 using hutuji::IsStoppedForReset;
+                using hutuji::AdvanceSendProgress;
                 using hutuji::ShouldRetrySend;
                 using hutuji::kSendStallBudgetMs;
                 using hutuji::StreamQuiescence;
 
+                size_t sent = 0;
+
+                assert(!AdvanceSendProgress(sent, -1));
+                assert(sent == 0);
+                assert(AdvanceSendProgress(sent, 3));
+                assert(sent == 3);
+
                 assert(kSendStallBudgetMs == 20000);
 
-                // ShouldRetrySend: n > 0 => continue loop
-                assert(ShouldRetrySend(1, 0, true));
-                assert(ShouldRetrySend(100, 0, false));
+                // ShouldRetrySend 只判错误重试；正数进展由 AdvanceSendProgress 消费。
+                assert(!ShouldRetrySend(1, 0, true));
+                assert(!ShouldRetrySend(100, 0, false));
 
                 // n < 0 + EAGAIN + budget => retry
                 assert(ShouldRetrySend(-1, EAGAIN, true));
@@ -70,9 +78,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 assert(!ShouldRetrySend(-1, EPIPE, true));
                 assert(!ShouldRetrySend(-1, ECONNRESET, true));
                 assert(!ShouldRetrySend(-1, 0, true));
-
-                // n == 0 => teardown (should not happen with blocking socket)
+                // n == 0 即使 errno 残留 EAGAIN 也必须 teardown，不能无进展循环。
                 assert(!ShouldRetrySend(0, 0, true));
+                assert(!ShouldRetrySend(0, EAGAIN, true));
 
                 assert(IsStoppedForReset(true, false, false));
                 assert(IsStoppedForReset(false, true, true));

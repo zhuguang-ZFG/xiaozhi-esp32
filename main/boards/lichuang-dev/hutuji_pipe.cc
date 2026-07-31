@@ -487,26 +487,32 @@ bool Pipe::SendRawLocked(const char* data, size_t len) {
     const TickType_t send_began = xTaskGetTickCount();
     while (sent < len) {
         int n = send(sock_, data + sent, len - sent, 0);
+        const int send_errno = errno;  // 紧贴 send() 捕获，防后续调用改写 errno
+        if (AdvanceSendProgress(sent, n)) {
+            continue;
+        }
         const bool budget_remaining =
             (xTaskGetTickCount() - send_began) < pdMS_TO_TICKS(kSendStallBudgetMs);
-        if (!ShouldRetrySend(n, errno, budget_remaining)) {
-            abort_reset_token_.Cancel();
-            ready_.store(false);
-            authorized_.store(false);
-            // n>=0 说明已写出部分字节，可能残留半条命令；半关连接唤醒 recv 泵并
-            // 强制重连，绝不让下一条命令与对端残留半行拼接。sock_mutex_ 已持有，
-            // 不能调用 ShutdownSocket()。
-            if (n < 0) {
-                ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", n, errno,
-                         strerror(errno));
-            } else {
-                ESP_LOGE(TAG, "send 停滞超过 %lu ms，判定链路死亡，强制重建当前连接",
-                         (unsigned long)kSendStallBudgetMs);
-            }
-            shutdown(sock_, SHUT_RDWR);
-            return false;
+        if (ShouldRetrySend(n, send_errno, budget_remaining)) {
+            continue;
         }
-        sent += static_cast<size_t>(n);
+
+        abort_reset_token_.Cancel();
+        ready_.store(false);
+        authorized_.store(false);
+        // 之前的成功迭代可能已写出半条命令；半关连接唤醒 recv 泵并强制重连，
+        // 绝不让下一条命令与对端残留半行拼接。sock_mutex_ 已持有，不能调用
+        // ShutdownSocket()。
+        const bool send_stalled = n < 0 && (send_errno == EAGAIN || send_errno == EWOULDBLOCK);
+        if (send_stalled) {
+            ESP_LOGE(TAG, "send 停滞超过 %lu ms（errno=%d），判定链路死亡，强制重建当前连接",
+                     (unsigned long)kSendStallBudgetMs, send_errno);
+        } else {
+            ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", n, send_errno,
+                     strerror(send_errno));
+        }
+        shutdown(sock_, SHUT_RDWR);
+        return false;
     }
     return true;
 }

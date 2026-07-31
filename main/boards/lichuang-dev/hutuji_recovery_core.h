@@ -2,8 +2,9 @@
 #define HUTUJI_RECOVERY_CORE_H
 
 #include <atomic>
-#include <cstdint>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 
 namespace hutuji {
 
@@ -12,8 +13,19 @@ namespace hutuji {
  * send() 会阻塞；窗口=512 的 ok 计数流控在 `Bf:0,0` 前不会收敛（见 P2 设计 §3），
  * 故 send 必须容忍有限的停滞（正常绘图可因机器运动而数秒写不进去），
  * 超过该预算才判定链路真正死亡并重建连接。
+ * 权衡：SendRawLocked 停滞期间持 sock_mutex_，Job 层行间 abort 检查因此最坏延迟
+ * 一个预算周期（~20s，与 keepalive 超时同量级）；换取真背压下不误拆活链路。
  */
 inline constexpr uint32_t kSendStallBudgetMs = 20000;
+
+/** 只有 send() 真正写出正数字节时才推进游标，错误/零进展必须留在原位。 */
+inline constexpr bool AdvanceSendProgress(size_t& sent, int n) {
+    if (n <= 0) {
+        return false;
+    }
+    sent += static_cast<size_t>(n);
+    return true;
+}
 
 /**
  * send() 返回 EAGAIN/EWOULDBLOCK 时是否应重试（而不是立即断开）。
@@ -22,10 +34,7 @@ inline constexpr uint32_t kSendStallBudgetMs = 20000;
  * @param e 当前 errno 值（errno 是宏，不能作参数名）
  */
 inline constexpr bool ShouldRetrySend(int n, int e, bool budget_remaining) {
-    if (n > 0) {
-        return true;  // 已写出部分字节，继续剩余部分
-    }
-    return (e == EAGAIN || e == EWOULDBLOCK) && budget_remaining;
+    return n < 0 && (e == EAGAIN || e == EWOULDBLOCK) && budget_remaining;
 }
 
 inline constexpr bool IsStoppedForReset(bool idle, bool hold, bool hold_complete) {
