@@ -276,6 +276,7 @@ std::string Job::StartDraw(const std::string& url) {
         return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
     }
     abort_requested_.store(false);
+    ResetAbortResetState();
     paper_active_.store(false);
     paused_.store(false);
     // 新任务：留存的旧 G-code 作废（Run 里 DownloadToPsram 会 ReleaseBuffer）
@@ -307,8 +308,6 @@ std::string Job::RequestAbort() {
         pen_test_active = pen_test_active_.load();
         paper_active = paper_active_.load();
     }
-    // 试笔只有一组已界定的短 Z 运动。若已整批提交，让它完成 Z0 抬笔比并发
-    // 0x18、触发授权探测抢应答更安全。
     if (pen_test_active) {
         return JsonString("试笔即将停止");
     }
@@ -317,8 +316,6 @@ std::string Job::RequestAbort() {
         std::lock_guard<std::mutex> lock(state_mutex_);
         state = state_;
     }
-    // 下载/校验尚未向 Grbl 下发绘图载荷，任务循环看到 abort 后自行收尾即可；
-    // 此时软复位 Grbl 只会无谓丢坐标和触发重新探活。
     if (state == "downloading" || state == "verifying") {
         return JsonString("ok");
     }
@@ -326,31 +323,144 @@ std::string Job::RequestAbort() {
         Notify("写字机正在换纸，无法即停；换纸完成后任务将停止");
         return JsonString("换纸中无法即停，完成后即停");
     }
-    // 不在 MCP 回调里 sleep：独立短任务发 !，等 Hold 停稳后 0x18 丢弃 planner。
-    // 对端复位 banner 会触发 Pipe 重新探活，探活序列的首个 M5 负责确定抬笔。
-    xTaskCreate(
+    // 调用方先原子抢占 owner，再创建任务，杜绝并发 abort 各起一个任务。
+    bool expected = false;
+    if (!abort_reset_started_.compare_exchange_strong(expected, true)) {
+        return JsonString("ok");
+    }
+    BaseType_t created = xTaskCreate(
         [](void*) {
-            auto& pipe = Pipe::GetInstance();
             auto& job = Job::GetInstance();
-            pipe.SendRealtime('!');
-            for (int i = 0; i < 80 && !job.IsPaperActive(); ++i) {
-                pipe.SendRealtime('?');
-                vTaskDelay(pdMS_TO_TICKS(100));
-                GrblState state = pipe.GetGrblState();
-                if (state == GrblState::Hold || state == GrblState::Idle) {
+            job.PerformAbortReset(true, true);
+            vTaskDelete(nullptr);
+        },
+        "hutuji_abort", 3072, nullptr, 6, nullptr);
+    if (created != pdTRUE) {
+        abort_reset_started_.store(false);
+        abort_requested_.store(false);
+        return "{\"error\":\"无法创建 abort 恢复任务\"}";
+    }
+    return JsonString("ok");
+}
+
+bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed) {
+    auto& pipe = Pipe::GetInstance();
+    if (!owner_claimed && abort_reset_started_.exchange(true)) {
+        return WaitForAbortReset();
+    }
+
+    const uint32_t session = pipe.GetConnectionSequence();
+    const uint32_t status_before = pipe.GetStatusReportSequence();
+    const TickType_t began = xTaskGetTickCount();
+    bool success = false;
+    do {
+        if (!pipe.IsResetSessionReady(session)) {
+            break;
+        }
+        if (wait_for_stream_quiescence) {
+            while (stream_window_active_.load() &&
+                   (xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (stream_window_active_.load()) {
+                break;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            if (!pipe.IsResetSessionReady(session) || !pipe.SendRealtime('!')) {
+                break;
+            }
+        }
+
+        bool stopped = false;
+        uint32_t stopped_status_baseline = status_before;
+        while ((xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
+            if (!pipe.IsConnected() || pipe.GetConnectionSequence() != session) {
+                break;
+            }
+            const uint32_t before_query = pipe.GetStatusReportSequence();
+            if (!pipe.SendRealtime('?')) {
+                break;
+            }
+            const TickType_t query_began = xTaskGetTickCount();
+            while (pipe.GetStatusReportSequence() == before_query &&
+                   (xTaskGetTickCount() - query_began) < pdMS_TO_TICKS(1000)) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (pipe.HasFreshStoppedStatus(before_query, session)) {
+                stopped_status_baseline = before_query;
+                stopped = true;
+                break;
+            }
+        }
+        if (!stopped) {
+            break;
+        }
+
+        const uint32_t paper_before = pipe.GetPaperStatusSequence();
+        if (!pipe.SendLine("[ESP901]")) {
+            break;
+        }
+        int paper_error = -1;
+        if (pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &paper_error) != WaitResult::Ok ||
+            pipe.GetPaperStatusSequence() == paper_before ||
+            pipe.GetPaperChangingState() != PaperChangingState::Off) {
+            break;
+        }
+        const uint32_t banner_before = pipe.GetResetBannerSequence();
+        const uint32_t post_reset_status = pipe.GetStatusReportSequence();
+        if (!pipe.SendAbortReset(session, stopped_status_baseline, paper_before)) {
+            break;
+        }
+        uint32_t idle_query_baseline = post_reset_status;
+        bool queried_idle = false;
+        while ((xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
+            if (!pipe.IsConnected() || pipe.GetConnectionSequence() != session) {
+                break;
+            }
+            if (pipe.GetResetBannerSequence() > banner_before && pipe.IsReady() &&
+                pipe.IsAuthorized()) {
+                if (!queried_idle) {
+                    idle_query_baseline = pipe.GetStatusReportSequence();
+                    queried_idle = true;
+                    if (!pipe.SendRealtime('?')) {
+                        break;
+                    }
+                }
+                if (pipe.GetStatusReportSequence() != idle_query_baseline &&
+                    pipe.GetStatusReportSequence() != post_reset_status &&
+                    pipe.GetGrblState() == GrblState::Idle) {
+                    success = true;
                     break;
                 }
             }
-            if (!job.IsPaperActive()) {
-                pipe.PrepareAbortReset();
-                if (!pipe.SendRealtime(static_cast<char>(0x18))) {
-                    pipe.CancelAbortReset();
-                }
-            }
-            vTaskDelete(nullptr);
-        },
-        "hutuji_abort", 2048, nullptr, 6, nullptr);
-    return JsonString("ok");
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    } while (false);
+
+    if (!success) {
+        pipe.CancelAbortReset();
+    }
+    abort_reset_success_.store(success);
+    abort_reset_done_.store(true);
+    return success;
+}
+
+bool Job::WaitForAbortReset() {
+    const TickType_t began = xTaskGetTickCount();
+    while (!abort_reset_done_.load() &&
+           (xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs + 1000)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return abort_reset_done_.load() && abort_reset_success_.load();
+}
+
+void Job::ResetAbortResetState() {
+    abort_reset_success_.store(false);
+    abort_reset_done_.store(false);
+    abort_reset_started_.store(false);
 }
 
 std::string Job::RequestPause() {
@@ -424,6 +534,7 @@ std::string Job::RequestRepeat() {
         return "{\"error\":\"还没画过东西，没有可重画的内容\"}";
     }
     abort_requested_.store(false);
+    ResetAbortResetState();
     paused_.store(false);
     paper_active_.store(false);
     repeat_mode_.store(replay);
@@ -699,6 +810,10 @@ void Job::Run() {
         }
     } while (false);
 
+    if (abort_reset_started_.load() && !WaitForAbortReset()) {
+        last_error_ = "abort reset 恢复失败";
+        SetState("error");
+    }
     // 出图成功则留存 buffer_ 供 hutuji.repeat 复用（PSRAM 上限 512KB，只留一份）；
     // 失败/中止时释放，避免重画一份画坏的内容。
     if (ok && !abort_requested_.load() && buffer_ != nullptr) {
@@ -854,17 +969,10 @@ bool Job::WaitWhilePaused() {
             abort_requested_.store(true);
             last_error_ = "暂停超时自动取消";
             Notify("暂停超过 10 分钟，已自动取消这幅画；想画的话跟我说一声");
-            // Grbl 仍在 Hold（RequestPause 发的 !），planner 满且笔可能压在纸上。
-            // 必须冲掉 planner 否则后续 PreparePenOrigin 永远等不到 Idle。
-            pipe.SendRealtime('!');
-            for (int i = 0; i < 40; ++i) {
-                pipe.SendRealtime('?');
-                vTaskDelay(pdMS_TO_TICKS(100));
-                GrblState st = pipe.GetGrblState();
-                if (st == GrblState::Hold || st == GrblState::Idle) break;
+            // 超时复位也走唯一事务；此处窗口已无在途行，失败则 fail closed。
+            if (!PerformAbortReset(false)) {
+                last_error_ = "暂停超时 abort reset 恢复失败";
             }
-            pipe.PrepareAbortReset();
-            pipe.SendRealtime(static_cast<char>(0x18));
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -1123,35 +1231,13 @@ bool Job::RecoverDisconnectedDraw() {
     }
     paper_active_.store(false);
 
-    // 普通画线断连：只给本次主动 reset 自动解锁权限。reset 清掉可能仍在执行的 planner，
-    // 探活序列再明确抬笔并恢复授权；任何其它 reset/Alarm 仍保持人工处理。
-    const uint32_t reset_seq = pipe.GetResetBannerSequence();
-    pipe.PrepareAbortReset();
-    if (!pipe.SendRealtime(static_cast<char>(0x18))) {
-        pipe.CancelAbortReset();
-        last_error_ = "断连恢复软复位发送失败";
+    // 普通画线断连与用户 abort 共用同一受限 reset 事务和恢复判据。
+    if (!PerformAbortReset(false)) {
+        last_error_ = "断连恢复 abort reset 失败";
         return false;
     }
-
-    const TickType_t reset_began = xTaskGetTickCount();
-    while (!abort_requested_.load()) {
-        if (pipe.GetResetBannerSequence() != reset_seq && pipe.IsReady()) {
-            break;
-        }
-        if ((xTaskGetTickCount() - reset_began) >= pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
-            last_error_ = "断连恢复后重新探活超时";
-            return false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    if (abort_requested_.load()) {
-        last_error_ = "aborted";
-        return false;
-    }
-    if (!pipe.IsAuthorized()) {
-        last_error_ = "断连恢复后写字机未授权";
-        return false;
-    }
+    // 断连恢复只清 planner，不终结任务；释放 owner 供本任务后续真实 abort 使用。
+    ResetAbortResetState();
 
     // 走掉已经画坏的纸并装入新纸。成功后 ChangePaperAfterDraw 已确认 fresh Idle。
     if (!ChangePaperAfterDraw()) {
@@ -1304,14 +1390,17 @@ bool Job::StreamToGrbl() {
     UpdateDisplayProgress();
     TickType_t last_notify_tick = xTaskGetTickCount();
 
-    // S3：打开窗口化模式 — SendLine 不再清残留应答，在途应答是合法凭据。
-    // 函数退出前（无论成功/失败/abort）必须复原为逐行模式，避免影响后续
-    // status/pen_test 等单命令调用点。
+    // 窗口模式下所有在途应答必须先排空，普通状态命令不得插入窗口。
+    stream_window_active_.store(true);
     pipe.SetWindowed(true);
     struct WindowGuard {
         Pipe& pipe_ref;
-        ~WindowGuard() { pipe_ref.SetWindowed(false); }
-    } window_guard{pipe};
+        std::atomic<bool>& active;
+        ~WindowGuard() {
+            pipe_ref.SetWindowed(false);
+            active.store(false);
+        }
+    } window_guard{pipe, stream_window_active_};
 
     // 照抄官方 stream.py 的 c_line / g_count 结构（§4.2）
     std::deque<size_t> c_line;    // 在途各行字节数（含 +1 换行，R1）

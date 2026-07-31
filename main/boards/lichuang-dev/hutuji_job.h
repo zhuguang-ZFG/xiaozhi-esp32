@@ -98,6 +98,11 @@ private:
      */
     bool WaitWhilePaused();
 
+    bool PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed = false);
+    /** 等已启动的 reset 恢复收敛，busy_ 在此之前不得释放。 */
+    bool WaitForAbortReset();
+    void ResetAbortResetState();
+
     /**
      * 把 buffer_ 预解析成行索引，供 StreamToGrbl 预取下一行长度
      * （窗口化流控的 peek 前提）。解析规则与改造前内联逻辑逐字一致。
@@ -125,6 +130,12 @@ private:
     std::atomic<bool> abort_requested_{false};
     std::atomic<bool> paper_active_{false};
     std::atomic<bool> paused_{false};
+    // 每个任务最多一个 reset owner；done 前 busy_ 始终保持 true。
+    std::atomic<bool> abort_reset_started_{false};
+    std::atomic<bool> abort_reset_done_{false};
+    std::atomic<bool> abort_reset_success_{false};
+    // 仅表示窗口模式可能仍持有在途应答；普通状态命令必须等它清零。
+    std::atomic<bool> stream_window_active_{false};
     // 重画：跳过下载/校验，直接复用 buffer_
     std::atomic<bool> repeat_mode_{false};
     // buffer_ 是否留存着可重画的 G-code（出图成功后不释放）

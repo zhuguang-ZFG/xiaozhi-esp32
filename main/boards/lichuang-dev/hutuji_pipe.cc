@@ -114,6 +114,8 @@ void Pipe::PipeTask() {
             continue;
         }
         backoff_ms = kBackoffInitMs;
+        // 每次连接发布前都撤销旧 session 的 reset 权限。
+        abort_reset_token_.Cancel();
         paper_changing_.store(PaperChangingState::Unknown);
         ready_.store(false);
         authorized_.store(false);
@@ -122,6 +124,7 @@ void Pipe::PipeTask() {
             // 进行中的绘图刚经历断连。旧 planner 可能仍在运动，或 M30 换纸仍在
             // 阻塞；此时 M5/G1 授权探针都会污染状态。先交给 Job 查询 Changing。
             auth_probe_stage_ = AuthProbeStage::Idle;
+            // 仍保持业务 ready=false；仅受限 reset 事务可使用已验真的活动任务 session。
             ESP_LOGW(TAG, "绘图会话重连：暂停自动授权探测，等待断连分流");
         } else {
             auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
@@ -133,10 +136,11 @@ void Pipe::PipeTask() {
         // 若 Job 随后 `[ESP901]` 查到 Changing=On，会显式打开，避免换纸期 silent-poll
         // 误杀 TCP。
         expect_blocking_peer_.store(false);
-        // 队列和探测阶段全部初始化后才向 Job 发布新 session，避免任务刚看到
-        // connection_seq 变化就发 `[ESP901]`，随后又被这里的 DrainResponses 清掉。
-        connection_seq_.fetch_add(1);
-        connected_.store(true);
+        {
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            connection_seq_.fetch_add(1);
+            connected_.store(true);
+        }
         ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", resolved_ip_, HUTUJI_PIPE_PORT);
         NotifyCloud(std::string("写字机已连接 (") + resolved_ip_ + ")");
 
@@ -186,14 +190,19 @@ void Pipe::PipeTask() {
             }
         }
 
-        CloseSocket();
-        connected_.store(false);
-        ready_.store(false);
-        authorized_.store(false);
+        {
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            connected_.store(false);
+            ready_.store(false);
+            authorized_.store(false);
+            abort_reset_token_.Cancel();
+            CloseSocket();
+        }
         paper_changing_.store(PaperChangingState::Unknown);
         expect_blocking_peer_.store(false);
         auth_probe_stage_ = AuthProbeStage::Idle;
         grbl_state_.store(GrblState::Unknown);
+        grbl_substate_.store(-1);
         NotifyCloud("写字机连接断开");
         rx_buffer_.clear();
         // 断连必须清空应答队列：上次连接遗留的 ok 若留到下次，会被当成本次命令的
@@ -424,6 +433,9 @@ bool Pipe::ConnectOnce() {
 
 void Pipe::CloseSocket() {
     std::lock_guard<std::mutex> lock(sock_mutex_);
+    abort_reset_token_.Cancel();
+    ready_.store(false);
+    authorized_.store(false);
     if (sock_ >= 0) {
         close(sock_);
         sock_ = -1;
@@ -431,6 +443,9 @@ void Pipe::CloseSocket() {
 }
 
 void Pipe::ShutdownSocket() {
+    abort_reset_token_.Cancel();
+    ready_.store(false);
+    authorized_.store(false);
     std::lock_guard<std::mutex> lock(sock_mutex_);
     if (sock_ >= 0) {
         shutdown(sock_, SHUT_RDWR);
@@ -446,6 +461,9 @@ bool Pipe::SendRawLocked(const char* data, size_t len) {
     while (sent < len) {
         int n = send(sock_, data + sent, len - sent, 0);
         if (n <= 0) {
+            abort_reset_token_.Cancel();
+            ready_.store(false);
+            authorized_.store(false);
             ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", n, errno,
                      strerror(errno));
             // 可能已经写出半条命令；半关连接唤醒 recv 泵并强制重连，绝不让下一条
@@ -562,9 +580,11 @@ void Pipe::ProcessLine(const std::string& line) {
 
     if (line.rfind("Grbl ", 0) == 0) {
         reset_banner_seq_.fetch_add(1);
+        // 与 SendAbortReset 共用单写者锁，避免 token arm 与 banner consume 交错。
+        std::lock_guard<std::mutex> write_lock(write_mutex_);
         ready_.store(false);
         authorized_.store(false);
-        const bool recover_abort = abort_reset_pending_.exchange(false);
+        const bool recover_abort = abort_reset_token_.Consume(connection_seq_.load());
         if (recover_abort) {
             auth_probe_stage_ = AuthProbeStage::WaitingAbortUnlockOk;
         } else if (task_session_active_.load()) {
@@ -579,8 +599,6 @@ void Pipe::ProcessLine(const std::string& line) {
             last_response_.clear();
             last_error_code_ = -1;
         }
-        ESP_LOGW(TAG, "检测到对端复位，重新探活");
-        std::lock_guard<std::mutex> lock(write_mutex_);
         if (recover_abort) {
             // 仅处理本机刚发出的 abort reset 所产生的锁定；其它 Alarm 不自动解锁。
             SendRawLocked("$X\n", 3);
@@ -655,6 +673,7 @@ void Pipe::ParseStatusReport(const std::string& line) {
     else if (state_str == "Sleep")
         gs = GrblState::Sleep;
 
+    grbl_substate_.store(colon != std::string::npos ? sub_code : -1);
     GrblState prev = grbl_state_.exchange(gs);
     if (prev != gs) {
         ESP_LOGI(TAG, "Grbl 状态: %s -> %s", GrblStateName(prev), GrblStateName(gs));
@@ -869,6 +888,47 @@ bool Pipe::SendLine(const std::string& line) {
         return false;
     }
     ESP_LOGI(TAG, "-> %s", line.c_str());
+    return true;
+}
+
+bool Pipe::HasFreshStoppedStatus(uint32_t previous_status_sequence,
+                                 uint32_t expected_connection_sequence) const {
+    if (connection_seq_.load() != expected_connection_sequence ||
+        status_report_seq_.load() == previous_status_sequence) {
+        return false;
+    }
+    const GrblState state = grbl_state_.load();
+    return IsStoppedForReset(state == GrblState::Idle, state == GrblState::Hold,
+                             grbl_substate_.load() == 0);
+}
+
+bool Pipe::SendAbortReset(uint32_t expected_connection_sequence,
+                          uint32_t previous_status_sequence,
+                          uint32_t previous_paper_status_sequence) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    const bool same_session = connection_seq_.load() == expected_connection_sequence;
+    const bool reset_session_ready = IsResetSessionReady(expected_connection_sequence);
+    const bool fresh_stopped = HasFreshStoppedStatus(previous_status_sequence,
+                                                     expected_connection_sequence);
+    const bool fresh_paper = paper_status_seq_.load() != previous_paper_status_sequence;
+    if (!same_session) {
+        abort_reset_token_.Cancel();
+        return false;
+    }
+    if (!CanSendAbortReset(connected_.load(), reset_session_ready, true, fresh_stopped,
+                           fresh_paper, paper_changing_.load() == PaperChangingState::Off) ||
+        !abort_reset_token_.Arm(expected_connection_sequence)) {
+        return false;
+    }
+
+    // banner 恢复完成前不允许任何新任务复用旧 ready/authorized。
+    ready_.store(false);
+    authorized_.store(false);
+    const char reset = static_cast<char>(0x18);
+    if (!SendRawLocked(&reset, 1)) {
+        abort_reset_token_.Cancel();
+        return false;
+    }
     return true;
 }
 

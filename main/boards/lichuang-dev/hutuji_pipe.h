@@ -4,6 +4,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include "hutuji_recovery_core.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -97,7 +98,12 @@ public:
      * 绘图会话存续期间，重连只验 Telnet banner，不自动发送授权运动探针。
      * 任务层须先按 protocol §2.1 查询 Changing，再决定是否发受限 reset。
      */
-    void SetTaskSessionActive(bool active) { task_session_active_.store(active); }
+    void SetTaskSessionActive(bool active) {
+        task_session_active_.store(active);
+        if (!active && !authorized_.load()) {
+            ready_.store(false);
+        }
+    }
 
     /**
      * 对端可能长时间阻塞且不泵 Telnet RX（典型：Grbl paper_auto_change）。
@@ -111,11 +117,29 @@ public:
     uint32_t GetResetBannerSequence() const { return reset_banner_seq_.load(); }
     uint32_t GetPaperStatusSequence() const { return paper_status_seq_.load(); }
     PaperChangingState GetPaperChangingState() const { return paper_changing_.load(); }
+    /** 当前连接已验明 Grbl，可执行受限 reset；活动任务重连时不等同于业务 ready。 */
+    bool IsResetSessionReady(uint32_t expected_connection_sequence) const {
+        return connected_.load() && connection_seq_.load() == expected_connection_sequence &&
+               (ready_.load() || task_session_active_.load());
+    }
+    /**
+     * previous_status_sequence 之后同一连接的新报告是否已停稳。
+     * Hold:0 表示减速完成；Hold:1 仍在减速，不能授权 reset。
+     */
+    bool HasFreshStoppedStatus(uint32_t previous_status_sequence,
+                               uint32_t expected_connection_sequence) const;
 
-    /** 标记下一次 Grbl reset banner 来自本机 abort；仅该次允许自动 `$X` 恢复。 */
-    void PrepareAbortReset() { abort_reset_pending_.store(true); }
-    /** reset 字符未发出去时撤销许可，防止下一次无关 banner 被自动解锁。 */
-    void CancelAbortReset() { abort_reset_pending_.store(false); }
+    /**
+     * 原子提交 abort reset：在单写者锁内复核同一 ready 会话、新停稳状态和
+     * Changing=Off，绑定本次 banner 权限后先撤销 ready/authorized 再发送 0x18。
+     */
+    bool SendAbortReset(uint32_t expected_connection_sequence,
+                        uint32_t previous_status_sequence,
+                        uint32_t previous_paper_status_sequence);
+
+    bool IsAbortResetPending() const { return abort_reset_token_.Pending(); }
+    /** reset banner 超时或调用方放弃时撤销一次性权限。 */
+    void CancelAbortReset() { abort_reset_token_.Cancel(); }
 
     GrblState GetGrblState() const { return grbl_state_.load(); }
     uint32_t GetStatusReportSequence() const { return status_report_seq_.load(); }
@@ -192,10 +216,11 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> authorized_{false};
-    std::atomic<bool> abort_reset_pending_{false};
+    AbortResetToken abort_reset_token_;
     std::atomic<bool> task_session_active_{false};
     std::atomic<bool> expect_blocking_peer_{false};
     std::atomic<GrblState> grbl_state_{GrblState::Unknown};
+    std::atomic<int> grbl_substate_{-1};
     std::atomic<uint32_t> status_report_seq_{0};
     std::atomic<uint32_t> connection_seq_{0};
     std::atomic<uint32_t> reset_banner_seq_{0};
