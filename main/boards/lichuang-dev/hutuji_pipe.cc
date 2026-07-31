@@ -114,8 +114,6 @@ void Pipe::PipeTask() {
             continue;
         }
         backoff_ms = kBackoffInitMs;
-        // 每次连接发布前都撤销旧 session 的 reset 权限。
-        abort_reset_token_.Cancel();
         paper_changing_.store(PaperChangingState::Unknown);
         ready_.store(false);
         authorized_.store(false);
@@ -128,8 +126,6 @@ void Pipe::PipeTask() {
             ESP_LOGW(TAG, "绘图会话重连：暂停自动授权探测，等待断连分流");
         } else {
             auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
-            std::lock_guard<std::mutex> lock(write_mutex_);
-            SendRawLocked("$I\n", 3);
         }
 
         // 新连接重建时先关闭「对端正长阻塞」标记：当前仅凭 banner 不能判定是否换纸。
@@ -138,8 +134,13 @@ void Pipe::PipeTask() {
         expect_blocking_peer_.store(false);
         {
             std::lock_guard<std::mutex> lock(write_mutex_);
+            // 撤销旧 token 与新 session 发布在线性化点内完成。
+            abort_reset_token_.Cancel();
             connection_seq_.fetch_add(1);
             connected_.store(true);
+            if (!task_session_active_.load()) {
+                SendRawLocked("$I\n", 3);
+            }
         }
         ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", resolved_ip_, HUTUJI_PIPE_PORT);
         NotifyCloud(std::string("写字机已连接 (") + resolved_ip_ + ")");
@@ -148,10 +149,21 @@ void Pipe::PipeTask() {
         // 连续「探活已发但一个字节都没回」的次数。任何数据到达即归零。
         int silent_polls = 0;
         while (true) {
-            int len = recv(sock_, buf, sizeof(buf), 0);
+            int len = -1;
+            uint32_t receive_epoch = 0;
+            {
+                // 全局锁序：reset_receive_mutex_ -> write_mutex_。完整行分派也在 receive
+                // 排他区内，不能让已 recv 到本地 buf 的旧 banner 跨过 reset Arm 边界。
+                std::lock_guard<std::mutex> receive_lock(reset_receive_mutex_);
+                len = recv(sock_, buf, sizeof(buf), 0);
+                if (len > 0) {
+                    receive_epoch = reset_receive_epoch_.fetch_add(1U) + 1U;
+                    silent_polls = 0;
+                    OnRxData(buf, static_cast<size_t>(len), receive_epoch);
+                }
+            }
             if (len > 0) {
-                silent_polls = 0;
-                OnRxData(buf, static_cast<size_t>(len));
+                continue;
             } else if (len == 0) {
                 break;
             } else {
@@ -193,10 +205,7 @@ void Pipe::PipeTask() {
         {
             std::lock_guard<std::mutex> lock(write_mutex_);
             connected_.store(false);
-            ready_.store(false);
-            authorized_.store(false);
-            abort_reset_token_.Cancel();
-            CloseSocket();
+            CloseSocketLocked();
         }
         paper_changing_.store(PaperChangingState::Unknown);
         expect_blocking_peer_.store(false);
@@ -204,7 +213,10 @@ void Pipe::PipeTask() {
         grbl_state_.store(GrblState::Unknown);
         grbl_substate_.store(-1);
         NotifyCloud("写字机连接断开");
-        rx_buffer_.clear();
+        {
+            std::lock_guard<std::mutex> receive_lock(reset_receive_mutex_);
+            rx_buffer_.clear();
+        }
         // 断连必须清空应答队列：上次连接遗留的 ok 若留到下次，会被当成本次命令的
         // 应答，窗口化流控下等于在途计数凭空少一格（最终死锁）。
         DrainResponses();
@@ -432,24 +444,38 @@ bool Pipe::ConnectOnce() {
 }
 
 void Pipe::CloseSocket() {
-    std::lock_guard<std::mutex> lock(sock_mutex_);
+    std::lock_guard<std::mutex> write_lock(write_mutex_);
+    CloseSocketLocked();
+}
+
+void Pipe::CloseSocketLocked() {
     abort_reset_token_.Cancel();
     ready_.store(false);
     authorized_.store(false);
+    std::lock_guard<std::mutex> sock_lock(sock_mutex_);
     if (sock_ >= 0) {
         close(sock_);
         sock_ = -1;
     }
 }
 
-void Pipe::ShutdownSocket() {
+void Pipe::ShutdownSocket(uint32_t expected_connection_sequence) {
+    std::lock_guard<std::mutex> write_lock(write_mutex_);
+    if (connection_seq_.load() != expected_connection_sequence) {
+        return;
+    }
     abort_reset_token_.Cancel();
     ready_.store(false);
     authorized_.store(false);
-    std::lock_guard<std::mutex> lock(sock_mutex_);
+    std::lock_guard<std::mutex> sock_lock(sock_mutex_);
     if (sock_ >= 0) {
         shutdown(sock_, SHUT_RDWR);
     }
+}
+
+void Pipe::CancelAbortReset() {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    abort_reset_token_.Cancel();
 }
 
 bool Pipe::SendRawLocked(const char* data, size_t len) {
@@ -476,7 +502,7 @@ bool Pipe::SendRawLocked(const char* data, size_t len) {
     return true;
 }
 
-void Pipe::OnRxData(const uint8_t* data, size_t data_len) {
+void Pipe::OnRxData(const uint8_t* data, size_t data_len, uint32_t receive_epoch) {
     rx_buffer_.append(reinterpret_cast<const char*>(data), data_len);
 
     // 先拆完整行，再丢超长残段——避免同分片里的 ok 被 clear 掉（M2 / protocol §3）
@@ -488,7 +514,7 @@ void Pipe::OnRxData(const uint8_t* data, size_t data_len) {
             line.pop_back();
         }
         if (!line.empty()) {
-            ProcessLine(line);
+            ProcessLine(line, receive_epoch);
         }
     }
     if (rx_buffer_.size() > kRxLineMax) {
@@ -517,7 +543,7 @@ int Pipe::ParseErrorCode(const std::string& line) {
     return code;
 }
 
-void Pipe::ProcessLine(const std::string& line) {
+void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         last_line_ = line;
@@ -579,12 +605,12 @@ void Pipe::ProcessLine(const std::string& line) {
     }
 
     if (line.rfind("Grbl ", 0) == 0) {
-        reset_banner_seq_.fetch_add(1);
-        // 与 SendAbortReset 共用单写者锁，避免 token arm 与 banner consume 交错。
         std::lock_guard<std::mutex> write_lock(write_mutex_);
+        const uint32_t banner_generation = reset_banner_seq_.fetch_add(1) + 1U;
         ready_.store(false);
         authorized_.store(false);
-        const bool recover_abort = abort_reset_token_.Consume(connection_seq_.load());
+        const bool recover_abort = abort_reset_token_.Consume(
+            connection_seq_.load(), banner_generation, receive_epoch);
         if (recover_abort) {
             auth_probe_stage_ = AuthProbeStage::WaitingAbortUnlockOk;
         } else if (task_session_active_.load()) {
@@ -904,24 +930,59 @@ bool Pipe::HasFreshStoppedStatus(uint32_t previous_status_sequence,
 
 bool Pipe::SendAbortReset(uint32_t expected_connection_sequence,
                           uint32_t previous_status_sequence,
-                          uint32_t previous_paper_status_sequence) {
+                          uint32_t previous_paper_status_sequence,
+                          uint32_t previous_banner_sequence,
+                          bool allow_unready_reconnect) {
+    // 先挡住 recv 泵并处理 socket 中已经到达的旧字节；只有这些字节完成分派后，
+    // 才能定义本次 0x18 的接收 epoch 边界。
+    std::unique_lock<std::mutex> receive_lock(reset_receive_mutex_);
+    std::string pending_rx;
+    uint32_t pending_epoch = reset_receive_epoch_.load();
+    {
+        std::lock_guard<std::mutex> sock_lock(sock_mutex_);
+        uint8_t pending[256];
+        while (sock_ >= 0) {
+            int n = recv(sock_, pending, sizeof(pending), MSG_DONTWAIT);
+            if (n <= 0) {
+                break;
+            }
+            pending_rx.append(reinterpret_cast<const char*>(pending), static_cast<size_t>(n));
+            pending_epoch = reset_receive_epoch_.fetch_add(1U) + 1U;
+        }
+    }
+    if (!pending_rx.empty()) {
+        OnRxData(reinterpret_cast<const uint8_t*>(pending_rx.data()), pending_rx.size(),
+                 pending_epoch);
+    }
+    // 旧残段跨越 0x18 边界时无法证明后续完整 banner 属于本次 reset，直接拒绝。
+    if (!rx_buffer_.empty()) {
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(write_mutex_);
     const bool same_session = connection_seq_.load() == expected_connection_sequence;
-    const bool reset_session_ready = IsResetSessionReady(expected_connection_sequence);
+    const bool reset_session_ready =
+        IsResetSessionReady(expected_connection_sequence, allow_unready_reconnect);
     const bool fresh_stopped = HasFreshStoppedStatus(previous_status_sequence,
                                                      expected_connection_sequence);
     const bool fresh_paper = paper_status_seq_.load() != previous_paper_status_sequence;
-    if (!same_session) {
+    const bool banner_unchanged = reset_banner_seq_.load() == previous_banner_sequence;
+    if (!same_session || !banner_unchanged) {
         abort_reset_token_.Cancel();
         return false;
     }
     if (!CanSendAbortReset(connected_.load(), reset_session_ready, true, fresh_stopped,
-                           fresh_paper, paper_changing_.load() == PaperChangingState::Off) ||
-        !abort_reset_token_.Arm(expected_connection_sequence)) {
+                           fresh_paper, paper_changing_.load() == PaperChangingState::Off)) {
         return false;
     }
 
-    // banner 恢复完成前不允许任何新任务复用旧 ready/authorized。
+    // recv 泵仍被挡住：先绑定当前 epoch/下一代 banner，再完整写出 0x18；解锁后
+    // 第一个新 recv 必然获得严格晚于基线的 epoch，旧排队 banner 无法 Consume。
+    const uint32_t receive_baseline = reset_receive_epoch_.load();
+    if (!abort_reset_token_.Arm(expected_connection_sequence, previous_banner_sequence,
+                                receive_baseline)) {
+        return false;
+    }
     ready_.store(false);
     authorized_.store(false);
     const char reset = static_cast<char>(0x18);

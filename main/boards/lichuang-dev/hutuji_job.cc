@@ -263,9 +263,19 @@ std::string Job::StartDraw(const std::string& url) {
         return "{\"error\":\"url 必须是 http(s)://<私有IP或hutuji.donglicao.com>/... 的 capability "
                "地址\"}";
     }
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
         return JsonString("busy");
     }
+    if (!ResetAbortResetState()) {
+        busy_.store(false);
+        return "{\"error\":\"上一 reset owner 尚未收敛\"}";
+    }
+    stream_quiescence_.store(StreamQuiescence::Idle, std::memory_order_release);
+    abort_hold_confirmed_.store(false);
+    abort_requested_.store(false);
+    paused_.store(false);
+    paper_active_.store(false);
     auto& pipe = Pipe::GetInstance();
     if (!pipe.IsConnected()) {
         busy_.store(false);
@@ -275,10 +285,6 @@ std::string Job::StartDraw(const std::string& url) {
         busy_.store(false);
         return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
     }
-    abort_requested_.store(false);
-    ResetAbortResetState();
-    paper_active_.store(false);
-    paused_.store(false);
     // 新任务：留存的旧 G-code 作废（Run 里 DownloadToPsram 会 ReleaseBuffer）
     repeat_mode_.store(false);
     buffer_replayable_.store(false);
@@ -323,59 +329,72 @@ std::string Job::RequestAbort() {
         Notify("写字机正在换纸，无法即停；换纸完成后任务将停止");
         return JsonString("换纸中无法即停，完成后即停");
     }
-    // 调用方先原子抢占 owner，再创建任务，杜绝并发 abort 各起一个任务。
-    bool expected = false;
-    if (!abort_reset_started_.compare_exchange_strong(expected, true)) {
-        return JsonString("ok");
-    }
-    BaseType_t created = xTaskCreate(
-        [](void*) {
-            auto& job = Job::GetInstance();
-            job.PerformAbortReset(true, true);
-            vTaskDelete(nullptr);
-        },
-        "hutuji_abort", 3072, nullptr, 6, nullptr);
-    if (created != pdTRUE) {
-        abort_reset_started_.store(false);
-        abort_requested_.store(false);
-        return "{\"error\":\"无法创建 abort 恢复任务\"}";
+    {
+        // owner 抢占与 Run 的 busy_ 释放共用 stream_mutex_，避免任务收尾后迟到创建 reset。
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (!busy_.load()) {
+            return JsonString("ok");
+        }
+        if (pen_test_active_.load()) {
+            return JsonString("试笔即将停止");
+        }
+        if (paper_active_.load()) {
+            Notify("写字机正在换纸，无法即停；换纸完成后任务将停止");
+            return JsonString("换纸中无法即停，完成后即停");
+        }
+        if (!StartAbortResetTask()) {
+            abort_requested_.store(false);
+            return "{\"error\":\"无法创建 abort 恢复任务\"}";
+        }
     }
     return JsonString("ok");
 }
 
-bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed) {
+bool Job::StartAbortResetTask() {
+    if (!abort_reset_owner_.TryClaim()) {
+        return true;
+    }
+    abort_reset_worker_active_.store(true, std::memory_order_release);
+    BaseType_t created = xTaskCreate(
+        [](void*) {
+            auto& job = Job::GetInstance();
+            job.PerformAbortReset(true, true, false);
+            job.abort_reset_worker_active_.store(false, std::memory_order_release);
+            vTaskDelete(nullptr);
+        },
+        "hutuji_abort", 3072, nullptr, 6, nullptr);
+    if (created != pdTRUE) {
+        abort_reset_worker_active_.store(false, std::memory_order_release);
+        abort_reset_owner_.CancelClaim();
+        return false;
+    }
+    return true;
+}
+
+bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
+                            bool allow_unready_reconnect) {
     auto& pipe = Pipe::GetInstance();
-    if (!owner_claimed && abort_reset_started_.exchange(true)) {
+    if (!owner_claimed && !abort_reset_owner_.TryClaim()) {
         return WaitForAbortReset();
     }
 
     const uint32_t session = pipe.GetConnectionSequence();
-    const uint32_t status_before = pipe.GetStatusReportSequence();
+    abort_reset_session_.store(session, std::memory_order_release);
     const TickType_t began = xTaskGetTickCount();
     bool success = false;
     do {
-        if (!pipe.IsResetSessionReady(session)) {
-            break;
-        }
-        if (wait_for_stream_quiescence) {
-            while (stream_window_active_.load() &&
-                   (xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            if (stream_window_active_.load()) {
-                break;
-            }
-        }
-
+        // `!` 必须先于任何可能长达数十分钟的 planner-sync 应答等待。它只是
+        // 安全停机字符，不是 reset；即使旧流已 Failed 也要先尽力停住机器。
         {
             std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-            if (!pipe.IsResetSessionReady(session) || !pipe.SendRealtime('!')) {
+            if (!pipe.IsResetSessionReady(session, allow_unready_reconnect) ||
+                !pipe.SendRealtime('!')) {
                 break;
             }
         }
 
         bool stopped = false;
-        uint32_t stopped_status_baseline = status_before;
+        uint32_t stopped_status_baseline = pipe.GetStatusReportSequence();
         while ((xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
             if (!pipe.IsConnected() || pipe.GetConnectionSequence() != session) {
                 break;
@@ -392,6 +411,7 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed)
             if (pipe.HasFreshStoppedStatus(before_query, session)) {
                 stopped_status_baseline = before_query;
                 stopped = true;
+                abort_hold_confirmed_.store(true, std::memory_order_release);
                 break;
             }
         }
@@ -399,9 +419,24 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed)
             break;
         }
 
-        const uint32_t paper_before = pipe.GetPaperStatusSequence();
-        if (!pipe.SendLine("[ESP901]")) {
-            break;
+        if (wait_for_stream_quiescence) {
+            while (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire)) &&
+                   (xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
+
+        uint32_t paper_before = 0;
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            if (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire)) ||
+                !pipe.IsResetSessionReady(session, allow_unready_reconnect)) {
+                break;
+            }
+            paper_before = pipe.GetPaperStatusSequence();
+            if (!pipe.SendLine("[ESP901]")) {
+                break;
+            }
         }
         int paper_error = -1;
         if (pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &paper_error) != WaitResult::Ok ||
@@ -411,7 +446,8 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed)
         }
         const uint32_t banner_before = pipe.GetResetBannerSequence();
         const uint32_t post_reset_status = pipe.GetStatusReportSequence();
-        if (!pipe.SendAbortReset(session, stopped_status_baseline, paper_before)) {
+        if (!pipe.SendAbortReset(session, stopped_status_baseline, paper_before, banner_before,
+                                 allow_unready_reconnect)) {
             break;
         }
         uint32_t idle_query_baseline = post_reset_status;
@@ -420,8 +456,9 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed)
             if (!pipe.IsConnected() || pipe.GetConnectionSequence() != session) {
                 break;
             }
-            if (pipe.GetResetBannerSequence() > banner_before && pipe.IsReady() &&
-                pipe.IsAuthorized()) {
+            const uint32_t banner_generation = pipe.GetResetBannerSequence();
+            if (banner_generation == AbortResetToken::NextGeneration(banner_before) &&
+                pipe.IsReady() && pipe.IsAuthorized()) {
                 if (!queried_idle) {
                     idle_query_baseline = pipe.GetStatusReportSequence();
                     queried_idle = true;
@@ -442,25 +479,37 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed)
 
     if (!success) {
         pipe.CancelAbortReset();
+        // 不解锁未知 Alarm。若普通 abort 未能完成受限 reset，只拆会话阻止继续写；
+        // busy 在 owner 终态发布后才释放，下一次连接仍须重新验明。
+        if (pipe.GetGrblState() != GrblState::Alarm) {
+            pipe.ShutdownSocket(session);
+        }
     }
-    abort_reset_success_.store(success);
-    abort_reset_done_.store(true);
+    if (!abort_reset_owner_.Complete(success)) {
+        pipe.CancelAbortReset();
+        return false;
+    }
     return success;
 }
 
 bool Job::WaitForAbortReset() {
     const TickType_t began = xTaskGetTickCount();
-    while (!abort_reset_done_.load() &&
-           (xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs + 1000)) {
+    bool teardown_sent = false;
+    while (abort_reset_owner_.Running() ||
+           abort_reset_worker_active_.load(std::memory_order_acquire)) {
+        if (!teardown_sent &&
+            (xTaskGetTickCount() - began) >= pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
+            // 超预算即拆 session 令有界等待尽快失败；只有 worker 能发布 terminal phase。
+            Pipe::GetInstance().ShutdownSocket(
+                abort_reset_session_.load(std::memory_order_acquire));
+            teardown_sent = true;
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    return abort_reset_done_.load() && abort_reset_success_.load();
+    return abort_reset_owner_.Phase() == AbortResetOwnerPhase::Succeeded;
 }
-
-void Job::ResetAbortResetState() {
-    abort_reset_success_.store(false);
-    abort_reset_done_.store(false);
-    abort_reset_started_.store(false);
+bool Job::ResetAbortResetState() {
+    return abort_reset_owner_.ResetIfSettled();
 }
 
 std::string Job::RequestPause() {
@@ -515,6 +564,7 @@ std::string Job::RequestResume() {
 }
 
 std::string Job::RequestRepeat() {
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
         return JsonString("busy");
     }
@@ -533,8 +583,13 @@ std::string Job::RequestRepeat() {
         busy_.store(false);
         return "{\"error\":\"还没画过东西，没有可重画的内容\"}";
     }
+    if (!ResetAbortResetState()) {
+        busy_.store(false);
+        return "{\"error\":\"上一 reset owner 尚未收敛\"}";
+    }
+    stream_quiescence_.store(StreamQuiescence::Idle, std::memory_order_release);
+    abort_hold_confirmed_.store(false);
     abort_requested_.store(false);
-    ResetAbortResetState();
     paused_.store(false);
     paper_active_.store(false);
     repeat_mode_.store(replay);
@@ -777,14 +832,19 @@ void Job::Run() {
             if (ok) {
                 ok = WaitForIdle(true, kJobIdleTimeoutMs);
             }
-            if (ok || abort_requested_.load() || !stream_disconnected_) {
+            if (ok || !stream_disconnected_) {
                 break;
             }
             if (++disconnect_replays > kDisconnectReplayMaxRetries) {
                 last_error_ = "断连自动重画次数耗尽";
                 break;
             }
+            // 即使 abort 已到达，也必须完成重连后的 Changing 分流和安全 reset；
+            // 不能让旧 planner 在 S3 已放弃任务后继续运动。
             if (!RecoverDisconnectedDraw()) {
+                break;
+            }
+            if (abort_requested_.load()) {
                 break;
             }
             ESP_LOGW(TAG, "断连恢复完成，从 PSRAM 第 1 行重画（%d/%d）", disconnect_replays,
@@ -810,29 +870,51 @@ void Job::Run() {
         }
     } while (false);
 
-    if (abort_reset_started_.load() && !WaitForAbortReset()) {
-        last_error_ = "abort reset 恢复失败";
-        SetState("error");
+    bool reset_ok = true;
+    while (true) {
+        std::unique_lock<std::mutex> stream_lock(stream_mutex_);
+        if (abort_reset_owner_.Running() ||
+            abort_reset_worker_active_.load(std::memory_order_acquire)) {
+            stream_lock.unlock();
+            if (!WaitForAbortReset()) {
+                reset_ok = false;
+            }
+            continue;
+        }
+        if (abort_reset_owner_.Started() && !abort_reset_owner_.Succeeded()) {
+            reset_ok = false;
+        }
+        if (!ResetAbortResetState()) {
+            stream_lock.unlock();
+            continue;
+        }
+        if (!reset_ok) {
+            last_error_ = "abort reset 恢复失败";
+            SetState("error");
+            ok = false;
+        }
+
+        // stream_mutex 同时是新任务的发布门：旧任务全部资源/状态写入必须先完成。
+        if (ok && !abort_requested_.load() && buffer_ != nullptr) {
+            buffer_replayable_.store(true);
+        } else {
+            buffer_replayable_.store(false);
+            ReleaseBuffer();
+        }
+        paper_active_.store(false);
+        paused_.store(false);
+        repeat_mode_.store(false);
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            ESP_LOGI(TAG, "任务结束 state=%s err=%s replayable=%d", state_.c_str(),
+                     last_error_.c_str(), (int)buffer_replayable_.load());
+        }
+        Pipe::GetInstance().SetExpectBlockingPeer(false);
+        Pipe::GetInstance().SetTaskSessionActive(false);
+        // 必须是旧任务最后一次共享写入；解锁后 StartDraw/Repeat/PenTest 才可发布新任务。
+        busy_.store(false, std::memory_order_release);
+        break;
     }
-    // 出图成功则留存 buffer_ 供 hutuji.repeat 复用（PSRAM 上限 512KB，只留一份）；
-    // 失败/中止时释放，避免重画一份画坏的内容。
-    if (ok && !abort_requested_.load() && buffer_ != nullptr) {
-        buffer_replayable_.store(true);
-    } else {
-        buffer_replayable_.store(false);
-        ReleaseBuffer();
-    }
-    paper_active_.store(false);
-    Pipe::GetInstance().SetExpectBlockingPeer(false);
-    Pipe::GetInstance().SetTaskSessionActive(false);
-    paused_.store(false);
-    repeat_mode_.store(false);
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        ESP_LOGI(TAG, "任务结束 state=%s err=%s replayable=%d", state_.c_str(), last_error_.c_str(),
-                 (int)buffer_replayable_.load());
-    }
-    busy_.store(false);
 }
 
 bool Job::DownloadToPsram(const std::string& url) {
@@ -962,16 +1044,15 @@ bool Job::WaitWhilePaused() {
             last_error_ = "暂停中链路丢失";
             return false;
         }
-        // 暂停不能无限期挂住 busy_，否则 draw/repeat/pen_test 全被顶成 busy，
-        // 用户只剩 abort 一条出路。超时按放弃处理，并如实告知云端。
+        // 暂停不能无限期挂住 busy_，否则 draw/repeat/pen_test 全被顶成 busy。
         if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(kMaxPauseMs)) {
             paused_.store(false);
             abort_requested_.store(true);
             last_error_ = "暂停超时自动取消";
             Notify("暂停超过 10 分钟，已自动取消这幅画；想画的话跟我说一声");
-            // 超时复位也走唯一事务；此处窗口已无在途行，失败则 fail closed。
-            if (!PerformAbortReset(false)) {
-                last_error_ = "暂停超时 abort reset 恢复失败";
+            // 先启动唯一 owner；StreamToGrbl 退出发布 Quiesced 后 worker 才能发 reset。
+            if (!StartAbortResetTask()) {
+                last_error_ = "暂停超时无法创建 abort reset 任务";
             }
             return false;
         }
@@ -1001,7 +1082,7 @@ bool Job::PreparePenOrigin() {
         vTaskDelay(pdMS_TO_TICKS(kPenSpringReturnMs));
         bool retry_after_pause = false;
         {
-            // 与 RequestPause/RequestAbort 共用提交锁：若 `!`/abort 先发生，本轮不得再发 G92。
+            // Active 与 G92 在同一提交锁下发布；abort owner 必须等本事务消费应答后 reset。
             std::lock_guard<std::mutex> stream_lock(stream_mutex_);
             if (abort_requested_.load()) {
                 last_error_ = "aborted";
@@ -1014,10 +1095,15 @@ bool Job::PreparePenOrigin() {
                 stream_disconnected_ = true;
                 last_error_ = "校准 Z0 前链路丢失";
                 return false;
-            } else if (!pipe.SendLine("G92 Z0")) {
-                stream_disconnected_ = true;
-                last_error_ = "发送 Z0 校准命令失败";
-                return false;
+            } else {
+                stream_quiescence_.store(StreamQuiescence::Active, std::memory_order_release);
+                if (!pipe.SendLine("G92 Z0")) {
+                    stream_quiescence_.store(StreamQuiescence::Failed,
+                                             std::memory_order_release);
+                    stream_disconnected_ = true;
+                    last_error_ = "发送 Z0 校准命令失败";
+                    return false;
+                }
             }
         }
         if (retry_after_pause) {
@@ -1032,6 +1118,16 @@ bool Job::PreparePenOrigin() {
             continue;
         }
 
+        struct PrepareGuard {
+            std::mutex& mutex;
+            std::atomic<StreamQuiescence>& state;
+            bool quiesced = false;
+            ~PrepareGuard() {
+                std::lock_guard<std::mutex> lock(mutex);
+                state.store(FinishStream(quiesced), std::memory_order_release);
+            }
+        } prepare_guard{stream_mutex_, stream_quiescence_};
+
         int error_code = -1;
         const WaitResult wr = pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &error_code);
         if (wr != WaitResult::Ok) {
@@ -1040,8 +1136,13 @@ bool Job::PreparePenOrigin() {
             last_error_ = wr == WaitResult::Timeout
                               ? "等待 Z0 校准应答超时"
                               : "Z0 校准被 Grbl 拒绝 (error:" + std::to_string(error_code) + ")";
+            if (abort_hold_confirmed_.load(std::memory_order_acquire)) {
+                pipe.DrainResponses();
+                prepare_guard.quiesced = true;
+            }
             return false;
         }
+        prepare_guard.quiesced = true;
         ESP_LOGI(TAG, "弹簧回位后已校准 G92 Z0");
         return true;
     }
@@ -1173,12 +1274,29 @@ bool Job::RecoverDisconnectedDraw() {
     // 新 session 的 Changing 尚未查明前按最保守的换纸保护处理。此窗口若收到 abort，
     // 只能置挂起，禁止另一任务误发 0x18；确认 Off 后再解除保护并执行受限 reset。
     paper_active_.store(true);
+    // 断连窗口开始前可能已有 abort worker 抢到 owner；必须等其真正退出并清掉
+    // settled phase，否则同步 reconnect reset 会被旧 owner 拦截。此处 paper_active_=true，
+    // 后续 RequestAbort 不会再创建第二个 owner；若抢占刚完成则重新取锁复核。
+    while (true) {
+        bool owner_started = false;
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            owner_started = abort_reset_owner_.Started();
+        }
+        if (!owner_started) {
+            break;
+        }
+        (void)WaitForAbortReset();
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (ResetAbortResetState()) {
+            break;
+        }
+    }
     if (auto* d = Board::GetInstance().GetDisplay())
         d->SetStatus("写字机重连中...");
     Notify("写字机连接中断，正在安全恢复这幅画");
-
     const TickType_t reconnect_began = xTaskGetTickCount();
-    while (!abort_requested_.load()) {
+    while (true) {
         if (pipe.IsConnected() && pipe.GetConnectionSequence() != stream_connection_seq_) {
             break;
         }
@@ -1187,10 +1305,6 @@ bool Job::RecoverDisconnectedDraw() {
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    if (abort_requested_.load()) {
-        last_error_ = "aborted";
-        return false;
     }
     const uint32_t paper_seq = pipe.GetPaperStatusSequence();
     if (!pipe.SendLine("[ESP901]")) {
@@ -1229,15 +1343,27 @@ bool Job::RecoverDisconnectedDraw() {
         }
         return false;
     }
-    paper_active_.store(false);
+    // PipeTask 已关闭旧 socket 并清空其应答；新 session 再排空一次后，才把 Failed
+    // 显式转为 Quiesced。只有这个已证实断连的恢复路径能做此转换。
+    pipe.DrainResponses();
+    stream_quiescence_.store(StreamQuiescence::Quiesced, std::memory_order_release);
+
 
     // 普通画线断连与用户 abort 共用同一受限 reset 事务和恢复判据。
-    if (!PerformAbortReset(false)) {
+    if (!PerformAbortReset(false, false, true)) {
         last_error_ = "断连恢复 abort reset 失败";
         return false;
     }
-    // 断连恢复只清 planner，不终结任务；释放 owner 供本任务后续真实 abort 使用。
-    ResetAbortResetState();
+    // 断连恢复只清 planner，不终结任务；释放已收敛 owner 供本任务后续真实 abort 使用。
+    if (!ResetAbortResetState()) {
+        last_error_ = "断连恢复 reset owner 未收敛";
+        return false;
+    }
+    if (abort_requested_.load()) {
+        paper_active_.store(false);
+        last_error_ = "aborted";
+        return true;
+    }
 
     // 走掉已经画坏的纸并装入新纸。成功后 ChangePaperAfterDraw 已确认 fresh Idle。
     if (!ChangePaperAfterDraw()) {
@@ -1390,17 +1516,28 @@ bool Job::StreamToGrbl() {
     UpdateDisplayProgress();
     TickType_t last_notify_tick = xTaskGetTickCount();
 
-    // 窗口模式下所有在途应答必须先排空，普通状态命令不得插入窗口。
-    stream_window_active_.store(true);
+    // Idle→Active 发布与 abort 提交锁原子化；abort 已在校准/下载阶段收敛时不得再开窗。
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (abort_requested_.load()) {
+            stream_quiescence_.store(StreamQuiescence::Quiesced, std::memory_order_release);
+            return false;
+        }
+        stream_quiescence_.store(StreamQuiescence::Active, std::memory_order_release);
+    }
     pipe.SetWindowed(true);
     struct WindowGuard {
         Pipe& pipe_ref;
-        std::atomic<bool>& active;
+        std::mutex& mutex;
+        std::atomic<StreamQuiescence>& state;
+        bool quiesced = false;
+        void MarkQuiesced() { quiesced = true; }
         ~WindowGuard() {
             pipe_ref.SetWindowed(false);
-            active.store(false);
+            std::lock_guard<std::mutex> lock(mutex);
+            state.store(FinishStream(quiesced), std::memory_order_release);
         }
-    } window_guard{pipe, stream_window_active_};
+    } window_guard{pipe, stream_mutex_, stream_quiescence_};
 
     // 照抄官方 stream.py 的 c_line / g_count 结构（§4.2）
     std::deque<size_t> c_line;    // 在途各行字节数（含 +1 换行，R1）
@@ -1420,12 +1557,14 @@ bool Job::StreamToGrbl() {
     //   自适应反压（§3.1）本次不做，S3 核心是 window=512 + 换纸行排空。
 
     while (next_ < spans.size() || !c_line.empty()) {
-        // === 检查点（§4.3：abort/ALARM/链路从「每行」变成「每次灌/收循环」）===
-        if (abort_requested_.load() && !paper_active_.load()) {
-            // abort 后在途计数残留：c_line 随函数返回整体销毁，不需显式清零。
+        if (abort_requested_.load() && !paper_active_.load() && c_line.empty()) {
+            // 已停止灌新行且旧应答全部消费，reset owner 可在窗口关闭后继续。
             last_error_ = "aborted";
+            window_guard.MarkQuiesced();
             return false;
         }
+        // abort 且仍有在途时禁止继续灌，落入收分支把旧应答消费干净。
+        const bool drain_for_abort = abort_requested_.load() && !paper_active_.load();
         if (pipe.GetGrblState() == GrblState::Alarm) {
             last_error_ = "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
             return false;
@@ -1443,6 +1582,9 @@ bool Job::StreamToGrbl() {
         if (paused_.load() && !paper_active_.load() && !paper_pending && c_line.empty() &&
             next_ < spans.size()) {
             if (!WaitWhilePaused()) {
+                if (abort_requested_.load() && c_line.empty()) {
+                    window_guard.MarkQuiesced();
+                }
                 if (last_error_.empty())
                     last_error_ = "aborted";
                 return false;
@@ -1461,6 +1603,9 @@ bool Job::StreamToGrbl() {
             while (true) {
                 // 行已解析但尚未写入时也可能收到 pause；在这里等待而不是忙等重试。
                 if (!WaitWhilePaused()) {
+                    if (abort_requested_.load() && c_line.empty()) {
+                        window_guard.MarkQuiesced();
+                    }
                     if (last_error_.empty())
                         last_error_ = "aborted";
                     return false;
@@ -1484,13 +1629,16 @@ bool Job::StreamToGrbl() {
                     }
                 }
 
-                // 换纸行 ok 可能等数十秒，分段等便于响应 abort
+                // 换纸行 ok 可能等数十秒，分段等便于响应 abort。
                 WaitResult wr = WaitResult::Timeout;
                 int err = -1;
                 uint32_t waited = 0;
                 const uint32_t slice = 1000;
                 while (waited < kPaperOkTimeoutMs) {
                     if (!WaitWhilePaused()) {
+                        if (abort_requested_.load() && c_line.empty()) {
+                            window_guard.MarkQuiesced();
+                        }
                         if (last_error_.empty())
                             last_error_ = "aborted";
                         return false;
@@ -1510,7 +1658,7 @@ bool Job::StreamToGrbl() {
                             "写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
                         return false;
                     }
-                    uint32_t step =
+                    const uint32_t step =
                         (kPaperOkTimeoutMs - waited > slice) ? slice : (kPaperOkTimeoutMs - waited);
                     wr = pipe.TakeResponse(step, &err);
                     if (wr != WaitResult::Timeout) {
@@ -1522,17 +1670,15 @@ bool Job::StreamToGrbl() {
                 if (wr == WaitResult::Ok) {
                     ++lines_sent_;
                     paper_active_.store(false);
-                    // 换纸期间用户可能已按暂停：别把 paused 覆盖成 streaming。
                     SetState(paused_.load() ? "paused" : "streaming");
-                    UpdateDisplayProgress();
                     if (abort_requested_.load()) {
                         last_error_ = "aborted";
+                        window_guard.MarkQuiesced();
                         return false;
                     }
                     break;
                 }
                 if (wr == WaitResult::Deferred) {
-                    // error:8：暂停后重发本行（§4.3：只在逐行模式可定位重发）
                     paper_active_.store(true);
                     SetState("paper_change");
                     ++retries;
@@ -1548,7 +1694,6 @@ bool Job::StreamToGrbl() {
                     last_error_ = "error:" + std::to_string(err);
                     return false;
                 }
-                // Timeout：发 ? 探活一次再判失败
                 pipe.SendRealtime('?');
                 ESP_LOGE(TAG, "换纸行等 ok 超时: %s", line.c_str());
                 last_error_ = "换纸行等 ok 超时";
@@ -1556,11 +1701,11 @@ bool Job::StreamToGrbl() {
             }
 
             ++next_;
-            continue;  // 换纸行完成，继续窗口化
+            continue;
         }
 
         // === 灌分支 ===
-        if (!paper_pending && next_ < spans.size() && !paused_.load()) {
+        if (!drain_for_abort && !paper_pending && next_ < spans.size() && !paused_.load()) {
             const std::string line(LineAt(spans[next_]));
 
             if (LooksLikePaperLine(line)) {
@@ -1576,8 +1721,8 @@ bool Job::StreamToGrbl() {
                 if (c_line_bytes_sum + need < kWindow || c_line.empty()) {
                     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
                     if (abort_requested_.load()) {
-                        last_error_ = "aborted";
-                        return false;
+                        // 不再灌新行；回到循环顶部排空已有 c_line 后再发布 Quiesced。
+                        continue;
                     }
                     if (paused_.load()) {
                         continue;
@@ -1626,8 +1771,14 @@ bool Job::StreamToGrbl() {
         uint32_t waited = 0;
         const uint32_t slice = 1000;
         while (waited < timeout) {
-            if (abort_requested_.load() && !paper_active_.load()) {
+            if (abort_requested_.load() &&
+                abort_hold_confirmed_.load(std::memory_order_acquire)) {
+                // fresh Hold:0/Idle 已证明 planner 停稳；旧 ok 已不再代表可续画进度。
+                pipe.DrainResponses();
+                c_line.clear();
+                c_line_bytes_sum = 0;
                 last_error_ = "aborted";
+                window_guard.MarkQuiesced();
                 return false;
             }
             if (pipe.GetGrblState() == GrblState::Alarm) {
@@ -1706,6 +1857,7 @@ bool Job::StreamToGrbl() {
         }
     }
 
+    window_guard.MarkQuiesced();
     return true;
 }
 

@@ -1,6 +1,8 @@
 #ifndef HUTUJI_JOB_H
 #define HUTUJI_JOB_H
 
+#include "hutuji_recovery_core.h"
+
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -98,10 +100,12 @@ private:
      */
     bool WaitWhilePaused();
 
-    bool PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed = false);
+    bool StartAbortResetTask();
+    bool PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed = false,
+                           bool allow_unready_reconnect = false);
     /** 等已启动的 reset 恢复收敛，busy_ 在此之前不得释放。 */
     bool WaitForAbortReset();
-    void ResetAbortResetState();
+    bool ResetAbortResetState();
 
     /**
      * 把 buffer_ 预解析成行索引，供 StreamToGrbl 预取下一行长度
@@ -130,12 +134,14 @@ private:
     std::atomic<bool> abort_requested_{false};
     std::atomic<bool> paper_active_{false};
     std::atomic<bool> paused_{false};
-    // 每个任务最多一个 reset owner；done 前 busy_ 始终保持 true。
-    std::atomic<bool> abort_reset_started_{false};
-    std::atomic<bool> abort_reset_done_{false};
-    std::atomic<bool> abort_reset_success_{false};
-    // 仅表示窗口模式可能仍持有在途应答；普通状态命令必须等它清零。
-    std::atomic<bool> stream_window_active_{false};
+    // 每个任务最多一个 reset owner；owner 收敛前 busy_ 始终保持 true。
+    AbortResetOwner abort_reset_owner_;
+    std::atomic<bool> abort_reset_worker_active_{false};
+    std::atomic<uint32_t> abort_reset_session_{0};
+    // 窗口退出时只有 Quiesced 能证明旧应答已全部消费；Failed 禁止 reset。
+    std::atomic<StreamQuiescence> stream_quiescence_{StreamQuiescence::Idle};
+    // abort owner 已用 fresh Hold:0/Idle 证明机器停稳；流任务可丢弃旧应答并发布 Quiesced。
+    std::atomic<bool> abort_hold_confirmed_{false};
     // 重画：跳过下载/校验，直接复用 buffer_
     std::atomic<bool> repeat_mode_{false};
     // buffer_ 是否留存着可重画的 G-code（出图成功后不释放）

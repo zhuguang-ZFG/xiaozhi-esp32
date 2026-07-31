@@ -116,11 +116,14 @@ public:
     uint32_t GetConnectionSequence() const { return connection_seq_.load(); }
     uint32_t GetResetBannerSequence() const { return reset_banner_seq_.load(); }
     uint32_t GetPaperStatusSequence() const { return paper_status_seq_.load(); }
+    uint32_t GetResetReceiveEpoch() const { return reset_receive_epoch_.load(); }
     PaperChangingState GetPaperChangingState() const { return paper_changing_.load(); }
-    /** 当前连接已验明 Grbl，可执行受限 reset；活动任务重连时不等同于业务 ready。 */
-    bool IsResetSessionReady(uint32_t expected_connection_sequence) const {
-        return connected_.load() && connection_seq_.load() == expected_connection_sequence &&
-               (ready_.load() || task_session_active_.load());
+    /** 当前连接已验明 Grbl，可执行受限 reset；仅断连恢复可显式使用未 ready 会话。 */
+    bool IsResetSessionReady(uint32_t expected_connection_sequence,
+                             bool allow_unready_reconnect = false) const {
+        return connection_seq_.load() == expected_connection_sequence &&
+               hutuji::IsResetSessionReady(connected_.load(), ready_.load(),
+                                           task_session_active_.load(), allow_unready_reconnect);
     }
     /**
      * previous_status_sequence 之后同一连接的新报告是否已停稳。
@@ -130,16 +133,18 @@ public:
                                uint32_t expected_connection_sequence) const;
 
     /**
-     * 原子提交 abort reset：在单写者锁内复核同一 ready 会话、新停稳状态和
-     * Changing=Off，绑定本次 banner 权限后先撤销 ready/authorized 再发送 0x18。
+     * 原子提交 abort reset：在单写者锁内复核同一会话、新停稳状态、
+     * Changing=Off 与未变化的 banner 基线，绑定下一代 banner 后发送 0x18。
+     * allow_unready_reconnect 只能由已证实断连的绘图恢复路径传 true。
      */
     bool SendAbortReset(uint32_t expected_connection_sequence,
                         uint32_t previous_status_sequence,
-                        uint32_t previous_paper_status_sequence);
+                        uint32_t previous_paper_status_sequence,
+                        uint32_t previous_banner_sequence,
+                        bool allow_unready_reconnect = false);
 
-    bool IsAbortResetPending() const { return abort_reset_token_.Pending(); }
-    /** reset banner 超时或调用方放弃时撤销一次性权限。 */
-    void CancelAbortReset() { abort_reset_token_.Cancel(); }
+    /** reset banner 超时或调用方放弃时在线性化发送锁下撤销一次性权限。 */
+    void CancelAbortReset();
 
     GrblState GetGrblState() const { return grbl_state_.load(); }
     uint32_t GetStatusReportSequence() const { return status_report_seq_.load(); }
@@ -163,10 +168,10 @@ public:
     }
 
     /**
-     * 半关 socket 以唤醒阻塞 recv（不 release fd）。
-     * 仅用于需要立刻打断接收泵的场景；真正 close 仍只在 pipe 任务内。
+     * 仅当连接仍是 expected_connection_sequence 时半关 socket，避免旧 worker 拆新 session。
+     * 真正 close 仍只在 pipe 任务内执行。
      */
-    void ShutdownSocket();
+    void ShutdownSocket(uint32_t expected_connection_sequence);
 
 private:
     enum class PeerCheck {
@@ -203,10 +208,11 @@ private:
      */
     PeerCheck VerifyGrblPeer(int sock, int timeout_ms);
     void CloseSocket();
+    void CloseSocketLocked();  // write_mutex_ 已持有
     bool SendRawLocked(const char* data, size_t len);  // 调用方已持 write_mutex_
 
-    void OnRxData(const uint8_t* data, size_t data_len);
-    void ProcessLine(const std::string& line);
+    void OnRxData(const uint8_t* data, size_t data_len, uint32_t receive_epoch);
+    void ProcessLine(const std::string& line, uint32_t receive_epoch);
     void ParseStatusReport(const std::string& line);
     void NotifyCloud(const std::string& message);
     static int ParseErrorCode(const std::string& line);
@@ -223,6 +229,7 @@ private:
     std::atomic<int> grbl_substate_{-1};
     std::atomic<uint32_t> status_report_seq_{0};
     std::atomic<uint32_t> connection_seq_{0};
+    std::atomic<uint32_t> reset_receive_epoch_{0};
     std::atomic<uint32_t> reset_banner_seq_{0};
     std::atomic<uint32_t> paper_status_seq_{0};
     std::atomic<PaperChangingState> paper_changing_{PaperChangingState::Unknown};
@@ -253,6 +260,8 @@ private:
 
     // 单写者：所有发送（行/实时）串行化
     std::mutex write_mutex_;
+    // reset 发送与 recv→epoch 发布串行化；普通写仍只占 write_mutex_。
+    std::mutex reset_receive_mutex_;
     std::mutex sock_mutex_;
     int sock_ = -1;
 
