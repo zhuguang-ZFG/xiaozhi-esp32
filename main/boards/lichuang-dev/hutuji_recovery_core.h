@@ -3,8 +3,30 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cerrno>
 
 namespace hutuji {
+
+/**
+ * 单次 send() 允许的传输停滞预算。Grbl 收满 RX 环形缓冲后 TCP 窗口关闭，
+ * send() 会阻塞；窗口=512 的 ok 计数流控在 `Bf:0,0` 前不会收敛（见 P2 设计 §3），
+ * 故 send 必须容忍有限的停滞（正常绘图可因机器运动而数秒写不进去），
+ * 超过该预算才判定链路真正死亡并重建连接。
+ */
+inline constexpr uint32_t kSendStallBudgetMs = 20000;
+
+/**
+ * send() 返回 EAGAIN/EWOULDBLOCK 时是否应重试（而不是立即断开）。
+ * n < 0 且 errno 是 EAGAIN/EWOULDBLOCK 属于 TCP 背压的瞬态，可重试；
+ * 真实错误（EPIPE/ENOTCONN 等）或预算耗尽则必须断开，防止无限自旋。
+ * @param e 当前 errno 值（errno 是宏，不能作参数名）
+ */
+inline constexpr bool ShouldRetrySend(int n, int e, bool budget_remaining) {
+    if (n > 0) {
+        return true;  // 已写出部分字节，继续剩余部分
+    }
+    return (e == EAGAIN || e == EWOULDBLOCK) && budget_remaining;
+}
 
 inline constexpr bool IsStoppedForReset(bool idle, bool hold, bool hold_complete) {
     return idle || (hold && hold_complete);

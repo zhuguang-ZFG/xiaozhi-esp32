@@ -484,16 +484,25 @@ bool Pipe::SendRawLocked(const char* data, size_t len) {
         return false;
     }
     size_t sent = 0;
+    const TickType_t send_began = xTaskGetTickCount();
     while (sent < len) {
         int n = send(sock_, data + sent, len - sent, 0);
-        if (n <= 0) {
+        const bool budget_remaining =
+            (xTaskGetTickCount() - send_began) < pdMS_TO_TICKS(kSendStallBudgetMs);
+        if (!ShouldRetrySend(n, errno, budget_remaining)) {
             abort_reset_token_.Cancel();
             ready_.store(false);
             authorized_.store(false);
-            ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", n, errno,
-                     strerror(errno));
-            // 可能已经写出半条命令；半关连接唤醒 recv 泵并强制重连，绝不让下一条
-            // 命令与对端残留半行拼接。sock_mutex_ 已持有，不能调用 ShutdownSocket()。
+            // n>=0 说明已写出部分字节，可能残留半条命令；半关连接唤醒 recv 泵并
+            // 强制重连，绝不让下一条命令与对端残留半行拼接。sock_mutex_ 已持有，
+            // 不能调用 ShutdownSocket()。
+            if (n < 0) {
+                ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", n, errno,
+                         strerror(errno));
+            } else {
+                ESP_LOGE(TAG, "send 停滞超过 %lu ms，判定链路死亡，强制重建当前连接",
+                         (unsigned long)kSendStallBudgetMs);
+            }
             shutdown(sock_, SHUT_RDWR);
             return false;
         }

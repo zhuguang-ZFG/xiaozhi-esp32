@@ -46,7 +46,33 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 using hutuji::IsResetSessionReady;
                 using hutuji::FinishStream;
                 using hutuji::IsStoppedForReset;
+                using hutuji::ShouldRetrySend;
+                using hutuji::kSendStallBudgetMs;
                 using hutuji::StreamQuiescence;
+
+                assert(kSendStallBudgetMs == 20000);
+
+                // ShouldRetrySend: n > 0 => continue loop
+                assert(ShouldRetrySend(1, 0, true));
+                assert(ShouldRetrySend(100, 0, false));
+
+                // n < 0 + EAGAIN + budget => retry
+                assert(ShouldRetrySend(-1, EAGAIN, true));
+                assert(ShouldRetrySend(-1, EWOULDBLOCK, true));
+
+                // n < 0 + EAGAIN + no budget => give up
+                assert(!ShouldRetrySend(-1, EAGAIN, false));
+                assert(!ShouldRetrySend(-1, EWOULDBLOCK, false));
+
+                // n < 0 + real error => teardown regardless of budget
+                assert(!ShouldRetrySend(-1, ENOTCONN, true));
+                assert(!ShouldRetrySend(-1, ENOTCONN, false));
+                assert(!ShouldRetrySend(-1, EPIPE, true));
+                assert(!ShouldRetrySend(-1, ECONNRESET, true));
+                assert(!ShouldRetrySend(-1, 0, true));
+
+                // n == 0 => teardown (should not happen with blocking socket)
+                assert(!ShouldRetrySend(0, 0, true));
 
                 assert(IsStoppedForReset(true, false, false));
                 assert(IsStoppedForReset(false, true, true));
