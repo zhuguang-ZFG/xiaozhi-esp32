@@ -1728,6 +1728,8 @@ bool Job::StreamToGrbl() {
                     // 发送可能受 TCP 背压；此处不能持 stream_mutex_，否则 abort/pause
                     // 无法发布 `!`。Grbl 会在任意字节边界消费实时字符，当前行至多在 Hold
                     // 状态下补齐并入 planner，abort reset 随后会清空它。
+                    // 上界：释放 stream_mutex_ 期间至多多灌 1 行（本轮这一行），由后续
+                    // 0x18 软复位清空 planner 兜底——不得据此以为可无限放宽此锁。
                     if (!pipe.SendLine(line)) {
                         // SendRawLocked 已半关 socket；即使接收泵尚未来得及更新原子状态，
                         // 也必须按断连恢复，不能复用可能残留半行的 session。

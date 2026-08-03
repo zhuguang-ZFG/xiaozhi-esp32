@@ -527,11 +527,6 @@ bool Pipe::SendRawLocked(const char* data, size_t len, bool feed_hold_priority) 
         return true;
     }
 
-    abort_reset_token_.Cancel();
-    ready_.store(false);
-    authorized_.store(false);
-    // 之前的成功迭代可能已写出半条命令；半关连接唤醒 recv 泵并强制重连，
-    // 绝不让下一条命令与对端残留半行拼接。
     if (budget_expired) {
         ESP_LOGE(TAG, "send 活动时间超过 %lu ms，判定链路死亡，强制重建当前连接",
                  (unsigned long)kSendStallBudgetMs);
@@ -539,6 +534,18 @@ bool Pipe::SendRawLocked(const char* data, size_t len, bool feed_hold_priority) 
         ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", last_result, send_errno,
                  strerror(send_errno));
     }
+    // feed hold 快路径不持 write_mutex_：绝不在此裸改 abort_reset_token_/ready_/authorized_
+    // 或半关 socket——那会破坏 AbortResetToken 的单写者锁串行化契约。整套 teardown 改由
+    // 调用方 SendFeedHold 在失败后经 write_mutex_ 保护的 ShutdownSocket() 串行化完成。
+    if (feed_hold_priority) {
+        return false;
+    }
+    // 普通/reset 路径：调用方已持 write_mutex_，就地完成 teardown。
+    // 之前的成功迭代可能已写出半条命令；半关连接唤醒 recv 泵并强制重连，
+    // 绝不让下一条命令与对端残留半行拼接。
+    abort_reset_token_.Cancel();
+    ready_.store(false);
+    authorized_.store(false);
     std::lock_guard<std::mutex> lock(sock_mutex_);
     if (sock_ >= 0) {
         shutdown(sock_, SHUT_RDWR);
@@ -1036,10 +1043,19 @@ bool Pipe::SendAbortReset(uint32_t expected_connection_sequence, uint32_t previo
 }
 
 bool Pipe::SendFeedHold() {
+    // 快路径整段不占 write_mutex_，保证 `!` 能在普通发送重试间隙抢占。先捕获当前 session：
+    // 失败 teardown 用它做守卫，连接已轮换时 ShutdownSocket 自会跳过，不误伤新 session。
+    const uint32_t session = connection_seq_.load();
     feed_hold_waiters_.fetch_add(1, std::memory_order_acq_rel);
     const char hold = '!';
     const bool sent = SendRawLocked(&hold, 1, true);
     feed_hold_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+    if (!sent) {
+        // SendRawLocked 在 feed_hold_priority 下只记日志、不碰共享状态。整套 teardown
+        // （Cancel token / 清 ready/authorized / 半关 socket）改由此处经 write_mutex_ 串行化，
+        // 恢复 AbortResetToken 的单写者锁契约（recovery_core.h Arm/Consume/Cancel 同锁约束）。
+        ShutdownSocket(session);
+    }
     return sent;
 }
 

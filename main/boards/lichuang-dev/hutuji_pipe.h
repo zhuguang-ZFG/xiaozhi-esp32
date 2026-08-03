@@ -45,7 +45,9 @@ enum class PaperChangingState {
  *
  * 链路：写字机 Grbl_Esp32 Telnet:23 ← 实战派 S3 TCP 客户端。
  * WiFi 由 WifiBoard 管理；本类只做 TCP 连接/重连与行协议。
- * 单写者：所有往 Telnet 的字节（含 `?`/`!`/`0x18`）必须经本类 API。
+ * 单写者：所有往 Telnet 的字节都经本类 API。`?`/`0x18` 等普通字节走 write_mutex_
+ * 串行化；`!`（feed hold）是安全抢占字符，快路径不占 write_mutex_，只有 send 失败后的
+ * teardown 才经 ShutdownSocket() 进 write_mutex_，以维持 AbortResetToken 的单写者锁契约。
  */
 class Pipe {
 public:
