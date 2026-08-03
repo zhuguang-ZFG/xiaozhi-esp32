@@ -58,7 +58,7 @@ public:
 
     /**
      * 发实时字符（`?` / `!` / `0x18`），不吃 ok、不清应答位。
-     * 仍占单写者锁，避免与 SendLine 字节交错。
+     * `!` 可在普通发送的非阻塞重试间隙抢占；其它字符仍走单写者锁。
      */
     bool SendRealtime(char ch);
 
@@ -137,10 +137,8 @@ public:
      * Changing=Off 与未变化的 banner 基线，绑定下一代 banner 后发送 0x18。
      * allow_unready_reconnect 只能由已证实断连的绘图恢复路径传 true。
      */
-    bool SendAbortReset(uint32_t expected_connection_sequence,
-                        uint32_t previous_status_sequence,
-                        uint32_t previous_paper_status_sequence,
-                        uint32_t previous_banner_sequence,
+    bool SendAbortReset(uint32_t expected_connection_sequence, uint32_t previous_status_sequence,
+                        uint32_t previous_paper_status_sequence, uint32_t previous_banner_sequence,
                         bool allow_unready_reconnect = false);
 
     /** reset banner 超时或调用方放弃时在线性化发送锁下撤销一次性权限。 */
@@ -209,7 +207,9 @@ private:
     PeerCheck VerifyGrblPeer(int sock, int timeout_ms);
     void CloseSocket();
     void CloseSocketLocked();  // write_mutex_ 已持有
-    bool SendRawLocked(const char* data, size_t len);  // 调用方已持 write_mutex_
+    // feed_hold_priority=true 仅供单字节 `!`；它不占 write_mutex_，可在普通发送重试间隙抢占。
+    bool SendRawLocked(const char* data, size_t len, bool feed_hold_priority = false);
+    bool SendFeedHold();
 
     void OnRxData(const uint8_t* data, size_t data_len, uint32_t receive_epoch);
     void ProcessLine(const std::string& line, uint32_t receive_epoch);
@@ -258,8 +258,9 @@ private:
     /** 入队一条应答（仅 ProcessLine 的 ok/error 分支调用）。队列满时丢最老。 */
     void PushResponse(WaitResult result, int error_code);
 
-    // 单写者：所有发送（行/实时）串行化
+    // 普通行与非抢占实时字符串行化；feed hold 是 Grbl 带内实时字符，可安全穿插。
     std::mutex write_mutex_;
+    std::atomic<uint32_t> feed_hold_waiters_{0};
     // reset 发送与 recv→epoch 发布串行化；普通写仍只占 write_mutex_。
     std::mutex reset_receive_mutex_;
     std::mutex sock_mutex_;

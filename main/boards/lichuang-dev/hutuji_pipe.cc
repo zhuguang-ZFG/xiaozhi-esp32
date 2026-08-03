@@ -478,43 +478,72 @@ void Pipe::CancelAbortReset() {
     abort_reset_token_.Cancel();
 }
 
-bool Pipe::SendRawLocked(const char* data, size_t len) {
-    std::lock_guard<std::mutex> lock(sock_mutex_);
-    if (sock_ < 0) {
-        return false;
-    }
+bool Pipe::SendRawLocked(const char* data, size_t len, bool feed_hold_priority) {
     size_t sent = 0;
-    const TickType_t send_began = xTaskGetTickCount();
+    int send_errno = 0;
+    int last_result = -1;
+    bool budget_expired = false;
+    const uint32_t send_began = static_cast<uint32_t>(xTaskGetTickCount());
+    SendStallBudget budget(send_began, static_cast<uint32_t>(pdMS_TO_TICKS(kSendStallBudgetMs)));
+
     while (sent < len) {
-        int n = send(sock_, data + sent, len - sent, 0);
-        const int send_errno = errno;  // 紧贴 send() 捕获，防后续调用改写 errno
-        if (AdvanceSendProgress(sent, n)) {
-            continue;
+        const uint32_t now = static_cast<uint32_t>(xTaskGetTickCount());
+        if (budget.Expired(now)) {
+            budget_expired = true;
+            break;
         }
-        const bool budget_remaining =
-            (xTaskGetTickCount() - send_began) < pdMS_TO_TICKS(kSendStallBudgetMs);
-        if (ShouldRetrySend(n, send_errno, budget_remaining)) {
+
+        // 普通发送不占着 socket 等背压；有 feed hold 等待时先让实时字符取得发送机会。
+        // 仲裁等待不是 TCP 停滞，不消耗普通发送的背压预算。
+        if (ShouldYieldToFeedHold(feed_hold_priority,
+                                  feed_hold_waiters_.load(std::memory_order_acquire))) {
+            const uint32_t suspended_from = now;
+            do {
+                vTaskDelay(1);
+            } while (ShouldYieldToFeedHold(feed_hold_priority,
+                                           feed_hold_waiters_.load(std::memory_order_acquire)));
+            budget.Suspend(suspended_from, static_cast<uint32_t>(xTaskGetTickCount()));
             continue;
         }
 
-        abort_reset_token_.Cancel();
-        ready_.store(false);
-        authorized_.store(false);
-        // 之前的成功迭代可能已写出半条命令；半关连接唤醒 recv 泵并强制重连，
-        // 绝不让下一条命令与对端残留半行拼接。sock_mutex_ 已持有，不能调用
-        // ShutdownSocket()。
-        const bool send_stalled = n < 0 && (send_errno == EAGAIN || send_errno == EWOULDBLOCK);
-        if (send_stalled) {
-            ESP_LOGE(TAG, "send 停滞超过 %lu ms（errno=%d），判定链路死亡，强制重建当前连接",
-                     (unsigned long)kSendStallBudgetMs, send_errno);
-        } else {
-            ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", n, send_errno,
-                     strerror(send_errno));
+        {
+            std::lock_guard<std::mutex> lock(sock_mutex_);
+            if (sock_ < 0) {
+                return false;
+            }
+            last_result = send(sock_, data + sent, len - sent, MSG_DONTWAIT);
+            send_errno = last_result < 0 ? errno : 0;  // 紧贴失败 send() 捕获，防后续调用改写
         }
-        shutdown(sock_, SHUT_RDWR);
-        return false;
+        if (AdvanceSendProgress(sent, last_result)) {
+            continue;
+        }
+        if (ShouldRetrySend(last_result, send_errno)) {
+            vTaskDelay(1);
+            continue;
+        }
+        break;
     }
-    return true;
+    if (sent == len) {
+        return true;
+    }
+
+    abort_reset_token_.Cancel();
+    ready_.store(false);
+    authorized_.store(false);
+    // 之前的成功迭代可能已写出半条命令；半关连接唤醒 recv 泵并强制重连，
+    // 绝不让下一条命令与对端残留半行拼接。
+    if (budget_expired) {
+        ESP_LOGE(TAG, "send 活动时间超过 %lu ms，判定链路死亡，强制重建当前连接",
+                 (unsigned long)kSendStallBudgetMs);
+    } else {
+        ESP_LOGE(TAG, "send 失败: n=%d errno=%d (%s)，强制重建当前连接", last_result, send_errno,
+                 strerror(send_errno));
+    }
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    if (sock_ >= 0) {
+        shutdown(sock_, SHUT_RDWR);
+    }
+    return false;
 }
 
 void Pipe::OnRxData(const uint8_t* data, size_t data_len, uint32_t receive_epoch) {
@@ -624,8 +653,8 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
         const uint32_t banner_generation = reset_banner_seq_.fetch_add(1) + 1U;
         ready_.store(false);
         authorized_.store(false);
-        const bool recover_abort = abort_reset_token_.Consume(
-            connection_seq_.load(), banner_generation, receive_epoch);
+        const bool recover_abort =
+            abort_reset_token_.Consume(connection_seq_.load(), banner_generation, receive_epoch);
         if (recover_abort) {
             auth_probe_stage_ = AuthProbeStage::WaitingAbortUnlockOk;
         } else if (task_session_active_.load()) {
@@ -943,11 +972,9 @@ bool Pipe::HasFreshStoppedStatus(uint32_t previous_status_sequence,
                              grbl_substate_.load() == 0);
 }
 
-bool Pipe::SendAbortReset(uint32_t expected_connection_sequence,
-                          uint32_t previous_status_sequence,
+bool Pipe::SendAbortReset(uint32_t expected_connection_sequence, uint32_t previous_status_sequence,
                           uint32_t previous_paper_status_sequence,
-                          uint32_t previous_banner_sequence,
-                          bool allow_unready_reconnect) {
+                          uint32_t previous_banner_sequence, bool allow_unready_reconnect) {
     // 先挡住 recv 泵并处理 socket 中已经到达的旧字节；只有这些字节完成分派后，
     // 才能定义本次 0x18 的接收 epoch 边界。
     std::unique_lock<std::mutex> receive_lock(reset_receive_mutex_);
@@ -978,16 +1005,16 @@ bool Pipe::SendAbortReset(uint32_t expected_connection_sequence,
     const bool same_session = connection_seq_.load() == expected_connection_sequence;
     const bool reset_session_ready =
         IsResetSessionReady(expected_connection_sequence, allow_unready_reconnect);
-    const bool fresh_stopped = HasFreshStoppedStatus(previous_status_sequence,
-                                                     expected_connection_sequence);
+    const bool fresh_stopped =
+        HasFreshStoppedStatus(previous_status_sequence, expected_connection_sequence);
     const bool fresh_paper = paper_status_seq_.load() != previous_paper_status_sequence;
     const bool banner_unchanged = reset_banner_seq_.load() == previous_banner_sequence;
     if (!same_session || !banner_unchanged) {
         abort_reset_token_.Cancel();
         return false;
     }
-    if (!CanSendAbortReset(connected_.load(), reset_session_ready, true, fresh_stopped,
-                           fresh_paper, paper_changing_.load() == PaperChangingState::Off)) {
+    if (!CanSendAbortReset(connected_.load(), reset_session_ready, true, fresh_stopped, fresh_paper,
+                           paper_changing_.load() == PaperChangingState::Off)) {
         return false;
     }
 
@@ -1008,9 +1035,21 @@ bool Pipe::SendAbortReset(uint32_t expected_connection_sequence,
     return true;
 }
 
+bool Pipe::SendFeedHold() {
+    feed_hold_waiters_.fetch_add(1, std::memory_order_acq_rel);
+    const char hold = '!';
+    const bool sent = SendRawLocked(&hold, 1, true);
+    feed_hold_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+    return sent;
+}
+
 bool Pipe::SendRealtime(char ch) {
     if (!connected_.load()) {
         return false;
+    }
+    if (ch == '!') {
+        // Grbl 在任意字节边界消费 feed hold，不进入行缓冲；无需等普通写锁。
+        return SendFeedHold();
     }
     std::lock_guard<std::mutex> lock(write_mutex_);
     return SendRawLocked(&ch, 1);

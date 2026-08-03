@@ -9,14 +9,33 @@
 namespace hutuji {
 
 /**
- * 单次 send() 允许的传输停滞预算。Grbl 收满 RX 环形缓冲后 TCP 窗口关闭，
- * send() 会阻塞；窗口=512 的 ok 计数流控在 `Bf:0,0` 前不会收敛（见 P2 设计 §3），
- * 故 send 必须容忍有限的停滞（正常绘图可因机器运动而数秒写不进去），
- * 超过该预算才判定链路真正死亡并重建连接。
- * 权衡：SendRawLocked 停滞期间持 sock_mutex_，Job 层行间 abort 检查因此最坏延迟
- * 一个预算周期（~20s，与 keepalive 超时同量级）；换取真背压下不误拆活链路。
+ * 单条发送的活动时间预算。部分成功不会续期；feed hold 仲裁挂起期间不计时，避免
+ * 把等待实时字符的时间误判成 TCP 背压。全部计算使用无符号差值，覆盖 tick 回绕。
  */
 inline constexpr uint32_t kSendStallBudgetMs = 20000;
+
+class SendStallBudget {
+public:
+    constexpr SendStallBudget(uint32_t began, uint32_t budget) : began_(began), budget_(budget) {}
+
+    constexpr void Suspend(uint32_t from, uint32_t to) {
+        suspended_ += static_cast<uint32_t>(to - from);
+    }
+
+    constexpr bool Expired(uint32_t now) const {
+        const uint32_t elapsed = static_cast<uint32_t>(now - began_);
+        return static_cast<uint32_t>(elapsed - suspended_) >= budget_;
+    }
+
+private:
+    uint32_t began_;
+    uint32_t budget_;
+    uint32_t suspended_ = 0;
+};
+
+inline constexpr bool ShouldYieldToFeedHold(bool feed_hold_priority, uint32_t waiters) {
+    return !feed_hold_priority && waiters > 0;
+}
 
 /** 只有 send() 真正写出正数字节时才推进游标，错误/零进展必须留在原位。 */
 inline constexpr bool AdvanceSendProgress(size_t& sent, int n) {
@@ -28,13 +47,12 @@ inline constexpr bool AdvanceSendProgress(size_t& sent, int n) {
 }
 
 /**
- * send() 返回 EAGAIN/EWOULDBLOCK 时是否应重试（而不是立即断开）。
- * n < 0 且 errno 是 EAGAIN/EWOULDBLOCK 属于 TCP 背压的瞬态，可重试；
- * 真实错误（EPIPE/ENOTCONN 等）或预算耗尽则必须断开，防止无限自旋。
+ * send() 返回 EAGAIN/EWOULDBLOCK 时是否应重试（而不是立即断开）。时间预算由
+ * SendStallBudget 独立判定，避免错误谓词同时拥有时钟状态。
  * @param e 当前 errno 值（errno 是宏，不能作参数名）
  */
-inline constexpr bool ShouldRetrySend(int n, int e, bool budget_remaining) {
-    return n < 0 && (e == EAGAIN || e == EWOULDBLOCK) && budget_remaining;
+inline constexpr bool ShouldRetrySend(int n, int e) {
+    return n < 0 && (e == EAGAIN || e == EWOULDBLOCK);
 }
 
 inline constexpr bool IsStoppedForReset(bool idle, bool hold, bool hold_complete) {
@@ -65,15 +83,13 @@ public:
     bool TryClaim() {
         AbortResetOwnerPhase expected = AbortResetOwnerPhase::Idle;
         return phase_.compare_exchange_strong(expected, AbortResetOwnerPhase::Running,
-                                              std::memory_order_acq_rel,
-                                              std::memory_order_acquire);
+                                              std::memory_order_acq_rel, std::memory_order_acquire);
     }
 
     bool CancelClaim() {
         AbortResetOwnerPhase expected = AbortResetOwnerPhase::Running;
         return phase_.compare_exchange_strong(expected, AbortResetOwnerPhase::Idle,
-                                              std::memory_order_acq_rel,
-                                              std::memory_order_acquire);
+                                              std::memory_order_acq_rel, std::memory_order_acquire);
     }
 
     bool Complete(bool success) {
@@ -126,7 +142,6 @@ inline constexpr bool CanResetAfterStream(StreamQuiescence state) {
     return state == StreamQuiescence::Idle || state == StreamQuiescence::Quiesced;
 }
 
-
 inline constexpr StreamQuiescence FinishStream(bool proven_quiesced) {
     return proven_quiesced ? StreamQuiescence::Quiesced : StreamQuiescence::Failed;
 }
@@ -168,8 +183,7 @@ public:
             // 早到/旧 session banner 不得破坏当前 token；只消费精确绑定的一代。
             if (connection_generation_.load(std::memory_order_relaxed) != connection_generation ||
                 expected_banner_generation_.load(std::memory_order_relaxed) != banner_generation ||
-                !IsAfter(receive_epoch,
-                         expected_receive_epoch_.load(std::memory_order_relaxed))) {
+                !IsAfter(receive_epoch, expected_receive_epoch_.load(std::memory_order_relaxed))) {
                 return false;
             }
             const bool redeem = state == State::Pending;

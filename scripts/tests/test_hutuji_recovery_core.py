@@ -49,6 +49,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 using hutuji::AdvanceSendProgress;
                 using hutuji::ShouldRetrySend;
                 using hutuji::kSendStallBudgetMs;
+                using hutuji::SendStallBudget;
+                using hutuji::ShouldYieldToFeedHold;
                 using hutuji::StreamQuiescence;
 
                 size_t sent = 0;
@@ -59,28 +61,49 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 assert(sent == 3);
 
                 assert(kSendStallBudgetMs == 20000);
+                // 停滞预算只累计实际发送阶段；达到预算当刻必须过期。
+                SendStallBudget active_budget(100, 20);
+                assert(!active_budget.Expired(119));
+                assert(active_budget.Expired(120));
 
-                // ShouldRetrySend 只判错误重试；正数进展由 AdvanceSendProgress 消费。
-                assert(!ShouldRetrySend(1, 0, true));
-                assert(!ShouldRetrySend(100, 0, false));
+                // feed hold 仲裁挂起时间不消耗发送预算，恢复后继续累计剩余活动时间。
+                SendStallBudget suspended_budget(100, 20);
+                suspended_budget.Suspend(105, 1005);
+                assert(!suspended_budget.Expired(1019));
+                assert(suspended_budget.Expired(1020));
 
-                // n < 0 + EAGAIN + budget => retry
-                assert(ShouldRetrySend(-1, EAGAIN, true));
-                assert(ShouldRetrySend(-1, EWOULDBLOCK, true));
+                // TickType_t 32-bit 回绕仍按无符号差值计算。
+                SendStallBudget wrapping_budget(UINT32_MAX - 5, 20);
+                assert(!wrapping_budget.Expired(3));
+                assert(wrapping_budget.Expired(14));
 
-                // n < 0 + EAGAIN + no budget => give up
-                assert(!ShouldRetrySend(-1, EAGAIN, false));
-                assert(!ShouldRetrySend(-1, EWOULDBLOCK, false));
+                // 部分成功只推进发送游标，不能重置最初的活动预算。
+                SendStallBudget partial_send_budget(100, 20);
+                assert(AdvanceSendProgress(sent, 2));
+                assert(!partial_send_budget.Expired(119));
+                assert(AdvanceSendProgress(sent, 1));
+                assert(partial_send_budget.Expired(120));
+                assert(ShouldYieldToFeedHold(false, 1));
+                assert(ShouldYieldToFeedHold(false, 2));
+                assert(!ShouldYieldToFeedHold(false, 0));
+                assert(!ShouldYieldToFeedHold(true, 1));
 
-                // n < 0 + real error => teardown regardless of budget
-                assert(!ShouldRetrySend(-1, ENOTCONN, true));
-                assert(!ShouldRetrySend(-1, ENOTCONN, false));
-                assert(!ShouldRetrySend(-1, EPIPE, true));
-                assert(!ShouldRetrySend(-1, ECONNRESET, true));
-                assert(!ShouldRetrySend(-1, 0, true));
+                // ShouldRetrySend 只判 send() 结果和 errno，时间状态由 SendStallBudget 独立负责。
+                assert(!ShouldRetrySend(1, 0));
+                assert(!ShouldRetrySend(100, 0));
+
+                // n < 0 + EAGAIN/EWOULDBLOCK 属于可重试背压。
+                assert(ShouldRetrySend(-1, EAGAIN));
+                assert(ShouldRetrySend(-1, EWOULDBLOCK));
+
+                // 真实错误必须 teardown。
+                assert(!ShouldRetrySend(-1, ENOTCONN));
+                assert(!ShouldRetrySend(-1, EPIPE));
+                assert(!ShouldRetrySend(-1, ECONNRESET));
+                assert(!ShouldRetrySend(-1, 0));
                 // n == 0 即使 errno 残留 EAGAIN 也必须 teardown，不能无进展循环。
-                assert(!ShouldRetrySend(0, 0, true));
-                assert(!ShouldRetrySend(0, EAGAIN, true));
+                assert(!ShouldRetrySend(0, 0));
+                assert(!ShouldRetrySend(0, EAGAIN));
 
                 assert(IsStoppedForReset(true, false, false));
                 assert(IsStoppedForReset(false, true, true));

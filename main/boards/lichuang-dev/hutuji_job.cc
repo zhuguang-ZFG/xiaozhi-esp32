@@ -218,9 +218,9 @@ static bool ExtractGcodeWord(std::string_view line, char letter, float& out) {
         }
         char buf[32];
         size_t n = 0;
-        while (p < end && n + 1 < sizeof(buf) &&
-               (std::isdigit(static_cast<unsigned char>(*p)) || *p == '+' || *p == '-' ||
-                *p == '.')) {
+        while (
+            p < end && n + 1 < sizeof(buf) &&
+            (std::isdigit(static_cast<unsigned char>(*p)) || *p == '+' || *p == '-' || *p == '.')) {
             buf[n++] = *p++;
         }
         if (n == 0) {
@@ -508,9 +508,7 @@ bool Job::WaitForAbortReset() {
     }
     return abort_reset_owner_.Phase() == AbortResetOwnerPhase::Succeeded;
 }
-bool Job::ResetAbortResetState() {
-    return abort_reset_owner_.ResetIfSettled();
-}
+bool Job::ResetAbortResetState() { return abort_reset_owner_.ResetIfSettled(); }
 
 std::string Job::RequestPause() {
     // busy/试笔/换纸与暂停提交在同一快照下判断；`!` 发出后不能再有普通行入 planner。
@@ -1098,8 +1096,7 @@ bool Job::PreparePenOrigin() {
             } else {
                 stream_quiescence_.store(StreamQuiescence::Active, std::memory_order_release);
                 if (!pipe.SendLine("G92 Z0")) {
-                    stream_quiescence_.store(StreamQuiescence::Failed,
-                                             std::memory_order_release);
+                    stream_quiescence_.store(StreamQuiescence::Failed, std::memory_order_release);
                     stream_disconnected_ = true;
                     last_error_ = "发送 Z0 校准命令失败";
                     return false;
@@ -1347,7 +1344,6 @@ bool Job::RecoverDisconnectedDraw() {
     // 显式转为 Quiesced。只有这个已证实断连的恢复路径能做此转换。
     pipe.DrainResponses();
     stream_quiescence_.store(StreamQuiescence::Quiesced, std::memory_order_release);
-
 
     // 普通画线断连与用户 abort 共用同一受限 reset 事务和恢复判据。
     if (!PerformAbortReset(false, false, true)) {
@@ -1719,14 +1715,19 @@ bool Job::StreamToGrbl() {
                 // 当前商业固件链路实测会出现少应答，窗口计数会永久漂移。
                 const size_t need = line.size() + 1;  // R1：含换行符
                 if (c_line_bytes_sum + need < kWindow || c_line.empty()) {
-                    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-                    if (abort_requested_.load()) {
-                        // 不再灌新行；回到循环顶部排空已有 c_line 后再发布 Quiesced。
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+                        if (abort_requested_.load()) {
+                            // 不再灌新行；回到循环顶部排空已有 c_line 后再发布 Quiesced。
+                            continue;
+                        }
+                        if (paused_.load()) {
+                            continue;
+                        }
                     }
-                    if (paused_.load()) {
-                        continue;
-                    }
+                    // 发送可能受 TCP 背压；此处不能持 stream_mutex_，否则 abort/pause
+                    // 无法发布 `!`。Grbl 会在任意字节边界消费实时字符，当前行至多在 Hold
+                    // 状态下补齐并入 planner，abort reset 随后会清空它。
                     if (!pipe.SendLine(line)) {
                         // SendRawLocked 已半关 socket；即使接收泵尚未来得及更新原子状态，
                         // 也必须按断连恢复，不能复用可能残留半行的 session。
@@ -1771,8 +1772,7 @@ bool Job::StreamToGrbl() {
         uint32_t waited = 0;
         const uint32_t slice = 1000;
         while (waited < timeout) {
-            if (abort_requested_.load() &&
-                abort_hold_confirmed_.load(std::memory_order_acquire)) {
+            if (abort_requested_.load() && abort_hold_confirmed_.load(std::memory_order_acquire)) {
                 // fresh Hold:0/Idle 已证明 planner 停稳；旧 ok 已不再代表可续画进度。
                 pipe.DrainResponses();
                 c_line.clear();
