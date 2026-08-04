@@ -1755,9 +1755,14 @@ bool Job::StreamToGrbl() {
                         snap_epoch = stream_control_epoch_.load(std::memory_order_acquire);
                     }
                     // 发送不能持锁：SendLine 可能因 TCP 背压阻塞最坏 20s，持锁会让
-                    // pause/abort 无法发布 `!`。两个交错下普通行都不可能再进 planner：
+                    // pause/abort 无法发布 `!`。纪元闸把「暂停提交 vs 候选行检查」线性化：
                     //   a) 快照先取（旧纪元），pause/abort 随后提交 → latest != snap → Aborted；
                     //   b) pause/abort 先在锁内提交，快照看到新纪元/新状态 → Paused/Aborted。
+                    // 残余窗口：本行 Allowed 决策后、字节实际到达 Grbl 前，pause 仍可在锁内
+                    // 提交并成功发出 `!`——至多一行在途普通行会进入 Hold 态 planner（协议 §4.1
+                    // 承认该形态：abort 由 0x18 丢弃，pause 恢复 `~` 后至多多执行这一行）。这是
+                    // `!` 快路径（背压响应快）与严格无竞态（`!` 走写锁，暂停最坏延迟 20s）之间的
+                    // 权衡，比改造前「解锁即发」的窗口更窄，不再放宽。
                     switch (DecideStreamSend(
                         snap_abort, snap_paused, snap_epoch,
                         stream_control_epoch_.load(std::memory_order_acquire))) {

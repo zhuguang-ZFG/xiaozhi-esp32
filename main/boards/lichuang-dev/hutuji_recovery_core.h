@@ -155,7 +155,7 @@ enum class StreamSendCancel : uint8_t {
 
 /**
  * 普通灌行前闸判定：把 stream_mutex_ 内快照与发送前的最新原子读捏成一次决策。
- * 语义与暂停前「持锁直接检查」完全等价；abort 判定改为「状态位置位，或控制纪元
+ * 语义是「拒绝集 ≥ 持锁直接检查」：abort 判定改为「状态位置位，或控制纪元
  * 在快照后前进」。pause/abort 提交方在发布暂停/abort 状态的同时（同一把
  * stream_mutex_ 内）递增 stream_control_epoch_，因此快照后发生的提交必然被
  * 快照 epoch 捕获。换纸行分支仍在 stream_mutex_ 内检查 paused，abort 则由循环顶
