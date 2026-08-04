@@ -1092,11 +1092,18 @@ void Pipe::DrainResponses() {
 
 WaitResult Pipe::TakeResponse(uint32_t timeout_ms, int* error_code) {
     if (resp_queue_ == nullptr) {
+        // 契约（hutuji_pipe.h）：Timeout 时必须写 -1，调用方不能在超时后读到旧码。
+        if (error_code != nullptr) {
+            *error_code = -1;
+        }
         return WaitResult::Timeout;
     }
     RespItem item{};
     if (xQueueReceive(resp_queue_, &item, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
         ESP_LOGW(TAG, "等待 Grbl 应答超时 (%ums)", (unsigned)timeout_ms);
+        if (error_code != nullptr) {
+            *error_code = -1;
+        }
         return WaitResult::Timeout;
     }
     {
