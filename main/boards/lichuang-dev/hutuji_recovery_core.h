@@ -145,6 +145,33 @@ inline constexpr bool CanResetAfterStream(StreamQuiescence state) {
 inline constexpr StreamQuiescence FinishStream(bool proven_quiesced) {
     return proven_quiesced ? StreamQuiescence::Quiesced : StreamQuiescence::Failed;
 }
+
+/** 灌行前闸的决策结果；socket 故障由调用方单独处理。 */
+enum class StreamSendCancel : uint8_t {
+    Allowed = 0,
+    Paused,
+    Aborted,
+};
+
+/**
+ * 普通灌行前闸判定：把 stream_mutex_ 内快照与发送前的最新原子读捏成一次决策。
+ * 语义与暂停前「持锁直接检查」完全等价；abort 判定改为「状态位置位，或控制纪元
+ * 在快照后前进」。pause/abort 提交方在发布暂停/abort 状态的同时（同一把
+ * stream_mutex_ 内）递增 stream_control_epoch_，因此快照后发生的提交必然被
+ * 快照 epoch 捕获。换纸行分支仍在 stream_mutex_ 内检查 paused，abort 则由循环顶
+ * 的排流逻辑兜底。
+ */
+inline constexpr StreamSendCancel DecideStreamSend(bool snap_abort, bool snap_paused,
+                                                   uint32_t snap_epoch, uint32_t latest_epoch) {
+    if (snap_abort || latest_epoch != snap_epoch) {
+        return StreamSendCancel::Aborted;
+    }
+    return snap_paused ? StreamSendCancel::Paused : StreamSendCancel::Allowed;
+}
+
+/** pause/abort 提交方的纪元递增（允许回绕；ABA 需 2^32 次提交，实际不可达）。 */
+inline constexpr uint32_t NextStreamControlEpoch(uint32_t epoch) { return epoch + 1U; }
+
 class AbortResetToken {
 public:
     /** 调用方必须用同一把发送锁串行化 Arm/Consume/Cancel。 */

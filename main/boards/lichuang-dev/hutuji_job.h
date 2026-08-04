@@ -134,6 +134,13 @@ private:
     std::atomic<bool> abort_requested_{false};
     std::atomic<bool> paper_active_{false};
     std::atomic<bool> paused_{false};
+    // pause/abort 提交纪元：RequestPause/RequestAbort、恢复失败回滚和暂停超时 abort
+    // 均在 stream_mutex_ 内发布状态并递增。灌行候选在 stream_mutex_ 内捕获快照后
+    // 解锁，执行 SendLine 前用 DecideStreamSend 复核「快照后无提交」；StreamToGrbl
+    // 单行发送串行，因此该决策与暂停前「持锁直接检查」逐字等价。已有在途字节由
+    // Grbl feed hold 与 planner 边界兜底（保持本轮出图画笔行为不变）。成功恢复不动
+    // 纪元；恢复失败回滚 paused 时动纪元，拒绝恢复尝试期间形成的旧候选行。
+    std::atomic<uint32_t> stream_control_epoch_{0};
     // 每个任务最多一个 reset owner；owner 收敛前 busy_ 始终保持 true。
     AbortResetOwner abort_reset_owner_;
     std::atomic<bool> abort_reset_worker_active_{false};

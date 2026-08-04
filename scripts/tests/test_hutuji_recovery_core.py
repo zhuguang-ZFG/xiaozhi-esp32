@@ -35,6 +35,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
 
             #include <cassert>
+
             #include <cstdint>
 
             int main() {
@@ -52,6 +53,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 using hutuji::SendStallBudget;
                 using hutuji::ShouldYieldToFeedHold;
                 using hutuji::StreamQuiescence;
+                using hutuji::DecideStreamSend;
+                using hutuji::NextStreamControlEpoch;
+                using hutuji::StreamSendCancel;
 
                 size_t sent = 0;
 
@@ -155,6 +159,37 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 assert(!CanResetAfterStream(StreamQuiescence::Failed));
                 assert(FinishStream(true) == StreamQuiescence::Quiesced);
                 assert(FinishStream(false) == StreamQuiescence::Failed);
+
+                // DecideStreamSend：状态干净且纪元未动 → Allowed。
+                assert(DecideStreamSend(false, false, 7, 7) == StreamSendCancel::Allowed);
+                // 快照已见 paused（pause 已先在锁内提交，快照看到新纪元也匹配）→ Paused。
+                assert(DecideStreamSend(false, true, 7, 7) == StreamSendCancel::Paused);
+                // 快照已见 abort → Aborted；abort 优先级高于 paused。
+                assert(DecideStreamSend(true, false, 7, 7) == StreamSendCancel::Aborted);
+                assert(DecideStreamSend(true, true, 7, 7) == StreamSendCancel::Aborted);
+                // 快照后纪元前进（pause/abort 在解锁后提交）→ 拒发，即使状态位看着干净。
+                assert(DecideStreamSend(false, false, 7, 8) == StreamSendCancel::Aborted);
+                assert(DecideStreamSend(false, true, 7, 8) == StreamSendCancel::Aborted);
+                assert(DecideStreamSend(true, false, 7, 8) == StreamSendCancel::Aborted);
+                // 纪元回绕 UINT32_MAX→0 仍判为前进（ABA 需 2^32 次提交，实际不可达）。
+                assert(NextStreamControlEpoch(UINT32_MAX) == 0);
+                assert(NextStreamControlEpoch(0) == 1);
+                // 模拟 RequestResume：成功不动纪元；`~` 失败回滚 paused 时推进一次。
+                const uint32_t before_resume = 23;
+                const uint32_t resume_success_epoch = before_resume;
+                assert(resume_success_epoch == before_resume);
+                const uint32_t resume_rollback_epoch =
+                    NextStreamControlEpoch(before_resume);
+                assert(resume_rollback_epoch == 24);
+                assert(DecideStreamSend(false, false, before_resume, resume_rollback_epoch) ==
+                       StreamSendCancel::Aborted);
+                assert(DecideStreamSend(false, true, resume_rollback_epoch,
+                                        resume_rollback_epoch) == StreamSendCancel::Paused);
+                assert(DecideStreamSend(false, false, UINT32_MAX, 0) ==
+                       StreamSendCancel::Aborted);
+                assert(DecideStreamSend(false, true, UINT32_MAX, 0) ==
+                       StreamSendCancel::Aborted);
+                assert(DecideStreamSend(false, false, 0, 0) == StreamSendCancel::Allowed);
 
                 AbortResetToken token;
                 assert(!token.Pending());

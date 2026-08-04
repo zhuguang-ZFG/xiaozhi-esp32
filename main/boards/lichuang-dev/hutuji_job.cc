@@ -311,6 +311,10 @@ std::string Job::RequestAbort() {
             return JsonString("ok");
         }
         abort_requested_.store(true);
+        // 纪元与 abort 状态同锁发布；快照早于本提交的候选行经 DecideStreamSend 必然拒发。
+        stream_control_epoch_.store(
+            NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+            std::memory_order_release);
         pen_test_active = pen_test_active_.load();
         paper_active = paper_active_.load();
     }
@@ -344,6 +348,10 @@ std::string Job::RequestAbort() {
         }
         if (!StartAbortResetTask()) {
             abort_requested_.store(false);
+            // 回滚同样动纪元：旧候选至多被冤枉拒发一次重试，不会漏看后续提交。
+            stream_control_epoch_.store(
+                NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+                std::memory_order_release);
             return "{\"error\":\"无法创建 abort 恢复任务\"}";
         }
     }
@@ -525,10 +533,17 @@ std::string Job::RequestPause() {
     if (paused_.exchange(true)) {
         return JsonString("已经是暂停状态");
     }
+    // 纪元与暂停状态同锁发布；`!` 发送失败回滚时也递增一次——只冤枉当前候选行重试。
+    stream_control_epoch_.store(
+        NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+        std::memory_order_release);
     // `!` 进给保持：Grbl 减速停住，planner 内容保留，`~` 可原地续跑。
     // 发送失败时回滚本地状态，不能把断链说成已暂停。
     if (!Pipe::GetInstance().SendRealtime('!')) {
         paused_.store(false);
+        stream_control_epoch_.store(
+            NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+            std::memory_order_release);
         return "{\"error\":\"写字机 Telnet 已断开，无法暂停\"}";
     }
     // Hold 中普通 G-code 只会进入 planner，无法即时抬笔；额外注入 Z 行还会让主任务的
@@ -553,6 +568,10 @@ std::string Job::RequestResume() {
     }
     if (!Pipe::GetInstance().SendRealtime('~')) {
         paused_.store(true);
+        // 恢复失败的 paused 回滚与 pause/abort 提交同样推进纪元，拒绝旧候选行。
+        stream_control_epoch_.store(
+            NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+            std::memory_order_release);
         return "{\"error\":\"写字机 Telnet 已断开，无法继续\"}";
     }
     SetState("streaming");
@@ -1044,8 +1063,16 @@ bool Job::WaitWhilePaused() {
         }
         // 暂停不能无限期挂住 busy_，否则 draw/repeat/pen_test 全被顶成 busy。
         if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(kMaxPauseMs)) {
-            paused_.store(false);
-            abort_requested_.store(true);
+            // WaitWhilePaused 的调用点均不持 stream_mutex_；在提交锁内同时发布
+            // paused 回滚、abort 与纪元，避免普通灌行候选漏看超时取消。
+            {
+                std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+                paused_.store(false);
+                abort_requested_.store(true);
+                stream_control_epoch_.store(
+                    NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+                    std::memory_order_release);
+            }
             last_error_ = "暂停超时自动取消";
             Notify("暂停超过 10 分钟，已自动取消这幅画；想画的话跟我说一声");
             // 先启动唯一 owner；StreamToGrbl 退出发布 Quiesced 后 worker 才能发 reset。
@@ -1715,21 +1742,36 @@ bool Job::StreamToGrbl() {
                 // 当前商业固件链路实测会出现少应答，窗口计数会永久漂移。
                 const size_t need = line.size() + 1;  // R1：含换行符
                 if (c_line_bytes_sum + need < kWindow || c_line.empty()) {
+                    // 快照与暂停/abort 提交在同一把 stream_mutex_ 下做：RequestPause/
+                    // RequestAbort 在锁内发布状态并递增 stream_control_epoch_；解锁后、
+                    // SendLine 前用 DecideStreamSend 复核「快照后无新提交」。
+                    bool snap_abort = false;
+                    bool snap_paused = false;
+                    uint32_t snap_epoch = 0;
                     {
                         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-                        if (abort_requested_.load()) {
-                            // 不再灌新行；回到循环顶部排空已有 c_line 后再发布 Quiesced。
-                            continue;
-                        }
-                        if (paused_.load()) {
-                            continue;
-                        }
+                        snap_abort = abort_requested_.load(std::memory_order_acquire);
+                        snap_paused = paused_.load(std::memory_order_acquire);
+                        snap_epoch = stream_control_epoch_.load(std::memory_order_acquire);
                     }
-                    // 发送可能受 TCP 背压；此处不能持 stream_mutex_，否则 abort/pause
-                    // 无法发布 `!`。Grbl 会在任意字节边界消费实时字符，当前行至多在 Hold
-                    // 状态下补齐并入 planner，abort reset 随后会清空它。
-                    // 上界：释放 stream_mutex_ 期间至多多灌 1 行（本轮这一行），由后续
-                    // 0x18 软复位清空 planner 兜底——不得据此以为可无限放宽此锁。
+                    // 发送不能持锁：SendLine 可能因 TCP 背压阻塞最坏 20s，持锁会让
+                    // pause/abort 无法发布 `!`。两个交错下普通行都不可能再进 planner：
+                    //   a) 快照先取（旧纪元），pause/abort 随后提交 → latest != snap → Aborted；
+                    //   b) pause/abort 先在锁内提交，快照看到新纪元/新状态 → Paused/Aborted。
+                    switch (DecideStreamSend(
+                        snap_abort, snap_paused, snap_epoch,
+                        stream_control_epoch_.load(std::memory_order_acquire))) {
+                    case StreamSendCancel::Paused:
+                        // `!` 已发出：本行不得再进 planner；回循环顶由暂停分支等待恢复。
+                        continue;
+                    case StreamSendCancel::Aborted:
+                        // abort 提交方已在同一把锁内置位 abort_requested_，循环顶的排流/
+                        // Quiesced 逻辑只认该标志，这里无需再写状态；取消 ≠ socket 故障，
+                        // 绝不置 stream_disconnected_。回循环顶走既有收分支/abort 恢复路径。
+                        continue;
+                    case StreamSendCancel::Allowed:
+                        break;
+                    }
                     if (!pipe.SendLine(line)) {
                         // SendRawLocked 已半关 socket；即使接收泵尚未来得及更新原子状态，
                         // 也必须按断连恢复，不能复用可能残留半行的 session。
