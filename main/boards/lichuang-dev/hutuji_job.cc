@@ -18,7 +18,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#include <algorithm>
 #include <deque>
 #include <string>
 
@@ -54,57 +53,8 @@ constexpr int kDeferredMaxRetries = 8;
 constexpr int kDisconnectReplayMaxRetries = 2;
 // 暂停上限：超过则自动放弃，避免 busy_ 被无限期占用导致所有工具返回 busy。
 constexpr uint32_t kMaxPauseMs = 10 * 60 * 1000;
-// S3 窗口化流控窗口（§3 取值：Telnet RX ①的 43%，约 21 行在途）。
-constexpr size_t kWindow = 512;
-
-// 设备侧出图只允许云端生成的 capability URL；scheme 限定 http/https，
-// 主机限定私有网段或 hutuji.donglicao.com。拦坏 url 在设备侧，
-// 避免 MCP 回调被诱发出站拉取任意内网/公网地址。
-static bool IsValidDrawUrl(const std::string& url) {
-    const std::string kHttps = "https://";
-    const std::string kHttp = "http://";
-    std::string rest;
-    if (url.rfind(kHttps, 0) == 0) {
-        rest = url.substr(kHttps.size());
-    } else if (url.rfind(kHttp, 0) == 0) {
-        rest = url.substr(kHttp.size());
-    } else {
-        return false;
-    }
-    const size_t slash = rest.find('/');
-    const std::string hostport = rest.substr(0, slash);
-    if (hostport.empty()) {
-        return false;
-    }
-    std::string host = hostport;
-    const size_t colon = host.find(':');
-    if (colon != std::string::npos) {
-        host = host.substr(0, colon);
-    }
-    if (host.empty()) {
-        return false;
-    }
-    std::string lowhost = host;
-    std::transform(lowhost.begin(), lowhost.end(), lowhost.begin(), ::tolower);
-    if (lowhost == "hutuji.donglicao.com") {
-        return true;
-    }
-    unsigned a, b, c, d;
-    char tail;
-    if (std::sscanf(host.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) {
-        return false;
-    }
-    if (a > 255 || b > 255 || c > 255 || d > 255) {
-        return false;
-    }
-    if (a == 10)
-        return true;
-    if (a == 172 && b >= 16 && b <= 31)
-        return true;
-    if (a == 192 && b == 168)
-        return true;
-    return false;
-}
+// S3 窗口化流控窗口（§3 取值：Telnet RX ①的 43%）。应答队列容量由同一常量推导。
+constexpr size_t kWindow = kStreamWindowBytes;
 
 std::string JsonString(const char* value) {
     cJSON* root = cJSON_CreateString(value);
@@ -158,7 +108,6 @@ void Job::ReleaseBuffer() {
         buffer_ = nullptr;
     }
     buffer_len_ = 0;
-    have_crc_ = false;
 }
 
 uint32_t Job::Crc32Ieee(const uint8_t* data, size_t len) {
@@ -260,8 +209,8 @@ std::string Job::StartDraw(const std::string& url) {
         return "{\"error\":\"url 不能为空\"}";
     }
     if (!IsValidDrawUrl(url)) {
-        return "{\"error\":\"url 必须是 http(s)://<私有IP或hutuji.donglicao.com>/... 的 capability "
-               "地址\"}";
+        return "{\"error\":\"url 必须是 https://hutuji.donglicao.com/files/...，或 RFC1918 "
+               "联调主机的 /files/... capability 地址\"}";
     }
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
@@ -947,7 +896,7 @@ bool Job::DownloadToPsram(const std::string& url) {
         return false;
     }
     http->SetTimeout(60000);
-    // 自签证书在正式证换上前可能失败；联调可用 http:// PUBLIC_BASE_URL
+    // 生产域由 IsValidDrawUrl 强制 HTTPS；HTTP 只允许 RFC1918 联调主机。
     if (!http->Open("GET", url)) {
         last_error_ = "HTTP Open 失败";
         return false;
@@ -974,11 +923,8 @@ bool Job::DownloadToPsram(const std::string& url) {
     if (crc_hdr.empty()) {
         crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
     }
-    if (!crc_hdr.empty()) {
-        expect_crc_ = static_cast<uint32_t>(strtoul(crc_hdr.c_str(), nullptr, 16));
-        have_crc_ = true;
-    } else {
-        last_error_ = "缺少 X-Hutuji-CRC32";
+    if (!ParseCrc32Header(crc_hdr, expect_crc_)) {
+        last_error_ = crc_hdr.empty() ? "缺少 X-Hutuji-CRC32" : "X-Hutuji-CRC32 格式无效";
         http->Close();
         return false;
     }
@@ -1026,9 +972,8 @@ bool Job::DownloadToPsram(const std::string& url) {
 
 bool Job::VerifyCrc() {
     uint32_t got = Crc32Ieee(buffer_, buffer_len_);
-    if (!have_crc_ || got != expect_crc_) {
+    if (!Crc32Matches(expect_crc_, got)) {
         last_error_ = "CRC 不符";
-        ESP_LOGE(TAG, "CRC expect=%08x got=%08x", (unsigned)expect_crc_, (unsigned)got);
         return false;
     }
     return true;
@@ -1763,19 +1708,19 @@ bool Job::StreamToGrbl() {
                     // 承认该形态：abort 由 0x18 丢弃，pause 恢复 `~` 后至多多执行这一行）。这是
                     // `!` 快路径（背压响应快）与严格无竞态（`!` 走写锁，暂停最坏延迟 20s）之间的
                     // 权衡，比改造前「解锁即发」的窗口更窄，不再放宽。
-                    switch (DecideStreamSend(
-                        snap_abort, snap_paused, snap_epoch,
-                        stream_control_epoch_.load(std::memory_order_acquire))) {
-                    case StreamSendCancel::Paused:
-                        // `!` 已发出：本行不得再进 planner；回循环顶由暂停分支等待恢复。
-                        continue;
-                    case StreamSendCancel::Aborted:
-                        // abort 提交方已在同一把锁内置位 abort_requested_，循环顶的排流/
-                        // Quiesced 逻辑只认该标志，这里无需再写状态；取消 ≠ socket 故障，
-                        // 绝不置 stream_disconnected_。回循环顶走既有收分支/abort 恢复路径。
-                        continue;
-                    case StreamSendCancel::Allowed:
-                        break;
+                    switch (
+                        DecideStreamSend(snap_abort, snap_paused, snap_epoch,
+                                         stream_control_epoch_.load(std::memory_order_acquire))) {
+                        case StreamSendCancel::Paused:
+                            // `!` 已发出：本行不得再进 planner；回循环顶由暂停分支等待恢复。
+                            continue;
+                        case StreamSendCancel::Aborted:
+                            // abort 提交方已在同一把锁内置位 abort_requested_，循环顶的排流/
+                            // Quiesced 逻辑只认该标志，这里无需再写状态；取消 ≠ socket 故障，
+                            // 绝不置 stream_disconnected_。回循环顶走既有收分支/abort 恢复路径。
+                            continue;
+                        case StreamSendCancel::Allowed:
+                            break;
                     }
                     if (!pipe.SendLine(line)) {
                         // SendRawLocked 已半关 socket；即使接收泵尚未来得及更新原子状态，

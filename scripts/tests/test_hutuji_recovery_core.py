@@ -25,6 +25,224 @@ def find_compiler():
 
 
 class HutujiRecoveryCoreTest(unittest.TestCase):
+    def _compile_and_run(self, compiler, source, stem):
+        """把 core 头的纯逻辑编成 host 可执行文件跑一遍，非 0 退出即失败。
+
+        `compiler` 与 `stem` 都不给默认值：编译器显式传入，漏传即在调用点报
+        TypeError，而不是靠隐式实例属性（漏赋值时错误会指向本 helper 而非漏的地方）；
+        stem 每个测试各自命名，避免默认值掩盖「一测一名」的意图。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            source_path = temp / f"{stem}.cpp"
+            output_path = temp / (f"{stem}.exe" if os.name == "nt" else stem)
+            source_path.write_text(source, encoding="utf-8")
+            build = subprocess.run(
+                [
+                    str(compiler),
+                    "-std=c++17",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-I",
+                    str(ROOT),
+                    str(source_path),
+                    "-o",
+                    str(output_path),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(build.returncode, 0, build.stderr or build.stdout)
+            run = subprocess.run(
+                [str(output_path)],
+                cwd=temp,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+    def test_parse_grbl_error_code_handles_verbose_text_form(self):
+        """`$Errors/Verbose=1` 时 Grbl 回文本而非数字，解析必须两种形态都认。
+
+        `Grbl_Esp32/src/Report.cpp:236` 在该设置为真时把 `error:11` 换成
+        `error: Line too long`。只认数字的话不是降级而是行为反转：`error:8`
+        （换纸期运动行被推迟、需重发）会解析成 -1 → WaitResult::Failed → 整单失败；
+        `error:110`（未授权）同样落进 Failed 而非「已知未授权」。该设置存在 NVS 里，
+        能被任何上位机（奎享本体、ESP3D WebUI）改写并持久化。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <string>
+
+            int main() {
+                using hutuji::ParseGrblErrorCode;
+
+                // 数字形态（$Errors/Verbose=0，出厂默认 Defaults.h:82）
+                assert(ParseGrblErrorCode("error:8") == 8);
+                assert(ParseGrblErrorCode("error:11") == 11);
+                assert(ParseGrblErrorCode("error:110") == 110);
+                assert(ParseGrblErrorCode("error 8") == 8);   // 旧式空格分隔
+
+                // 文本形态（$Errors/Verbose=1）——本次修复的核心。
+                // 字面量逐字取自 Grbl_Esp32/src/Error.cpp 的 ErrorNames。
+                assert(ParseGrblErrorCode("error: Command requires idle state") == 8);
+                assert(ParseGrblErrorCode("error: Authentication failed!") == 110);
+                assert(ParseGrblErrorCode("error: Line too long") == 11);
+                assert(ParseGrblErrorCode("error: GCode cannot be executed in lock or alarm state") == 9);
+                assert(ParseGrblErrorCode("error: Soft limit error") == 10);
+
+                // 数字形态必须整段合法且可装入 int；畸形网络输入不得触发
+                // signed overflow，也不得把带垃圾尾缀的 8 误判成 Deferred 重试。
+                assert(ParseGrblErrorCode("error:8garbage") == -1);
+                assert(ParseGrblErrorCode("error:8  ") == -1);
+                assert(ParseGrblErrorCode("error:2147483647") == 2147483647);
+                assert(ParseGrblErrorCode("error:2147483648") == -1);
+                assert(ParseGrblErrorCode("error:999999999999999999999999999999") == -1);
+                // 非 error 行与未收录文本仍回 -1（与旧行为一致，按 Failed 处理）
+                assert(ParseGrblErrorCode("ok") == -1);
+                assert(ParseGrblErrorCode("<Idle|MPos:0.000,0.000,0.000>") == -1);
+                assert(ParseGrblErrorCode("error: Some future message") == -1);
+                assert(ParseGrblErrorCode("error:") == -1);
+                assert(ParseGrblErrorCode("") == -1);
+                // 前缀相同但不是 error 行，不得误判
+                assert(ParseGrblErrorCode("errors:8") == -1);
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_parse_error_code_test")
+
+    def test_auth_probe_hits_grbl_license_gate_and_crc_header_is_strict(self):
+        """授权探针必须命中 Grbl 行首 G0–G3 前置门；CRC 头必须完整合法。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <cstdint>
+            #include <string>
+
+            int main() {
+                using hutuji::BuildLicenseProbeLine;
+                using hutuji::Crc32Matches;
+                using hutuji::ParseCrc32Header;
+
+                // Protocol.cpp 的授权前置门只认行首 G0~G3。G53 放前面会绕过前置门，
+                // 未授权运动在 GCode.cpp 内被静默跳过但整行仍回 ok，S3 会误判已授权。
+                const std::string probe = BuildLicenseProbeLine(12.5f);
+                assert(probe == "G1 G53 X12.500 F1500");
+                assert(probe.rfind("G1", 0) == 0);
+
+                uint32_t crc = 0;
+                assert(ParseCrc32Header("00000000", crc) && crc == 0u);
+                assert(ParseCrc32Header("89abcdef", crc) && crc == 0x89abcdefu);
+                assert(ParseCrc32Header("DEADBEEF", crc) && crc == 0xdeadbeefu);
+                assert(Crc32Matches(crc, 0xdeadbeefu));
+                assert(!Crc32Matches(crc, 0xdeadbeeeu));
+
+                // 服务端固定输出 8 位十六进制；缺位、超长、尾缀、前缀和空白均拒。
+                assert(!ParseCrc32Header("", crc));
+                assert(!ParseCrc32Header("deadbee", crc));
+                assert(!ParseCrc32Header("deadbeef0", crc));
+                assert(!ParseCrc32Header("deadbeefjunk", crc));
+                assert(!ParseCrc32Header("0xdeadbeef", crc));
+                assert(!ParseCrc32Header(" deadbeef", crc));
+                assert(!ParseCrc32Header("deadbeef ", crc));
+                assert(!ParseCrc32Header("deadbegf", crc));
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_auth_crc_contract_test")
+
+    def test_draw_url_rejects_public_http_and_authority_confusion(self):
+        """公网能力只走 HTTPS；authority 不能把允许主机藏进 userinfo。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <string>
+
+            int main() {
+                using hutuji::IsValidDrawUrl;
+
+                assert(IsValidDrawUrl("https://hutuji.donglicao.com/files/draw_token.gcode"));
+                assert(IsValidDrawUrl("https://HUTUJI.DONGLICAO.COM:443/files/draw_token.gcode?sig=x"));
+                assert(!IsValidDrawUrl("https://hutuji.donglicao.com:444/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("http://hutuji.donglicao.com/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("https://hutuji.donglicao.com:443@evil.example/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("https://hutuji.donglicao.com/files/draw_token.gcode\nInjected: x"));
+                assert(!IsValidDrawUrl("https://evil.example@hutuji.donglicao.com/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("https://hutuji.donglicao.com:abc/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("https://hutuji.donglicao.com:0/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("https://hutuji.donglicao.com:65536/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("https://hutuji.donglicao.com/other"));
+                assert(!IsValidDrawUrl("https://hutuji.donglicao.com/files/draw_token.gcode#fragment"));
+
+                // 研发联调可直连 RFC1918 的同形 /files 能力；公网地址不能借此放行。
+                assert(IsValidDrawUrl("http://192.168.1.2:8300/files/draw_token.gcode"));
+                assert(IsValidDrawUrl("https://10.0.0.8/files/draw_token.gcode"));
+                assert(IsValidDrawUrl("http://172.16.0.1/files/draw_token.gcode"));
+                assert(IsValidDrawUrl("http://172.31.255.254/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("http://172.32.0.1/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("http://127.0.0.1/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("https://8.8.8.8/files/draw_token.gcode"));
+                assert(!IsValidDrawUrl("ftp://hutuji.donglicao.com/files/draw_token.gcode"));
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_draw_url_contract_test")
+
+    def test_response_queue_covers_maximum_window_line_count(self):
+        """最短合法非空行也不得把应答队列灌穿并丢失 error。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+
+            int main() {
+                using hutuji::kResponseQueueDepth;
+                using hutuji::kStreamWindowBytes;
+
+                // StreamToGrbl 用 payload+LF 计窗且要求 sum+need < window。
+                // 非空 payload 最短 1B，故最多 (window-1)/2 条同时在途。
+                constexpr size_t max_inflight_lines = (kStreamWindowBytes - 1u) / 2u;
+                static_assert(kResponseQueueDepth >= max_inflight_lines,
+                              "response queue can drop an in-flight error");
+                assert(kResponseQueueDepth >= max_inflight_lines);
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_response_capacity_test")
+
+
     def test_recovery_decisions_and_abort_reset_token(self):
         compiler = find_compiler()
         if compiler is None:
@@ -231,38 +449,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             """
         )
 
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            source_path = temp / "hutuji_recovery_core_test.cpp"
-            output_path = temp / ("hutuji_recovery_core_test.exe" if os.name == "nt" else "hutuji_recovery_core_test")
-            source_path.write_text(source, encoding="utf-8")
-            build = subprocess.run(
-                [
-                    str(compiler),
-                    "-std=c++17",
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                    "-I",
-                    str(ROOT),
-                    str(source_path),
-                    "-o",
-                    str(output_path),
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            self.assertEqual(build.returncode, 0, build.stderr or build.stdout)
-            run = subprocess.run(
-                [str(output_path)],
-                cwd=temp,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self._compile_and_run(compiler, source, stem="hutuji_recovery_core_test")
 
 
 if __name__ == "__main__":

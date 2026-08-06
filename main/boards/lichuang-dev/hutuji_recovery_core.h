@@ -3,10 +3,231 @@
 
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 
 namespace hutuji {
+// 窗口按 payload+LF 计字节；应答队列须覆盖最短非空行形成的最大在途条数，
+// 否则队满丢掉 error 后，后续 ok 会与错误行错配，破坏 fail-closed。
+inline constexpr size_t kStreamWindowBytes = 512;
+inline constexpr size_t kResponseQueueDepth = (kStreamWindowBytes - 1u) / 2u;
+
+/**
+ * 解析 Grbl 的 `error` 应答为数字错误码；无法判定时返回 -1。
+ *
+ * **必须同时认数字与文本两种形态。** Grbl_Esp32 `Report.cpp:236` 在
+ * `$Errors/Verbose=1` 时把应答从 `error:11` 换成 `error: Line too long`：
+ *
+ *     if (verbose_errors->get()) grbl_sendf(client, "error: %s\r\n", errorString(status_code));
+ *     else                       grbl_sendf(client, "error:%d\r\n", (int)status_code);
+ *
+ * 只认数字的话，后果不是降级而是**行为反转**：`error:8`（换纸期运动行被推迟、该行
+ * 需重发）会解析成 -1 → 走 WaitResult::Failed → 整单失败而非重试；`error:110`
+ * （未授权）同样落进 Failed 分支而非「已知未授权」。默认值是 0（`Defaults.h:82`），
+ * 但这是块**现役商业固件**，`$`-设置存在 NVS 里，能被任何上位机（奎享本体、
+ * ESP3D WebUI）改写并持久化，且我们无法在出厂前保证它没被动过。
+ *
+ * 文本表取自 `Grbl_Esp32/src/Error.cpp` 的 ErrorNames，只收录 S3 三层换纸判定与
+ * 授权探测真正分派到的码 + 行长溢出；其余文本形态回 -1（与旧行为一致，按 Failed 处理）。
+ */
+inline int ParseGrblErrorCode(const std::string& line) {
+    // "error:8" / "error:110" / 旧式 "error 8"
+    if (line.rfind("error", 0) != 0) {
+        return -1;
+    }
+    size_t i = 5;
+    while (i < line.size() && (line[i] == ':' || line[i] == ' ')) {
+        ++i;
+    }
+    if (i < line.size() && line[i] >= '0' && line[i] <= '9') {
+        int code = 0;
+        while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
+            const int digit = line[i] - '0';
+            if (code > (INT_MAX - digit) / 10) {
+                return -1;
+            }
+            code = code * 10 + digit;
+            ++i;
+        }
+        return i == line.size() ? code : -1;
+    }
+    if (i >= line.size()) {
+        return -1;  // `error:` 后无内容：既非数字也非文本形态
+    }
+    // `$Errors/Verbose=1` 的文本形态。逐字对齐 Error.cpp 的 ErrorNames 字面量。
+    // 注：`errorString()` 对未定义的码返回 NULL（`ProcessSettings.cpp:369`），
+    // `Report.cpp:237` 会把它按 `%s` 印成 `(null)`——不在下表内，回 -1，与旧行为一致。
+    const std::string text = line.substr(i);
+    struct VerboseName {
+        const char* text;
+        int code;
+    };
+    static constexpr VerboseName kVerboseNames[] = {
+        {"Command requires idle state", 8},  // Error::IdleError = 8，换纸期推迟
+        {"Authentication failed!", 110},     // Error::AuthenticationFailed = 110
+        {"Line too long", 11},               // Error::Overflow = 11
+        {"GCode cannot be executed in lock or alarm state", 9},  // Error::SystemGcLock
+        {"Soft limit error", 10},                                // Error::SoftLimitError
+    };
+    for (const VerboseName& entry : kVerboseNames) {
+        if (text == entry.text) {
+            return entry.code;
+        }
+    }
+    return -1;
+}
+
+/**
+ * 构造未授权探测行。`G1` 必须是第一个 G 字：商业固件 Protocol.cpp 的前置授权门
+ * 只检查行首 G0~G3；若写成 `G53 G1 ...`，前置门看到 G53 会放过，GCode.cpp 内层
+ * 又只是静默跳过未授权运动并最终返回 ok，S3 会把未授权误判成已授权。
+ */
+inline std::string BuildLicenseProbeLine(float machine_x) {
+    char probe[64];
+    std::snprintf(probe, sizeof(probe), "G1 G53 X%.3f F1500", machine_x);
+    return probe;
+}
+
+/** 服务端固定输出 8 位十六进制 CRC32；任何缺位、溢出、空白或尾缀都拒绝。 */
+inline bool ParseCrc32Header(const std::string& text, uint32_t& out) {
+    if (text.size() != 8) {
+        return false;
+    }
+    uint32_t value = 0;
+    for (char c : text) {
+        uint32_t digit;
+        if (c >= '0' && c <= '9') {
+            digit = static_cast<uint32_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = static_cast<uint32_t>(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            digit = static_cast<uint32_t>(c - 'A' + 10);
+        } else {
+            return false;
+        }
+        value = (value << 4) | digit;
+    }
+    out = value;
+    return true;
+}
+
+inline constexpr bool Crc32Matches(uint32_t expected, uint32_t actual) {
+    return expected == actual;
+}
+
+inline bool ParseDecimalOctet(const std::string& text, size_t begin, size_t end, uint32_t& out) {
+    if (begin == end || end - begin > 3) {
+        return false;
+    }
+    uint32_t value = 0;
+    for (size_t i = begin; i < end; ++i) {
+        const char c = text[i];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = value * 10u + static_cast<uint32_t>(c - '0');
+    }
+    if (value > 255u) {
+        return false;
+    }
+    out = value;
+    return true;
+}
+
+inline bool ParseIpv4(const std::string& host, uint32_t (&octets)[4]) {
+    size_t begin = 0;
+    for (size_t index = 0; index < 4; ++index) {
+        const size_t end = index == 3 ? host.size() : host.find('.', begin);
+        if (end == std::string::npos || !ParseDecimalOctet(host, begin, end, octets[index])) {
+            return false;
+        }
+        begin = end + 1;
+    }
+    return begin == host.size() + 1;
+}
+
+inline bool IsDecimalPort(const std::string& text) {
+    if (text.empty() || text.size() > 5) {
+        return false;
+    }
+    uint32_t port = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        port = port * 10u + static_cast<uint32_t>(c - '0');
+    }
+    return port > 0u && port <= 65535u;
+}
+
+/**
+ * 校验 hutuji.draw 的 capability URL。生产域只允许 HTTPS；HTTP 仅留给 RFC1918
+ * 联调主机。authority 禁 userinfo/IPv6/畸形端口，路径固定为服务端的 `/files/`。
+ */
+inline bool IsValidDrawUrl(const std::string& url) {
+    constexpr const char* kHttps = "https://";
+    constexpr const char* kHttp = "http://";
+    for (unsigned char c : url) {
+        if (c <= 0x20u || c == 0x7fu) {
+            return false;
+        }
+    }
+
+    bool https = false;
+    size_t authority_begin = 0;
+    if (url.rfind(kHttps, 0) == 0) {
+        https = true;
+        authority_begin = 8;
+    } else if (url.rfind(kHttp, 0) == 0) {
+        authority_begin = 7;
+    } else {
+        return false;
+    }
+
+    const size_t slash = url.find('/', authority_begin);
+    if (slash == std::string::npos || slash == authority_begin ||
+        url.compare(slash, 7, "/files/") != 0 || url.find('#', slash) != std::string::npos) {
+        return false;
+    }
+    const std::string authority = url.substr(authority_begin, slash - authority_begin);
+    if (authority.find('@') != std::string::npos || authority.find('[') != std::string::npos ||
+        authority.find(']') != std::string::npos) {
+        return false;
+    }
+
+    std::string host = authority;
+    const size_t colon = authority.find(':');
+    if (colon != std::string::npos) {
+        if (authority.find(':', colon + 1) != std::string::npos ||
+            !IsDecimalPort(authority.substr(colon + 1))) {
+            return false;
+        }
+        host = authority.substr(0, colon);
+    }
+    if (host.empty()) {
+        return false;
+    }
+
+    std::string lower_host;
+    lower_host.reserve(host.size());
+    for (char c : host) {
+        lower_host.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+    }
+    if (lower_host == "hutuji.donglicao.com") {
+        return https && (colon == std::string::npos ||
+                         authority.compare(colon + 1, std::string::npos, "443") == 0);
+    }
+
+    uint32_t octets[4]{};
+    if (!ParseIpv4(host, octets)) {
+        return false;
+    }
+    return octets[0] == 10u || (octets[0] == 172u && octets[1] >= 16u && octets[1] <= 31u) ||
+           (octets[0] == 192u && octets[1] == 168u);
+}
 
 /**
  * 单条发送的活动时间预算。部分成功不会续期；feed hold 仲裁挂起期间不计时，避免

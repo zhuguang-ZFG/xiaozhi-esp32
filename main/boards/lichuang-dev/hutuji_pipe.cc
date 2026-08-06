@@ -25,9 +25,8 @@
 namespace hutuji {
 
 namespace {
-// 应答队列深度：窗口化流控（设计见 docs/design/p2-windowed-flow-control.md）下
-// 在途可达 ~21 行，队列须能缓冲一串连续到达的应答而不丢。取 32 留余量。
-constexpr UBaseType_t kRespQueueDepth = 32;
+// 深度与流控窗口共用纯核心常量，覆盖最短非空 payload 可形成的最大在途行数。
+constexpr UBaseType_t kRespQueueDepth = static_cast<UBaseType_t>(kResponseQueueDepth);
 
 constexpr size_t kRxLineMax = 512;
 constexpr uint32_t kBackoffInitMs = 1000;
@@ -575,23 +574,9 @@ void Pipe::OnRxData(const uint8_t* data, size_t data_len, uint32_t receive_epoch
 }
 
 int Pipe::ParseErrorCode(const std::string& line) {
-    // "error:8" / "error:110" / 旧式 "error 8"
-    if (line.rfind("error", 0) != 0) {
-        return -1;
-    }
-    size_t i = 5;
-    while (i < line.size() && (line[i] == ':' || line[i] == ' ')) {
-        ++i;
-    }
-    if (i >= line.size() || line[i] < '0' || line[i] > '9') {
-        return -1;
-    }
-    int code = 0;
-    while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
-        code = code * 10 + (line[i] - '0');
-        ++i;
-    }
-    return code;
+    // 实现在 hutuji_recovery_core.h：纯函数便于 host 编译单测覆盖数字与
+    // `$Errors/Verbose=1` 文本两种形态（见该处注释说明为何必须认文本）。
+    return ParseGrblErrorCode(line);
 }
 
 void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
@@ -798,12 +783,11 @@ void Pipe::ParseStatusReport(const std::string& line) {
             } else if (auth_probe_stage_ == AuthProbeStage::WaitingPosition &&
                        gs == GrblState::Idle) {
                 // 授权状态没有 Telnet 查询命令。先 M5 抬笔，再以机器坐标发送当前 X 的
-                // G1 零位移行：已授权回 ok，未授权在 Protocol.cpp 前置门回 error:110。
-                // 用 G1 而非 G0，避免当前位置恰为原点时触发商业固件的自动换纸语义。
-                char probe[64];
-                std::snprintf(probe, sizeof(probe), "G53 G1 X%.3f F1500", x);
+                // G1 零位移行：已授权回 ok，未授权由 Protocol.cpp 的行首 G0~G3
+                // 前置门回 error:110。G1 必须放在 G53 前；`G53 G1` 会绕过该前置门，
+                // GCode.cpp 内层静默跳过未授权运动后仍回 ok，导致误报已授权。
                 auth_probe_stage_ = AuthProbeStage::WaitingMotionReply;
-                if (!SendLine(probe)) {
+                if (!SendLine(BuildLicenseProbeLine(x))) {
                     auth_probe_stage_ = AuthProbeStage::Failed;
                     ESP_LOGE(TAG, "授权探测发送失败");
                 }

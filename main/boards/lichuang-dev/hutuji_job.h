@@ -122,7 +122,6 @@ private:
     uint8_t* buffer_ = nullptr;
     size_t buffer_len_ = 0;
     uint32_t expect_crc_ = 0;
-    bool have_crc_ = false;
 
     mutable std::mutex state_mutex_;
     // 协调 pause 与 SendLine：暂停字符发出后禁止再灌入新行。
