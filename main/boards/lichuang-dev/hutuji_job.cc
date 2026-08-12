@@ -1563,6 +1563,15 @@ bool Job::StreamToGrbl() {
         // === 换纸行：c_line 已排空，走逐行模式（§4.3 第一条）===
         if (paper_pending && c_line.empty()) {
             paper_pending = false;
+            // §3：换纸期 Grbl 主循环不转、不回 `?`。本分支与 ChangePaperAfterDraw
+            // 同样是换纸等待，必须置 blocking 标记，否则 PipeTask 的 silent-poll
+            // 7×3s≈21s 会把还在等换纸 ok（预算 90s）的 TCP 掐断，任务以「等待换纸
+            // ok 时链路丢失」失败。RAII 保证任何出口（ok/重试耗尽/断连/abort）复位。
+            pipe.SetExpectBlockingPeer(true);
+            struct BlockingGuard {
+                Pipe& p;
+                ~BlockingGuard() { p.SetExpectBlockingPeer(false); }
+            } blocking_guard{pipe};
             const std::string line(LineAt(spans[next_]));
             paper_active_.store(true);
             SetState("paper_change");
@@ -1831,6 +1840,10 @@ bool Job::StreamToGrbl() {
             if (ok_fallback_count < kMaxOkFallback &&
                 ConfirmInFlightDoneByStatus(spans, lines_sent_, lines_sent_ + c_line.size())) {
                 ++ok_fallback_count;
+                // 释放整窗前先排空应答队列：等待期内到达的迟到 ok 属于本批已释放的
+                // 行，留在队列里会被下一批第一行的 TakeResponse 错配（ok 与状态行
+                // 无锁并发写同一 socket，迟到 ok 是已证现象；与 abort 分支同口径）。
+                pipe.DrainResponses();
                 const size_t released = c_line.size();
                 ESP_LOGW(TAG,
                          "等 ok 超时但状态报告确认在途 %zu 行已执行完（Idle+到位），靠状态"
