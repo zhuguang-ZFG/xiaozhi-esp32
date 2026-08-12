@@ -189,6 +189,9 @@ private:
         WaitingLiftOk,
         WaitingPosition,
         WaitingMotionReply,
+        // R10-PIPE-01：可重试失败后的延迟重探等待；到期由 PipeTask 的 EAGAIN
+        // 分支重新从 `$I` 起探（与 Idle 恢复探测同一驱动点，保持单任务修改）。
+        RetryWait,
         Complete,
         Failed,
     };
@@ -219,6 +222,12 @@ private:
     void NotifyCloud(const std::string& message);
     static int ParseErrorCode(const std::string& line);
     bool HandleAuthProbeResponse(WaitResult result, int error_code);
+    /**
+     * R10-PIPE-01：裸连接探测阶段收到可重试失败（error:8 等非权威结论）时的
+     * 统一处置——次数未耗尽转 RetryWait 并记到期 tick，耗尽才进 Failed 终态。
+     * 仅限 PipeTask 内调用（auth_probe_stage_ 单任务修改约定）。
+     */
+    void ScheduleAuthProbeRetryOrFail(const char* what, int error_code);
 
     std::atomic<bool> started_{false};
     std::atomic<bool> connected_{false};
@@ -238,6 +247,10 @@ private:
     // Grbl 的授权日志只发 CLIENT_SERIAL，Telnet `$I` 看不到。连接后用抬笔状态下的
     // G53 零位移运动探测 error:110；探测完成前 ready_ 保持 false，禁止绘图抢跑。
     AuthProbeStage auth_probe_stage_ = AuthProbeStage::Idle;
+    // R10-PIPE-01：本连接内已消耗的探测重试次数与 RetryWait 到期 tick。
+    // 连接建立与 reset banner 处清零（新机器状态另起额度）；RetryWait→重探不清。
+    int auth_probe_retries_ = 0;
+    uint32_t auth_probe_retry_due_tick_ = 0;
 
     TaskHandle_t pipe_task_ = nullptr;
 

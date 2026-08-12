@@ -451,6 +451,141 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         self._compile_and_run(compiler, source, stem="hutuji_recovery_core_test")
 
+    def test_recv_wait_tick_freezes_ok_clock_during_pause(self):
+        """R10-S3-01：暂停期收分支的等 ok 计时必须冻结，且暂停总时长仍受上限约束。
+
+        Hold 期 Grbl 主循环阻塞在 sys.suspend 自旋（Protocol.cpp 的挂起循环），
+        在途行躺在 RX 缓冲不被解析、ok 不会到来。若计时不冻结，
+        kMotionOkTimeoutMs=30s 一到任务按「等 ok 超时」死掉，既不发 `~` 也不
+        reset，写字机永久卡 Hold（只能断电解救）。冻结也不能无限：暂停累计达
+        kMaxPauseMs 后必须走与 WaitWhilePaused 相同的 abort-reset 收敛。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <cstdint>
+
+            int main() {
+                using hutuji::DecideRecvWaitTick;
+                using hutuji::RecvWaitTick;
+                constexpr uint32_t kMax = 10u * 60u * 1000u;
+
+                // 未暂停：正常计入等 ok 时钟，与暂停累计值无关。
+                assert(DecideRecvWaitTick(false, 0, kMax) == RecvWaitTick::Accrue);
+                assert(DecideRecvWaitTick(false, kMax, kMax) == RecvWaitTick::Accrue);
+
+                // 暂停中且未到上限：冻结（既不计入 ok 时钟，也不判失败）。
+                assert(DecideRecvWaitTick(true, 0, kMax) == RecvWaitTick::FreezePaused);
+                assert(DecideRecvWaitTick(true, kMax - 1, kMax) ==
+                       RecvWaitTick::FreezePaused);
+
+                // 暂停累计达上限：走暂停超时收敛（与 WaitWhilePaused 同一条上限）。
+                assert(DecideRecvWaitTick(true, kMax, kMax) == RecvWaitTick::PauseTimedOut);
+                assert(DecideRecvWaitTick(true, kMax + 1, kMax) ==
+                       RecvWaitTick::PauseTimedOut);
+                return 0;
+            }
+            """
+        )
+
+        self._compile_and_run(compiler, source, stem="hutuji_recv_wait_tick_test")
+
+    def test_auth_probe_failure_gets_bounded_retry(self):
+        """R10-PIPE-01：授权探测可重试失败必须有界重试，不得一击进 Failed 终态。
+
+        裸连接遇残留 Hold 时 `$I` 撞 Grbl 的 idleOrAlarm 门回 error:8，旧逻辑
+        直接置 Failed 且唯一清除点是连接重建；而 Hold 期 `?` 有应答、silent-poll
+        不判死、keepalive 不触发——连接活着就永不 ready，draw/repeat 恒报未就绪。
+        修复口径：重试次数未耗尽 → 延迟后重探（RetryLater）；耗尽 → FailClosed。
+        重试到期判定必须容忍 tick 回绕（uint32 半区间比较）。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <cstdint>
+
+            int main() {
+                using hutuji::AuthProbeFailure;
+                using hutuji::AuthProbeRetryDue;
+                using hutuji::DecideAuthProbeFailure;
+
+                // 次数未耗尽 → 重试；耗尽 → fail closed（等连接重建）。
+                assert(DecideAuthProbeFailure(0, 8) == AuthProbeFailure::RetryLater);
+                assert(DecideAuthProbeFailure(7, 8) == AuthProbeFailure::RetryLater);
+                assert(DecideAuthProbeFailure(8, 8) == AuthProbeFailure::FailClosed);
+                assert(DecideAuthProbeFailure(9, 8) == AuthProbeFailure::FailClosed);
+                // 上限为 0 = 从不重试（保守配置也必须成立）。
+                assert(DecideAuthProbeFailure(0, 0) == AuthProbeFailure::FailClosed);
+
+                // 到期判定：now >= due 即到期，且必须容忍 tick 回绕。
+                assert(AuthProbeRetryDue(100, 100));
+                assert(AuthProbeRetryDue(101, 100));
+                assert(!AuthProbeRetryDue(99, 100));
+                // 回绕：due 在 UINT32_MAX 附近、now 已回到小值。
+                assert(AuthProbeRetryDue(5, 4294967290u));
+                assert(!AuthProbeRetryDue(4294967290u, 5));
+                return 0;
+            }
+            """
+        )
+
+        self._compile_and_run(compiler, source, stem="hutuji_auth_probe_retry_test")
+
+    def test_gcode_command_prefix_requires_word_boundary(self):
+        """S3-P3d：换纸行匹配必须按命令字边界，`M30` 不得命中 `M300`。
+
+        `LooksLikePaperLine` 决定该行走换纸逐行模式（90s 预算 + error:8 重发）。
+        裸前缀匹配下 `M300`/`M301` 等也会被当成换纸行——当前校验器禁 M 码入文件，
+        不可达，但属于校验器口径漂移时的防御面，按词边界收紧。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <string>
+
+            int main() {
+                using hutuji::HasGcodeCommandPrefix;
+
+                // 命中：整词、带参数、带空格。
+                assert(HasGcodeCommandPrefix("M30", "M30"));
+                assert(HasGcodeCommandPrefix("M30 P1", "M30"));
+                assert(HasGcodeCommandPrefix("M721", "M721"));
+                assert(HasGcodeCommandPrefix("M701 S3", "M701"));
+
+                // 不命中：后随数字是另一条命令。
+                assert(!HasGcodeCommandPrefix("M300", "M30"));
+                assert(!HasGcodeCommandPrefix("M301 P1", "M30"));
+                assert(!HasGcodeCommandPrefix("M7011", "M701"));
+
+                // 不命中：不同前缀 / 空行 / 比命令字还短。
+                assert(!HasGcodeCommandPrefix("G30", "M30"));
+                assert(!HasGcodeCommandPrefix("", "M30"));
+                assert(!HasGcodeCommandPrefix("M3", "M30"));
+                return 0;
+            }
+            """
+        )
+
+        self._compile_and_run(compiler, source, stem="hutuji_paper_prefix_test")
+
 
 if __name__ == "__main__":
     unittest.main()

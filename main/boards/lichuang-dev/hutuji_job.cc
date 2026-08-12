@@ -124,12 +124,14 @@ uint32_t Job::Crc32Ieee(const uint8_t* data, size_t len) {
 }
 
 bool Job::LooksLikePaperLine(const std::string& line) {
-    // 粗匹配现役换纸相关；不解析参数语义
-    if (line.rfind("M30", 0) == 0)
+    // 匹配现役换纸相关命令字；不解析参数语义。词边界匹配（S3-P3d）：
+    // 裸前缀会把 M300 当 M30——当前校验器禁 M 码入文件，不可达，属校验器
+    // 口径漂移时的防御面。
+    if (HasGcodeCommandPrefix(line, "M30"))
         return true;
-    if (line.rfind("M721", 0) == 0)
+    if (HasGcodeCommandPrefix(line, "M721"))
         return true;
-    if (line.rfind("M701", 0) == 0)
+    if (HasGcodeCommandPrefix(line, "M701"))
         return true;
     if (line.find("[ESP910]") != std::string::npos)
         return true;
@@ -319,7 +321,10 @@ bool Job::StartAbortResetTask() {
             job.abort_reset_worker_active_.store(false, std::memory_order_release);
             vTaskDelete(nullptr);
         },
-        "hutuji_abort", 3072, nullptr, 6, nullptr);
+        // 4096：PerformAbortReset 的 drain 内可达深调用链
+        // （ParseStatusReport→NotifyCloud→cJSON+SendMcpMessage），3072 无高水位
+        // 实测余量；下次上机用 uxTaskGetStackHighWaterMark 取证后再议收紧。
+        "hutuji_abort", 4096, nullptr, 6, nullptr);
     if (created != pdTRUE) {
         abort_reset_worker_active_.store(false, std::memory_order_release);
         abort_reset_owner_.CancelClaim();
@@ -929,11 +934,10 @@ bool Job::DownloadToPsram(const std::string& url) {
         return false;
     }
 
+    // 只用 PSRAM，不回落内部 RAM（S3-P3c）：中等文件回落可能成功但饿死内部堆，
+    // 把「下载失败」换成 WiFi/音频不可预期崩溃；fail closed 更可诊断。
     buffer_ = static_cast<uint8_t*>(
         heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (buffer_ == nullptr) {
-        buffer_ = static_cast<uint8_t*>(heap_caps_malloc(content_length, MALLOC_CAP_8BIT));
-    }
     if (buffer_ == nullptr) {
         last_error_ = "PSRAM 分配失败";
         http->Close();
@@ -1008,22 +1012,7 @@ bool Job::WaitWhilePaused() {
         }
         // 暂停不能无限期挂住 busy_，否则 draw/repeat/pen_test 全被顶成 busy。
         if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(kMaxPauseMs)) {
-            // WaitWhilePaused 的调用点均不持 stream_mutex_；在提交锁内同时发布
-            // paused 回滚、abort 与纪元，避免普通灌行候选漏看超时取消。
-            {
-                std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-                paused_.store(false);
-                abort_requested_.store(true);
-                stream_control_epoch_.store(
-                    NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
-                    std::memory_order_release);
-            }
-            last_error_ = "暂停超时自动取消";
-            Notify("暂停超过 10 分钟，已自动取消这幅画；想画的话跟我说一声");
-            // 先启动唯一 owner；StreamToGrbl 退出发布 Quiesced 后 worker 才能发 reset。
-            if (!StartAbortResetTask()) {
-                last_error_ = "暂停超时无法创建 abort reset 任务";
-            }
+            CommitPauseTimeoutCancel();
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -1032,6 +1021,26 @@ bool Job::WaitWhilePaused() {
     paused_accum_ms_ +=
         static_cast<uint32_t>((xTaskGetTickCount() - pause_segment_start_) * portTICK_PERIOD_MS);
     return !abort_requested_.load();
+}
+
+void Job::CommitPauseTimeoutCancel() {
+    // 调用点（WaitWhilePaused 与收分支冻结路径）均不持 stream_mutex_；在提交锁内
+    // 同时发布 paused 回滚、abort 与纪元，避免普通灌行候选漏看超时取消。
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        paused_.store(false);
+        abort_requested_.store(true);
+        stream_control_epoch_.store(
+            NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+            std::memory_order_release);
+    }
+    last_error_ = "暂停超时自动取消";
+    Notify("暂停超过 10 分钟，已自动取消这幅画；想画的话跟我说一声");
+    // 先启动唯一 owner；StreamToGrbl 退出发布 Quiesced 后 worker 才能发 reset。
+    // owner 的受控 0x18 能把 Hold 一并清掉，写字机不会卡在进给保持。
+    if (!StartAbortResetTask()) {
+        last_error_ = "暂停超时无法创建 abort reset 任务";
+    }
 }
 
 bool Job::PreparePenOrigin() {
@@ -1520,6 +1529,11 @@ bool Job::StreamToGrbl() {
     // `?` 报告同核并发写同一 socket，偶发被抢占会静默吞掉一个 `ok`。超上限仍失败，
     // 避免真丢行/真卡死被无限掩盖。
     int ok_fallback_count = 0;
+    // R10-S3-01：收分支暂停冻结的累计暂停时长与「暂停超时已提交」标记。
+    // 暂停且有在途行时送分支被跳过、WaitWhilePaused 不可用（会阻塞收响应），
+    // 只能在收分支的等待循环里冻结计时；见下方 DecideRecvWaitTick 接线。
+    uint32_t paused_recv_ms = 0;
+    bool pause_timeout_cancel = false;
 
     // TODO(S4/Bf)：实机出图期周期性 ?，若 Telnet Bf 余量 < 300 则临时收窄窗口。
     //   自适应反压（§3.1）本次不做，S3 核心是 window=512 + 换纸行排空。
@@ -1780,7 +1794,10 @@ bool Job::StreamToGrbl() {
                 pipe.DrainResponses();
                 c_line.clear();
                 c_line_bytes_sum = 0;
-                last_error_ = "aborted";
+                // 暂停超时提交的 abort 保留原因文言，用户侧才能对上 Notify 的解释。
+                if (!pause_timeout_cancel) {
+                    last_error_ = "aborted";
+                }
                 window_guard.MarkQuiesced();
                 return false;
             }
@@ -1799,6 +1816,29 @@ bool Job::StreamToGrbl() {
             if (wr != WaitResult::Timeout) {
                 break;
             }
+            // R10-S3-01：Hold 期 Grbl 主循环阻塞在挂起自旋，在途行躺在 RX 缓冲、
+            // ok 不会到来——此刻的静默不是失联，等 ok 计时必须冻结，否则
+            // kMotionOkTimeoutMs=30s 一到任务按「等 ok 超时」死掉，既不发 `~` 也
+            // 不 reset，写字机永久卡 Hold（只能断电解救）。冻结不是无限：暂停累计
+            // 达 kMaxPauseMs 走与 WaitWhilePaused 同一条超时收敛，abort owner 的
+            // 受控 0x18 清掉 Hold 后，本循环顶的排流分支接管退出。仍继续
+            // TakeResponse：Hold 前已解析行的迟到 ok 与恢复 `~` 后的应答都要照收。
+            switch (DecideRecvWaitTick(paused_.load(), paused_recv_ms, kMaxPauseMs)) {
+                case RecvWaitTick::FreezePaused:
+                    paused_recv_ms += step;
+                    // 冻结时长计入 ETA 暂停扣减（与 WaitWhilePaused 同口径）。
+                    paused_accum_ms_ += step;
+                    continue;
+                case RecvWaitTick::PauseTimedOut:
+                    CommitPauseTimeoutCancel();
+                    pause_timeout_cancel = true;
+                    paused_recv_ms = 0;
+                    continue;
+                case RecvWaitTick::Accrue:
+                    break;
+            }
+            // 暂停结束（恢复或超时取消）后重置累计，下一次暂停另起新额度。
+            paused_recv_ms = 0;
             waited += step;
         }
 

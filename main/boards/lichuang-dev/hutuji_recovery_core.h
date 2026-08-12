@@ -393,6 +393,63 @@ inline constexpr StreamSendCancel DecideStreamSend(bool snap_abort, bool snap_pa
 /** pause/abort 提交方的纪元递增（允许回绕；ABA 需 2^32 次提交，实际不可达）。 */
 inline constexpr uint32_t NextStreamControlEpoch(uint32_t epoch) { return epoch + 1U; }
 
+/** 收分支等 ok 循环里单个等待片的记账方式。 */
+enum class RecvWaitTick : uint8_t {
+    Accrue = 0,     // 未暂停：计入等 ok 时钟
+    FreezePaused,   // 暂停中：冻结 ok 时钟，只累计暂停时长
+    PauseTimedOut,  // 暂停累计达上限：提交 abort，走 reset owner 收敛
+};
+
+/**
+ * 暂停期收分支的等 ok 计时决策。Hold 期 Grbl 主循环阻塞在挂起自旋，在途行
+ * 躺在 RX 缓冲不被解析、ok 不会到来——此刻的静默不是失联，等 ok 时钟必须
+ * 冻结，否则 30s 运动超时一到任务按「等 ok 超时」死掉，既不发 `~` 也不
+ * reset，写字机永久卡 Hold。冻结也不是无限：暂停累计达 max_pause_ms 后
+ * 必须走与 WaitWhilePaused 相同的暂停超时收敛（受控 0x18 能把 Hold 一并清掉）。
+ */
+inline constexpr RecvWaitTick DecideRecvWaitTick(bool paused, uint32_t paused_ms,
+                                                 uint32_t max_pause_ms) {
+    if (!paused) {
+        return RecvWaitTick::Accrue;
+    }
+    return paused_ms >= max_pause_ms ? RecvWaitTick::PauseTimedOut : RecvWaitTick::FreezePaused;
+}
+
+/** 授权探测可重试失败的处置。 */
+enum class AuthProbeFailure : uint8_t {
+    RetryLater = 0,  // 次数未耗尽：延迟后重新从 `$I` 起探
+    FailClosed,      // 耗尽：Failed 终态，等连接重建
+};
+
+/**
+ * 裸连接授权探测失败的有界重试判定。残留 Hold 时 `$I` 撞 Grbl 的 idleOrAlarm
+ * 门回 error:8；一击置 Failed 且唯一清除点是连接重建的话，Hold 期 `?` 有应答、
+ * silent-poll 不判死、keepalive 不触发——连接活着就永不 ready。重试给瞬态
+ * 非 Idle（Run 将尽、外部上位机解除 Hold）自愈机会；持续 Hold 在耗尽后仍
+ * fail closed，绝不代替用户复位（0x18 方案已否决，与换纸保护冲突）。
+ */
+inline constexpr AuthProbeFailure DecideAuthProbeFailure(int retries_done, int max_retries) {
+    return retries_done < max_retries ? AuthProbeFailure::RetryLater : AuthProbeFailure::FailClosed;
+}
+
+/** 重试到期判定：now >= due 即到期；RFC 1982 风格半区间比较，容忍 tick 回绕。 */
+inline constexpr bool AuthProbeRetryDue(uint32_t now_tick, uint32_t due_tick) {
+    return static_cast<uint32_t>(now_tick - due_tick) < (uint32_t{1} << 31);
+}
+
+/**
+ * 命令字前缀匹配（词边界）：行以 word 开头且下一字符不是数字才算命中。
+ * 裸前缀匹配会把 `M300` 当成 `M30`——换纸行匹配（LooksLikePaperLine）用它
+ * 决定 90s 逐行预算与 error:8 重发，误配面按词边界收掉。
+ */
+inline bool HasGcodeCommandPrefix(const std::string& line, const char* word) {
+    const size_t n = std::char_traits<char>::length(word);
+    if (line.compare(0, n, word) != 0) {
+        return false;
+    }
+    return line.size() == n || line[n] < '0' || line[n] > '9';
+}
+
 class AbortResetToken {
 public:
     /** 调用方必须用同一把发送锁串行化 Arm/Consume/Cancel。 */

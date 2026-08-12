@@ -47,13 +47,21 @@ constexpr int kPollIntervalSec = 3;
 constexpr int kSilentPollLimit = 7;
 
 // 连接后等对端 Telnet banner（"\r\nGrbl <ver> ...\r\n"）的最长时间。
-// Grbl_Esp32 在每个新 Telnet 连接上无条件发 report_init_message（TelnetServer.cpp:151，
+// Grbl_Esp32 在每个新 Telnet 连接上无条件发 report_init_message（TelnetServer.cpp:217，
 // ENABLE_TELNET_WELCOME_MSG 已开）。这条 banner 是「对端确实是写字机」的唯一被动指纹，
 // 用来堵「局域网里任意开着 :23 的主机（如路由器）被当成写字机缓存/顶替」的活锁。
 // 缓存命中与子网扫描共用此校验。非写字机的 :23 主机每台最多付一次此超时。
 constexpr int kVerifyTimeoutMs = 1500;
 constexpr char kGrblBanner[] = "Grbl ";
 constexpr uint8_t kCachedBusyRetriesBeforeScan = 5;
+
+// R10-PIPE-01：裸连接授权探测可重试失败的有界重试。残留 Hold 时 `$I` 撞
+// idleOrAlarm 门回 error:8；一击置 Failed 且唯一清除点是连接重建的话，Hold 期
+// `?` 有应答、silent-poll 不判死、keepalive 不触发——连接活着就永不 ready。
+// 8 次 × 5s ≈ 40s，覆盖「Run 将尽 / 外部上位机片刻后解除 Hold」的瞬态；持续
+// Hold 耗尽后仍 fail closed，绝不代替用户复位（0x18 已否决，与换纸保护冲突）。
+constexpr int kAuthProbeMaxRetries = 8;
+constexpr uint32_t kAuthProbeRetryDelayMs = 5000;
 
 uint32_t LoadCachedIp() {
     nvs_handle_t h;
@@ -126,6 +134,8 @@ void Pipe::PipeTask() {
         } else {
             auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
         }
+        // 新连接另起重试额度（R10-PIPE-01）。
+        auth_probe_retries_ = 0;
 
         // 新连接重建时先关闭「对端正长阻塞」标记：当前仅凭 banner 不能判定是否换纸。
         // 若 Job 随后 `[ESP901]` 查到 Changing=On，会显式打开，避免换纸期 silent-poll
@@ -169,8 +179,12 @@ void Pipe::PipeTask() {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     // Changing=On 分流结束后，Job 会释放会话保护。由 Pipe 自己在
                     // 接收任务内恢复标准探测，避免跨任务并发修改 auth_probe_stage_。
+                    // RetryWait 到期的重探也走这里（R10-PIPE-01）——同一驱动点，
+                    // 保持 auth_probe_stage_ 单任务修改。
                     if (!task_session_active_.load() && !ready_.load() &&
-                        auth_probe_stage_ == AuthProbeStage::Idle) {
+                        (auth_probe_stage_ == AuthProbeStage::Idle ||
+                         (auth_probe_stage_ == AuthProbeStage::RetryWait &&
+                          AuthProbeRetryDue(xTaskGetTickCount(), auth_probe_retry_due_tick_)))) {
                         auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
                         std::lock_guard<std::mutex> wlock(write_mutex_);
                         SendRawLocked("$I\n", 3);
@@ -226,7 +240,7 @@ void Pipe::PipeTask() {
 
 Pipe::PeerCheck Pipe::VerifyGrblPeer(int sock, int timeout_ms) {
     // 只读、不发任何字节：banner 由对端 Telnet accept 路径主动送出
-    // （report_init_message → TelnetServer.cpp:151，ENABLE_TELNET_WELCOME_MSG 已开），
+    // （report_init_message → TelnetServer.cpp:217，ENABLE_TELNET_WELCOME_MSG 已开），
     // 不需要我们先发 `$I`（那要等 Grbl 主循环，换纸期会阻塞）。
     // banner 字节在此被消费掉、不再送达主循环 —— 但主循环连上后会主动发 `$I`，
     // 靠 `[VER:` 应答（ProcessLine :391）置 ready_，不依赖这条 banner。
@@ -654,6 +668,8 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
         } else {
             auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
         }
+        // 对端已复位 = 全新机器状态，重试额度另起（R10-PIPE-01）。
+        auth_probe_retries_ = 0;
         // 对端软复位会丢弃其内部排队状态，我方遗留应答全部失效。
         DrainResponses();
         {
@@ -667,6 +683,11 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
         } else if (!task_session_active_.load()) {
             SendRawLocked("$I\n", 3);
         } else {
+            // S3-P3e 已评估：外部 reset（banner 到达但 TCP 未断）没有同连接恢复
+            // 路径——RecoverDisconnectedDraw 只认连接 seq 变化，本场景任务会在
+            // 等 ok/等 Idle 处按超时失败（≤ 对应预算）。维持 fail-closed：对端
+            // 复位已丢弃 planner 与模态，续画必然错位；且外部 0x18 意味着有别的
+            // 上位机在操作机器，S3 不应与之抢状态。代价是有界的等待，不加恢复。
             ESP_LOGW(TAG, "绘图会话内检测到 reset banner，等待任务层断连分流");
         }
         return;
@@ -835,8 +856,9 @@ bool Pipe::HandleAuthProbeResponse(WaitResult result, int error_code) {
 
         case AuthProbeStage::WaitingBuildInfoOk:
             if (result != WaitResult::Ok) {
-                auth_probe_stage_ = AuthProbeStage::Failed;
-                ESP_LOGE(TAG, "$I 探活应答失败: error:%d", error_code);
+                // 典型是残留 Hold 撞 idleOrAlarm 门的 error:8（Deferred）：机器
+                // 状态可能片刻后变化，走有界重试而不是一击进 Failed 终态。
+                ScheduleAuthProbeRetryOrFail("$I 探活", error_code);
                 return true;
             }
             // 探测运动前先确定抬笔；M 指令不受授权门限制。
@@ -849,8 +871,7 @@ bool Pipe::HandleAuthProbeResponse(WaitResult result, int error_code) {
 
         case AuthProbeStage::WaitingLiftOk:
             if (result != WaitResult::Ok) {
-                auth_probe_stage_ = AuthProbeStage::Failed;
-                ESP_LOGE(TAG, "授权探测抬笔失败: error:%d", error_code);
+                ScheduleAuthProbeRetryOrFail("授权探测抬笔", error_code);
                 return true;
             }
             auth_probe_stage_ = AuthProbeStage::WaitingPosition;
@@ -872,16 +893,33 @@ bool Pipe::HandleAuthProbeResponse(WaitResult result, int error_code) {
                 auth_probe_stage_ = AuthProbeStage::Complete;
                 ESP_LOGW(TAG, "写字机未授权（零位移探测返回 error:110）");
             } else {
+                // error:110 之外的失败不是授权结论（如换纸窗口的 error:8）：
+                // 保持 ready=false 并有界重试，别把瞬态当权威。
                 authorized_.store(false);
                 ready_.store(false);
-                auth_probe_stage_ = AuthProbeStage::Failed;
-                ESP_LOGE(TAG, "授权探测失败: error:%d", error_code);
+                ScheduleAuthProbeRetryOrFail("零位移授权探测", error_code);
             }
             return true;
 
         default:
             return false;
     }
+}
+
+void Pipe::ScheduleAuthProbeRetryOrFail(const char* what, int error_code) {
+    if (DecideAuthProbeFailure(auth_probe_retries_, kAuthProbeMaxRetries) ==
+        AuthProbeFailure::RetryLater) {
+        ++auth_probe_retries_;
+        auth_probe_stage_ = AuthProbeStage::RetryWait;
+        auth_probe_retry_due_tick_ = xTaskGetTickCount() + pdMS_TO_TICKS(kAuthProbeRetryDelayMs);
+        ESP_LOGW(TAG, "%s失败: error:%d，%ums 后重探（第 %d/%d 次）", what, error_code,
+                 (unsigned)kAuthProbeRetryDelayMs, auth_probe_retries_, kAuthProbeMaxRetries);
+        return;
+    }
+    auth_probe_stage_ = AuthProbeStage::Failed;
+    ESP_LOGE(TAG, "%s失败: error:%d，重试额度已耗尽，等待连接重建", what, error_code);
+    // 用户可感知的死角：连接活着但永不 ready。给云端一条可读解释。
+    NotifyCloud("写字机授权探测多次失败（可能停在暂停/保持状态），请检查写字机后重试");
 }
 
 const char* Pipe::GrblStateName(GrblState s) {

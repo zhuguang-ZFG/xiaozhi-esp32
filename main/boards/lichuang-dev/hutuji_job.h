@@ -100,6 +100,13 @@ private:
      */
     bool WaitWhilePaused();
 
+    /**
+     * 暂停超时（kMaxPauseMs）的统一收敛提交：锁内回滚 paused、置 abort 并推进
+     * 纪元，然后通知用户并启动唯一 reset owner。WaitWhilePaused 与收分支的
+     * 暂停冻结路径（R10-S3-01）共用，两处上限语义必须一致。
+     */
+    void CommitPauseTimeoutCancel();
+
     bool StartAbortResetTask();
     bool PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed = false,
                            bool allow_unready_reconnect = false);
