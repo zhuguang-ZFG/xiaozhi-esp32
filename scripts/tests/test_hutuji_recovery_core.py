@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -585,6 +586,67 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
 
         self._compile_and_run(compiler, source, stem="hutuji_paper_prefix_test")
+
+    def test_recv_loop_rechecks_abort_hold_before_ok_fallback(self):
+        """R11-PIPE-01：等待循环退出后必须再复核一次「abort 已提交且 Hold 已确认」。
+
+        暂停超时提交 abort 时，在途行的 `waited` 往往只差最后一个 slice：
+        `CommitPauseTimeoutCancel` 后 continue，下一片 TakeResponse 超时返回即让
+        `waited` 走满 timeout，`while (waited < timeout)` 先判假 —— 循环顶部那道
+        「排流 + 清窗 + MarkQuiesced」分支再也执行不到。落到 ok 兜底则必然失败
+        （`ConfirmInFlightDoneByStatus` 要 fresh Idle，机器在 Hold），而该失败路径
+        不 MarkQuiesced → `FinishStream(false)` = Failed → abort owner 的
+        `CanResetAfterStream(Failed)` 为假 → 受限 reset 发不出去 → 写字机滞留
+        Hold（只能外部 `~`/断电）且连接被拆。故复核点必须落在「等待片累计」与
+        「ok 兜底」之间。
+        """
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        start = source.index("bool Job::StreamToGrbl()")
+        body = source[start:]
+
+        accrue = body.rindex("waited += step;")
+        fallback = body.index("ok_fallback_count < kMaxOkFallback")
+        self.assertLess(accrue, fallback)
+        between = body[accrue:fallback]
+
+        self.assertIn("abort_hold_confirmed_", between)
+        # 仅复核不够：命中后必须走与循环顶部同款的收敛（含 MarkQuiesced），
+        # 否则 quiescence 仍是 Failed，受限 reset 照样被自家门拒。
+        self.assertIn("quiesce_for_abort()", between)
+
+    def test_paper_change_resets_blocking_peer_by_raii(self):
+        """R11-PIPE-02：换纸编排的 blocking 标记必须 RAII 复位，不留手工出口。
+
+        `ChangePaperAfterDraw` 的 M30 等待循环有 link-lost 与 ALARM 两个早退
+        `return false`，手工 `SetExpectBlockingPeer(false)` 覆盖不到它们；
+        `RecoverDisconnectedDraw` 的换纸窗口轮询分支更是完全不复位。两处此前都只靠
+        `Run()` 收尾兜底，属隐性契约：再插一个等待分支就是真泄漏。与换纸行分支既有的
+        BlockingGuard 统一成 RAII —— 全文件的复位调用都只许长在析构那一行上。
+        """
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+
+        for fn, next_symbol in (
+            ("bool Job::ChangePaperAfterDraw()", "\n}\n\nstd::vector<Job::LineSpan>"),
+            ("bool Job::RecoverDisconnectedDraw()", "\nbool Job::ChangePaperAfterDraw()"),
+        ):
+            start = source.index(fn)
+            body = source[start : source.index(next_symbol, start)]
+            with self.subTest(fn=fn):
+                self.assertIn("BlockingGuard", body)
+                resets = re.findall(
+                    r"^.*SetExpectBlockingPeer\(false\).*$", body, re.MULTILINE
+                )
+                self.assertEqual(len(resets), 1, resets)
+                self.assertIn("~BlockingGuard()", resets[0])
+                self.assertEqual(body.count("SetExpectBlockingPeer(true)"), 1)
+
+        # Run() 收尾那一处是任务级兜底（不在这两个函数体内），保持原样：全文件恰好
+        # 三处 RAII 析构 + 一处收尾兜底，多出任何手工复位都说明又开了新出口。
+        self.assertEqual(source.count("SetExpectBlockingPeer(false)"), 4)
 
 
 if __name__ == "__main__":

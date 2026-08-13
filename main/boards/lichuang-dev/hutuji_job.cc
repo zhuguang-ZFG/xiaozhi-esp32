@@ -1303,7 +1303,13 @@ bool Job::RecoverDisconnectedDraw() {
         // 不发 reset/M30。保留会话保护并轮询到换纸退出，使 Pipe 不会在
         // Changing=On 时自动跑 G1 授权探针；任务仍以 error 结束，不会续画。
         // 换纸窗口内同样打开 blocking 标记，避免等待期间 silent-poll 误杀 TCP。
+        // R11-PIPE-02（第二处）：同款 RAII——本分支唯一出口是 return false，此前
+        // 完全不复位，只靠 Run() 收尾兜底；与上面的 ChangePaperAfterDraw 统一。
         pipe.SetExpectBlockingPeer(true);
+        struct BlockingGuard {
+            Pipe& p;
+            ~BlockingGuard() { p.SetExpectBlockingPeer(false); }
+        } blocking_guard{pipe};
         const TickType_t changing_began = xTaskGetTickCount();
         while (pipe.IsConnected() &&
                (xTaskGetTickCount() - changing_began) < pdMS_TO_TICKS(kPaperOkTimeoutMs)) {
@@ -1364,6 +1370,15 @@ bool Job::RecoverDisconnectedDraw() {
 bool Job::ChangePaperAfterDraw() {
     auto& pipe = Pipe::GetInstance();
 
+    // R11-PIPE-02：blocking 标记走 RAII，与换纸行分支的 BlockingGuard 同款。M30 等待
+    // 循环的 link-lost / ALARM 两个早退覆盖不到手工复位（此前只靠 Run() 收尾兜底，
+    // 属隐性契约——再插一个等待分支就是真泄漏）。复位无条件做：abort 早退时它落在
+    // 一个本就为 false 的标记上，幂等无副作用，故不需要 armed 记账。
+    struct BlockingGuard {
+        Pipe& p;
+        ~BlockingGuard() { p.SetExpectBlockingPeer(false); }
+    } blocking_guard{pipe};
+
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (abort_requested_.load()) {
@@ -1381,7 +1396,6 @@ bool Job::ChangePaperAfterDraw() {
         // 提前打开 blocking 标记，避免 silent-poll≈21s 误杀 TCP。
         pipe.SetExpectBlockingPeer(true);
         if (!pipe.SendLine("M30")) {
-            pipe.SetExpectBlockingPeer(false);
             paper_active_.store(false);
             last_error_ = "自动换纸命令发送失败";
             return false;
@@ -1420,7 +1434,6 @@ bool Job::ChangePaperAfterDraw() {
             pipe.SendRealtime('?');
             last_error_ = "等待自动换纸完成超时";
         }
-        pipe.SetExpectBlockingPeer(false);
         paper_active_.store(false);
         return false;
     }
@@ -1429,12 +1442,10 @@ bool Job::ChangePaperAfterDraw() {
     // 确认写字机确实回到 Idle 后才允许任务进入 done。
     if (!WaitForIdle(false, kPostPaperIdleTimeoutMs)) {
         last_error_ = "自动换纸后未确认 Idle: " + last_error_;
-        pipe.SetExpectBlockingPeer(false);
         paper_active_.store(false);
         return false;
     }
 
-    pipe.SetExpectBlockingPeer(false);
     paper_active_.store(false);
     if (abort_requested_.load()) {
         last_error_ = "aborted";
@@ -1783,6 +1794,21 @@ bool Job::StreamToGrbl() {
                 timeout = kMotionOkTimeoutMs;
         }
 
+        // abort owner 已用 fresh Hold:0/Idle 证明 planner 停稳：旧 ok 不再代表可续画
+        // 进度，本流必须整窗弃掉并把 quiescence 判为 Quiesced，受限 reset 才发得出去。
+        // 提成 lambda 是因为有两个入口（循环顶 + 循环因 waited 走满而退出），两处逻辑
+        // 必须逐字一致：任一处漏 MarkQuiesced 都会让 abort 卡在自家 CanResetAfterStream。
+        auto quiesce_for_abort = [&]() {
+            pipe.DrainResponses();
+            c_line.clear();
+            c_line_bytes_sum = 0;
+            // 暂停超时提交的 abort 保留原因文言，用户侧才能对上 Notify 的解释。
+            if (!pause_timeout_cancel) {
+                last_error_ = "aborted";
+            }
+            window_guard.MarkQuiesced();
+        };
+
         // 分段等，便于响应 abort/ALARM/链路丢失
         WaitResult wr = WaitResult::Timeout;
         int err = -1;
@@ -1790,15 +1816,7 @@ bool Job::StreamToGrbl() {
         const uint32_t slice = 1000;
         while (waited < timeout) {
             if (abort_requested_.load() && abort_hold_confirmed_.load(std::memory_order_acquire)) {
-                // fresh Hold:0/Idle 已证明 planner 停稳；旧 ok 已不再代表可续画进度。
-                pipe.DrainResponses();
-                c_line.clear();
-                c_line_bytes_sum = 0;
-                // 暂停超时提交的 abort 保留原因文言，用户侧才能对上 Notify 的解释。
-                if (!pause_timeout_cancel) {
-                    last_error_ = "aborted";
-                }
-                window_guard.MarkQuiesced();
+                quiesce_for_abort();
                 return false;
             }
             if (pipe.GetGrblState() == GrblState::Alarm) {
@@ -1840,6 +1858,17 @@ bool Job::StreamToGrbl() {
             // 暂停结束（恢复或超时取消）后重置累计，下一次暂停另起新额度。
             paused_recv_ms = 0;
             waited += step;
+        }
+
+        // R11-PIPE-01：循环退出后必须再复核一次。暂停超时提交 abort 时，在途行的
+        // waited 常只差最后一个 slice：CommitPauseTimeoutCancel 后 continue，下一片
+        // TakeResponse 超时返回即让 waited 走满 timeout，`while` 先判假，循环顶那道
+        // 排流分支再也执行不到。落到下面的 ok 兜底必然失败（要 fresh Idle，机器在
+        // Hold）且不 MarkQuiesced → Failed → abort owner 的 CanResetAfterStream 为假
+        // → 受限 reset 发不出去 → 写字机滞留 Hold（只能外部 `~`/断电）、连接被拆。
+        if (abort_requested_.load() && abort_hold_confirmed_.load(std::memory_order_acquire)) {
+            quiesce_for_abort();
+            return false;
         }
 
         if (wr == WaitResult::Ok) {
