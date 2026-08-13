@@ -587,6 +587,18 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         self._compile_and_run(compiler, source, stem="hutuji_paper_prefix_test")
 
+    def test_page_end_uses_non_motion_m30_orchestration(self):
+        """页尾换纸必须单发 M30，不得把回原点运动塞进不可即停的换纸窗口。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        start = source.index("bool Job::ChangePaperAfterDraw()")
+        end = source.index("\n}\n\nstd::vector<Job::LineSpan>", start)
+        body = source[start:end]
+
+        commands = re.findall(r'pipe\.SendLine\("([^"]+)"\)', body)
+        self.assertEqual(commands, ["M30"])
+
     def test_recv_loop_rechecks_abort_hold_before_ok_fallback(self):
         """R11-PIPE-01：等待循环退出后必须再复核一次「abort 已提交且 Hold 已确认」。
 
