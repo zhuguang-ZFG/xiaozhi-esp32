@@ -819,6 +819,88 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertEqual(gates, 2)  # 两个入口都在门控内
         self.assertEqual(source.count("paper_change_notified_ = true;"), 2)
 
+    def test_pipe_transition_notify_wording(self):
+        """R21-F04：状态转移播报去英文状态名/机器坐标/内网 IP；Run→Idle 与 Hold
+        必须带 10s 去抖（页尾归位会确定性连触发两次 Run→Idle）。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("写字机运动完成 (Run→Idle)", source)
+        self.assertNotIn("写字机暂停 (Hold)", source)
+        self.assertNotIn("ALARM:%d 位置", source)
+        self.assertNotIn('resolved_ip_ + ")"', source)
+        self.assertIn('NotifyCloud("写字机运动完成")', source)
+        self.assertIn('NotifyCloud("写字机已暂停")', source)
+        self.assertIn('NotifyCloud("写字机已连接")', source)
+        # 去抖：两个分支共用同一纪元。
+        self.assertEqual(source.count("last_transition_notify_tick_"), 4)  # 两分支各一查一写
+
+    def test_progress_notify_percent_only(self):
+        """R21-F05：进度播报只留百分比；坐标/行号不再进 Notify（串口日志仍有）。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"出图进度: %d%%"', source)
+        self.assertNotIn("出图进度: %d%% (%zu/%zu行)", source)
+
+    def test_failure_notify_single_exit(self):
+        """R21-F08：断连换纸窗口分支已播报后，Run() 收尾失败出口不得二次播报。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        rec_start = source.index("bool Job::RecoverDisconnectedDraw()")
+        rec_body = source[rec_start : source.index("bool Job::ReturnHomeAfterDraw()", rec_start)]
+        self.assertIn("failure_notified_ = true;", rec_body)
+        run_start = source.index("void Job::Run()")
+        run_body = source[run_start : source.index("\n}\n", run_start)]
+        self.assertIn("failure_notified_ = false;", run_body)
+        self.assertIn("if (!failure_notified_)", run_body)
+
+    def test_error8_exhaustion_wording(self):
+        """R21-F13：error:8 重试耗尽的用户面文案不得带 error:8 原文（映射层会把
+        「正在换纸」进行式拼到「已停止」结论上）；技术细节只留 ESP 日志。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn('last_error_ = "换纸未完成，已停止本次绘图，请检查纸张后重试"', source)
+        # 旧文案只允许以日志形态存在。
+        self.assertNotIn('last_error_ = "error:8 重试耗尽"', source)
+        self.assertIn('ESP_LOGE(TAG, "换纸行 error:8 重试耗尽', source)
+
+    def test_error90_paper_source_sentence(self):
+        """R21-F07：换纸路径 err==90 在源头给「请整理纸张」动作句；通用码映射契约
+        保持 90==nullptr（test_describe_grbl_error_mapping 钉死）不变。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        start = source.index("bool Job::ChangePaperAfterDraw()")
+        body = source[start : source.index("\n}\n\nstd::vector<Job::LineSpan>", start)]
+        self.assertIn("if (err == 90)", body)
+        self.assertIn("纸张用完或未放好，请整理好纸张后再试", body)
+
+    def test_busy_done_repeat_wording(self):
+        """R21-F14：busy 裸英文 token 不得存在；repeat 有起始播报；done 话术带
+        「再来一次」引导（出图成功 buffer 留存，重画真实可用）。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('JsonString("busy")', source)
+        self.assertEqual(source.count('JsonString("写字机正忙，请稍候再试")'), 3)
+        self.assertIn('Notify("出图完成，可以说「再来一次」直接重画")', source)
+        self.assertIn('Notify("开始重画")', source)
+
+    def test_reconnect_wait_has_heartbeat(self):
+        """R21-F06/F12：断连恢复重连等待（最长 120s）必须有 30s 进展播报；
+        超时话术附可执行动作。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        rec_start = source.index("bool Job::RecoverDisconnectedDraw()")
+        rec_body = source[rec_start : source.index("bool Job::ReturnHomeAfterDraw()", rec_start)]
+        self.assertIn('Notify("还在重连写字机，请稍候")', rec_body)
+        self.assertIn("pdMS_TO_TICKS(30000)", rec_body)
+        self.assertIn("等待写字机重连超时，请检查写字机电源和网络后重新开始", rec_body)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -152,7 +152,8 @@ void Pipe::PipeTask() {
             }
         }
         ESP_LOGI(TAG, "已连接写字机 Telnet（%s:%d）", resolved_ip_, HUTUJI_PIPE_PORT);
-        NotifyCloud(std::string("写字机已连接 (") + resolved_ip_ + ")");
+        // R21-F04：播报去内网 IP（IP 留上面 ESP_LOGI 日志）。
+        NotifyCloud("写字机已连接");
 
         uint8_t buf[256];
         // 连续「探活已发但一个字节都没回」的次数。任何数据到达即归零。
@@ -616,16 +617,9 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
         }
         ESP_LOGW(TAG, "Grbl 报警: ALARM:%d", code);
         if (prev != GrblState::Alarm) {
-            float ax, ay, az;
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                ax = mpos_x_;
-                ay = mpos_y_;
-                az = mpos_z_;
-            }
-            char buf[128];
-            std::snprintf(buf, sizeof(buf), "写字机报警 ALARM:%d 位置 X=%.1f Y=%.1f Z=%.1f", code,
-                          ax, ay, az);
+            // R21-F04：报警码保留（售后定位）；机器坐标对用户无意义（串口逐行日志仍有）。
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "写字机报警，代码 %d", code);
             NotifyCloud(buf);
         }
         return;
@@ -760,24 +754,24 @@ void Pipe::ParseStatusReport(const std::string& line) {
     GrblState prev = grbl_state_.exchange(gs);
     if (prev != gs) {
         ESP_LOGI(TAG, "Grbl 状态: %s -> %s", GrblStateName(prev), GrblStateName(gs));
-        float nx, ny, nz;
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            nx = mpos_x_;
-            ny = mpos_y_;
-            nz = mpos_z_;
-        }
-        char buf[128];
+        // R21-F04：播报去英文状态名/机器坐标（用户无意义）；Run→Idle 与 Hold 加
+        // 10s 去抖——页尾归位会确定性连触发两次 Run→Idle（最后一行完成一次、
+        // 归位 G1 完成一次）。坐标仍在 :601 的逐行串口日志。
+        const TickType_t now = xTaskGetTickCount();
         if (gs == GrblState::Alarm) {
-            std::snprintf(buf, sizeof(buf), "写字机报警 ALARM:%d 位置 X=%.1f Y=%.1f Z=%.1f",
-                          sub_code, nx, ny, nz);
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "写字机报警，代码 %d", sub_code);
             NotifyCloud(buf);
         } else if (prev == GrblState::Run && gs == GrblState::Idle) {
-            std::snprintf(buf, sizeof(buf), "写字机运动完成 (Run→Idle) 停在 X=%.1f Y=%.1f", nx, ny);
-            NotifyCloud(buf);
+            if (now - last_transition_notify_tick_ >= pdMS_TO_TICKS(10000)) {
+                last_transition_notify_tick_ = now;
+                NotifyCloud("写字机运动完成");
+            }
         } else if (gs == GrblState::Hold) {
-            std::snprintf(buf, sizeof(buf), "写字机暂停 (Hold) 位置 X=%.1f Y=%.1f", nx, ny);
-            NotifyCloud(buf);
+            if (now - last_transition_notify_tick_ >= pdMS_TO_TICKS(10000)) {
+                last_transition_notify_tick_ = now;
+                NotifyCloud("写字机已暂停");
+            }
         }
     }
 

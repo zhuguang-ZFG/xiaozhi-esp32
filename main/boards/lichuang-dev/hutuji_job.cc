@@ -217,12 +217,12 @@ std::string Job::StartDraw(const std::string& url) {
         return "{\"error\":\"url 不能为空\"}";
     }
     if (!IsValidDrawUrl(url)) {
-        return "{\"error\":\"url 必须是 https://hutuji.donglicao.com/files/...，或 RFC1918 "
-               "联调主机的 /files/... capability 地址\"}";
+        return "{\"error\":\"url 必须是 https://hutuji.donglicao.com/files/... 或联调主机的 "
+               "/files/... 地址\"}";
     }
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
-        return JsonString("busy");
+        return JsonString("写字机正忙，请稍候再试");
     }
     if (!ResetAbortResetState()) {
         busy_.store(false);
@@ -543,7 +543,7 @@ std::string Job::RequestResume() {
 std::string Job::RequestRepeat() {
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
-        return JsonString("busy");
+        return JsonString("写字机正忙，请稍候再试");
     }
     auto& pipe = Pipe::GetInstance();
     if (!pipe.IsConnected()) {
@@ -589,7 +589,7 @@ std::string Job::RequestPenTest() {
         // 试笔状态与 busy 一起发布，RequestAbort 在同一把锁下分流，不能看到半成品状态。
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (busy_.load()) {
-            return JsonString("busy");
+            return JsonString("写字机正忙，请稍候再试");
         }
         if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
             return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
@@ -731,8 +731,9 @@ void Job::TaskEntry(void* arg) {
 
 void Job::Run() {
     bool ok = false;
-    // R21-F01：换纸一次性播报门控随任务复位。
+    // R21-F01/F08：一次性播报门控与失败单出口标记随任务复位。
     paper_change_notified_ = false;
+    failure_notified_ = false;
     do {
         if (abort_requested_.load()) {
             SetState("aborted");
@@ -743,6 +744,7 @@ void Job::Run() {
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("重画中...");
             ESP_LOGI(TAG, "重画：复用 PSRAM %zu 字节，跳过下载/校验", buffer_len_);
+            Notify("开始重画");
         } else {
             SetState("downloading");
             if (auto* d = Board::GetInstance().GetDisplay())
@@ -787,7 +789,7 @@ void Job::Run() {
             break;
         }
         if (!pipe.IsAuthorized()) {
-            last_error_ = "写字机未授权，请先按设备授权 SOP 处理";
+            last_error_ = "写字机未授权，请联系卖家协助激活";
             SetState("error");
             Notify(last_error_);
             break;
@@ -819,7 +821,7 @@ void Job::Run() {
                 break;
             }
             if (++disconnect_replays > kDisconnectReplayMaxRetries) {
-                last_error_ = "断连自动重画次数耗尽";
+                last_error_ = "断连自动重画次数耗尽，请检查网络后重新开始";
                 break;
             }
             // 即使 abort 已到达，也必须完成重连后的 Changing 分流和安全 reset；
@@ -845,7 +847,7 @@ void Job::Run() {
                 d->SetStatus("已取消");
         } else if (ok) {
             SetState("done");
-            Notify("出图完成");
+            Notify("出图完成，可以说「再来一次」直接重画");
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("画好啦！");
         } else {
@@ -863,7 +865,12 @@ void Job::Run() {
                     }
                 }
             }
-            Notify(std::string("转发失败: ") + user_error);
+            // R21-F07/FW-UX-01：去「转发失败:」前缀——归位/换纸/报警/断连等失败
+            // 都不是「转发」，前缀误导用户以为画失败。
+            // R21-F08：恢复路径已播报过的失败不二次播报（双播报实测延迟最长 90s）。
+            if (!failure_notified_) {
+                Notify(user_error);
+            }
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("出错了");
         }
@@ -1319,15 +1326,22 @@ bool Job::RecoverDisconnectedDraw() {
         d->SetStatus("写字机重连中...");
     Notify("写字机连接中断，正在安全恢复这幅画");
     const TickType_t reconnect_began = xTaskGetTickCount();
+    TickType_t last_reconnect_notify = reconnect_began;
     while (true) {
         if (pipe.IsConnected() && pipe.GetConnectionSequence() != stream_connection_seq_) {
             break;
         }
         if ((xTaskGetTickCount() - reconnect_began) >= pdMS_TO_TICKS(kReconnectReadyTimeoutMs)) {
-            last_error_ = "等待写字机重连超时";
+            // R21-F12：超时话术附可执行动作。
+            last_error_ = "等待写字机重连超时，请检查写字机电源和网络后重新开始";
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
+        // R21-F06：重连等待最长 120s 且期间零状态更新；每 30s 一次进展播报。
+        if ((xTaskGetTickCount() - last_reconnect_notify) >= pdMS_TO_TICKS(30000)) {
+            last_reconnect_notify = xTaskGetTickCount();
+            Notify("还在重连写字机，请稍候");
+        }
     }
     const uint32_t paper_seq = pipe.GetPaperStatusSequence();
     if (!pipe.SendLine("[ESP901]")) {
@@ -1345,6 +1359,10 @@ bool Job::RecoverDisconnectedDraw() {
     if (pipe.GetPaperChangingState() != PaperChangingState::Off) {
         last_error_ = "断连发生在换纸窗口，已停止自动恢复，请检查纸张后重画";
         Notify(last_error_);
+        // R21-F08：本分支已播报，Run() 收尾的失败出口不得二次播报；状态同步前置
+        // 为 error，避免「已停止恢复」播报与 reconnecting 状态并存（最长 90s 轮询期）。
+        failure_notified_ = true;
+        SetState("error");
         // 不发 reset/M30。保留会话保护并轮询到换纸退出，使 Pipe 不会在
         // Changing=On 时自动跑 G1 授权探针；任务仍以 error 结束，不会续画。
         // 换纸窗口内同样打开 blocking 标记，避免等待期间 silent-poll 误杀 TCP。
@@ -1534,7 +1552,14 @@ bool Job::ChangePaperAfterDraw() {
 
     if (wr != WaitResult::Ok) {
         if (wr == WaitResult::Failed || wr == WaitResult::Deferred) {
-            last_error_ = "自动换纸失败 (error:" + std::to_string(err) + ")";
+            // R21-F07：error:90 在换纸路径 = 缺纸/卡纸（protocol §7 OUT_OF_PAPER）。
+            // 通用码映射契约保持 90==nullptr（recovery_core.h 钉死）；动作建议在源头句给出。
+            if (err == 90) {
+                ESP_LOGE(TAG, "自动换纸失败 (error:90 缺纸/卡纸)");
+                last_error_ = "纸张用完或未放好，请整理好纸张后再试";
+            } else {
+                last_error_ = "自动换纸失败 (error:" + std::to_string(err) + ")";
+            }
         } else {
             pipe.SendRealtime('?');
             last_error_ = "等待自动换纸完成超时";
@@ -1799,7 +1824,10 @@ bool Job::StreamToGrbl() {
                     SetState("paper_change");
                     ++retries;
                     if (retries > kDeferredMaxRetries) {
-                        last_error_ = "error:8 重试耗尽";
+                        ESP_LOGE(TAG, "换纸行 error:8 重试耗尽: %s", line.c_str());
+                        // R21-F13：不带 error:8 原文——映射层会把「正在换纸」进行式
+                        // 拼到「已停止」结论上，时态矛盾；技术细节留在上面的日志。
+                        last_error_ = "换纸未完成，已停止本次绘图，请检查纸张后重试";
                         return false;
                     }
                     ESP_LOGW(TAG, "error:8，%d 次重发: %s", retries, line.c_str());
@@ -1995,12 +2023,11 @@ bool Job::StreamToGrbl() {
             TickType_t now = xTaskGetTickCount();
             if ((now - last_notify_tick) >= pdMS_TO_TICKS(5000)) {
                 last_notify_tick = now;
-                float mx, my, mz;
-                pipe.GetMachinePos(mx, my, mz);
+                // R21-F05：进度播报只留百分比——机器坐标/行号对最终用户是噪声
+                // （坐标仍在串口逐行日志可查）。5s 节流不变。
                 int pct = lines_total_ > 0 ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
-                char buf[128];
-                snprintf(buf, sizeof(buf), "出图进度: %d%% (%zu/%zu行) 位置 X=%.1f Y=%.1f", pct,
-                         lines_sent_, lines_total_, mx, my);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "出图进度: %d%%", pct);
                 Notify(buf);
             }
         } else if (wr == WaitResult::Failed) {

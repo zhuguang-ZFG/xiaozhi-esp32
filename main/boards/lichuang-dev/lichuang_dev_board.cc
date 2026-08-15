@@ -296,14 +296,17 @@ private:
 
         mcp_server.AddTool("hutuji.status",
             "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、是否授权、任务状态、最近应答行。"
-            "用户问「写字机连上了吗/能不能动」时用；云端生成服务请用 hutuji_status。",
+            "用户问「写字机连上了吗/能不能动」时用；云端生成服务请用 hutuji_status。"
+            "state 字段含义：idle 空闲、downloading 下载中、verifying 校验中、streaming 绘图中、"
+            "paused 已暂停、paper_change 换纸中、reconnecting 断线恢复中、done 完成、"
+            "error 出错、aborted 已取消。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().StatusJson();
             });
 
         mcp_server.AddTool("hutuji.draw",
             "执行出纸：参数 url 必须是云端 hutuji_draw 返回的 G-code 下载地址。"
-            "设备全量下载、CRC 校验、授权门通过后逐行经 Telnet 转发。进行中再调返回 busy。"
+            "设备全量下载、CRC 校验、授权门通过后逐行经 Telnet 转发。进行中再调会返回「写字机正忙」提示。"
             "用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
             PropertyList({
                 Property("url", kPropertyTypeString)
