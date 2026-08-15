@@ -35,6 +35,7 @@ constexpr uint32_t kJobIdleTimeoutMs = 30 * 60 * 1000;
 // 运动队列之后，等待时间等同剩余绘图时间，不能按普通 M-code 的 60s 判超时。
 constexpr uint32_t kPlannerSyncOkTimeoutMs = kJobIdleTimeoutMs;
 constexpr uint32_t kPostPaperIdleTimeoutMs = 5000;
+constexpr uint32_t kHomeIdleTimeoutMs = 30 * 1000;
 constexpr uint32_t kPenOriginIdleTimeoutMs = 5000;
 // 等 ok 超时后的状态兜底探测：只要一份新状态报告，2s 足够（`?` 是实时命令，
 // 不排 planner 队列）。
@@ -822,6 +823,9 @@ void Job::Run() {
                      kDisconnectReplayMaxRetries);
         }
         if (ok) {
+            ok = ReturnHomeAfterDraw();
+        }
+        if (ok) {
             ok = ChangePaperAfterDraw();
         }
         if (abort_requested_.load()) {
@@ -1364,6 +1368,52 @@ bool Job::RecoverDisconnectedDraw() {
     stream_connection_seq_ = recovered_seq;
     stream_disconnected_ = false;
     Notify("写字机已恢复，正在从头重画");
+    return true;
+}
+
+bool Job::ReturnHomeAfterDraw() {
+    auto& pipe = Pipe::GetInstance();
+
+    // 归位（2026-08-14 用户决策「画完一张之后要归位」）：画完一页先把笔架送回
+    // 原点，再进换纸。必须用 G1 不能用 G0：固件「回原点后换纸」触发
+    // （GCode.cpp 页尾分支）只认本行实际执行的 G0/G28/G30 且落点 XY≈0，
+    // G1 落 (0,0) 不触发——归位与换纸因此仍是两个独立阶段，运动留在可即停的
+    // 常规行里，不进 90s 不可即停的换纸窗口（既有 host test 钉死的口径）。
+    // 本行与 M30 一样是 S3 编排命令、不属于下载文件；下载文件的 X0Y0 禁令不变。
+    // 仅限正常页尾调用：断连恢复的废纸换纸（RecoverDisconnectedDraw 内
+    // ChangePaperAfterDraw 调用点）不归位——该路径刚经历受限 reset，position
+    // 可信度最低，只允许固定的受限恢复序列。
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (abort_requested_.load()) {
+            last_error_ = "aborted";
+            return false;
+        }
+        if (!pipe.SendLine("G1G90 X0Y0F8000")) {
+            last_error_ = "归位命令发送失败";
+            return false;
+        }
+    }
+    int err = -1;
+    const WaitResult wr = pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &err);
+    if (wr != WaitResult::Ok) {
+        last_error_ = wr == WaitResult::Timeout
+                          ? "等待归位应答超时"
+                          : "归位被 Grbl 拒绝 (error:" + std::to_string(err) + ")";
+        return false;
+    }
+    // G1 的 ok 只表示已入 planner，不代表走完；必须 fresh Idle 确认归位物理完成，
+    // 才允许进入换纸——否则「归位/换纸两阶段分离」只是靠 M30 内部 synchronize 的
+    // 隐性保证，abort 在两阶段之间没有真实决策点。
+    if (!WaitForIdle(true, kHomeIdleTimeoutMs)) {
+        if (last_error_.empty()) {
+            last_error_ = "归位后未确认写字机 Idle";
+        } else if (last_error_ != "aborted") {
+            last_error_ = "归位后未确认写字机 Idle: " + last_error_;
+        }
+        return false;
+    }
+    ESP_LOGI(TAG, "页尾归位完成（G1 X0Y0，不触发换纸）");
     return true;
 }
 

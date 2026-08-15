@@ -588,7 +588,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self._compile_and_run(compiler, source, stem="hutuji_paper_prefix_test")
 
     def test_page_end_uses_non_motion_m30_orchestration(self):
-        """页尾换纸必须单发 M30，不得把回原点运动塞进不可即停的换纸窗口。"""
+        """页尾换纸必须单发 M30，不得把回原点运动塞进不可即停的换纸窗口。
+
+        归位（2026-08-14 用户决策）由 `ReturnHomeAfterDraw()` 在正常页尾以
+        独立 G1 行先行完成，不进本函数的换纸窗口——本断言继续钉死 M30 是
+        换纸窗口内唯一命令。
+        """
         source = (
             ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
         ).read_text(encoding="utf-8")
@@ -598,6 +603,45 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         commands = re.findall(r'pipe\.SendLine\("([^"]+)"\)', body)
         self.assertEqual(commands, ["M30"])
+
+    def test_return_home_is_g1_and_only_on_normal_page_end(self):
+        """页尾归位（2026-08-14 用户决策）必须是 G1 且只在正常页尾路径。
+
+        固件「回原点后换纸」触发只认本行实际执行的 G0/G28/G30 且落点 XY≈0
+        （GCode.cpp 页尾分支，`block_executed_seek` 仅在 Motion::Seek 分支
+        置位）；G1 落 (0,0) 不触发。归位行若误用 G0，归位与换纸会耦进同一条
+        90s 不可即停的换纸行，违反上个测试钉死的口径。断连恢复的废纸换纸
+        （RecoverDisconnectedDraw 内 ChangePaperAfterDraw 调用点）不归位：
+        该路径刚经历受限 reset，position 可信度最低，只允许固定恢复序列。
+        """
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+
+        # 归位实现：发送的必须是 G1 形式的原点行，且函数内只有这一条发送。
+        start = source.index("bool Job::ReturnHomeAfterDraw()")
+        end = source.index("bool Job::ChangePaperAfterDraw()", start)
+        body = source[start:end]
+        homes = re.findall(r'pipe\.SendLine\("([^"]+)"\)', body)
+        self.assertEqual(homes, ["G1G90 X0Y0F8000"])
+        # 归位必须「ok 后再 fresh Idle」：G1 的 ok 只表示入 planner，缺了
+        # WaitForIdle 就退化成靠 M30 内部 synchronize 的隐性顺序保证，abort 在
+        # 归位/换纸两阶段之间没有真实决策点。
+        ok_wait = body.index("pipe.WaitResponse(")
+        idle_wait = body.index("WaitForIdle(true, kHomeIdleTimeoutMs)")
+        self.assertLess(ok_wait, idle_wait)
+        self.assertTrue(homes[0].startswith("G1"), homes)
+
+        # 正常页尾路径：先归位、后换纸（同行序调用）。
+        park_call = source.index("ok = ReturnHomeAfterDraw();")
+        change_call = source.index("ok = ChangePaperAfterDraw();", park_call)
+        self.assertLess(park_call, change_call)
+
+        # 恢复路径：不得含归位（函数体以 ReturnHomeAfterDraw 定义为界）。
+        rec_start = source.index("bool Job::RecoverDisconnectedDraw()")
+        rec_body = source[rec_start:start]
+        self.assertNotIn("ReturnHomeAfterDraw", rec_body)
+        self.assertNotIn("G1G90 X0Y0", rec_body)
 
     def test_recv_loop_rechecks_abort_hold_before_ok_fallback(self):
         """R11-PIPE-01：等待循环退出后必须再复核一次「abort 已提交且 Hold 已确认」。
@@ -643,7 +687,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         for fn, next_symbol in (
             ("bool Job::ChangePaperAfterDraw()", "\n}\n\nstd::vector<Job::LineSpan>"),
-            ("bool Job::RecoverDisconnectedDraw()", "\nbool Job::ChangePaperAfterDraw()"),
+            ("bool Job::RecoverDisconnectedDraw()", "\nbool Job::ReturnHomeAfterDraw()"),
         ):
             start = source.index(fn)
             body = source[start : source.index(next_symbol, start)]

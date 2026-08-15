@@ -80,6 +80,8 @@ private:
      * 全部完成。Run/Hold、坐标不符或拿不到新报告一律返回 false（fail closed）。
      */
     bool ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t from, size_t to);
+    /** 正常页尾专有：G1 归位（不触发换纸），随后才允许 ChangePaperAfterDraw。 */
+    bool ReturnHomeAfterDraw();
     bool ChangePaperAfterDraw();
     bool RecoverDisconnectedDraw();
     void ReleaseBuffer();
