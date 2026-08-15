@@ -731,6 +731,8 @@ void Job::TaskEntry(void* arg) {
 
 void Job::Run() {
     bool ok = false;
+    // R21-F01：换纸一次性播报门控随任务复位。
+    paper_change_notified_ = false;
     do {
         if (abort_requested_.load()) {
             SetState("aborted");
@@ -752,7 +754,10 @@ void Job::Run() {
                         d->SetStatus("已取消");
                 } else {
                     SetState("error");
-                    Notify(std::string("下载失败: ") + last_error_);
+                    ESP_LOGW(TAG, "下载失败: %s", last_error_.c_str());
+                    // R21-F03：last_error_ 是技术诊断串（HTTP/CRC32/PSRAM），用户面
+                    // 只发可行动话术；技术串留在日志与 status。
+                    Notify(hutuji::DescribeTransferFailure(last_error_));
                 }
                 break;
             }
@@ -765,7 +770,8 @@ void Job::Run() {
                 d->SetStatus("校验中...");
             if (!VerifyCrc()) {
                 SetState("error");
-                Notify(std::string("校验失败: ") + last_error_);
+                ESP_LOGW(TAG, "校验失败: %s", last_error_.c_str());
+                Notify(hutuji::DescribeTransferFailure(last_error_));
                 break;
             }
         }
@@ -864,6 +870,9 @@ void Job::Run() {
     } while (false);
 
     bool reset_ok = true;
+    // R21-F02：abort 终态播报延到 while 循环外（stream_mutex_ 已释放、reset 结果
+    // 已确定）再发；0=不播 1=已停止 2=取消失败。
+    int abort_notify = 0;
     while (true) {
         std::unique_lock<std::mutex> stream_lock(stream_mutex_);
         if (abort_reset_owner_.Running() ||
@@ -886,6 +895,11 @@ void Job::Run() {
             SetState("error");
             ok = false;
         }
+        // R21-F02：do-while 内的 aborted 分支早于 reset 判定，那里说「已停止」
+        // 在 reset 失败时是假话；只在这里记录，循环外发。
+        if (abort_requested_.load()) {
+            abort_notify = reset_ok ? 1 : 2;
+        }
 
         // stream_mutex 同时是新任务的发布门：旧任务全部资源/状态写入必须先完成。
         if (ok && !abort_requested_.load() && buffer_ != nullptr) {
@@ -907,6 +921,11 @@ void Job::Run() {
         // 必须是旧任务最后一次共享写入；解锁后 StartDraw/Repeat/PenTest 才可发布新任务。
         busy_.store(false, std::memory_order_release);
         break;
+    }
+    if (abort_notify == 1) {
+        Notify("已停止");
+    } else if (abort_notify == 2) {
+        Notify("取消失败，写字机可能未停稳，请断电重启");
     }
 }
 
@@ -1480,6 +1499,13 @@ bool Job::ChangePaperAfterDraw() {
             return false;
         }
     }
+    // R21-F01（页尾）：正常页尾与断连恢复的废纸换纸共用本函数；与换纸行分支
+    // 共用同一门控，整张任务只播一次。必须在 stream_mutex_ 外发——Notify 走
+    // cJSON + SendMcpMessage 网络路径，锁内调用会堵死新任务发布门（F02 同口径）。
+    if (!paper_change_notified_) {
+        paper_change_notified_ = true;
+        Notify("正在换纸，请稍候");
+    }
 
     WaitResult wr = WaitResult::Timeout;
     int err = -1;
@@ -1679,6 +1705,15 @@ bool Job::StreamToGrbl() {
             const std::string line(LineAt(spans[next_]));
             paper_active_.store(true);
             SetState("paper_change");
+            // R21-F01：换纸等待最长 90s（kPaperOkTimeoutMs）且期间无 ok、无进度
+            // 播报，用户会误以为卡死；入口一次性播报 + 屏显。多页文件的后续换纸行
+            // 不再重复播报（门控在 Run() 开始时复位）。
+            if (!paper_change_notified_) {
+                paper_change_notified_ = true;
+                Notify("正在换纸，请稍候");
+                if (auto* d = Board::GetInstance().GetDisplay())
+                    d->SetStatus("换纸中...");
+            }
 
             int retries = 0;
             while (true) {

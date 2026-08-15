@@ -750,6 +750,75 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 三处 RAII 析构 + 一处收尾兜底，多出任何手工复位都说明又开了新出口。
         self.assertEqual(source.count("SetExpectBlockingPeer(false)"), 4)
 
+    def test_describe_transfer_failure_mapping(self):
+        """R21-F03：下载/校验失败的用户面话术——404 引导重新生成（TTL 过期是正常
+        路径），CRC/长度类报文件不完整，其余网络/资源类报稍后重试；未知串走兜底。
+        技术诊断串由调用方留 ESP 日志，不进用户播报。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <cstring>
+
+            int main() {
+                using hutuji::DescribeTransferFailure;
+                assert(std::strstr(DescribeTransferFailure("HTTP status 404"), "重新生成"));
+                assert(std::strstr(DescribeTransferFailure("CRC 不符"), "不完整"));
+                assert(std::strstr(DescribeTransferFailure("Content-Length 为 0"), "不完整"));
+                assert(std::strstr(DescribeTransferFailure("PSRAM 分配失败"), "重试"));
+                assert(std::strstr(DescribeTransferFailure("HTTP Open 失败"), "重试"));
+                return 0;
+            }
+            """
+        )
+
+        self._compile_and_run(compiler, source, stem="hutuji_transfer_failure_test")
+
+    def test_abort_completion_notify_after_reset_outcome(self):
+        """R21-F02：abort 终态播报必须晚于 reset 结果判定，且在 stream_mutex_ 外发出。
+
+        do-while 内的 aborted 分支早于 reset 判定（WaitForAbortReset/owner 结果在
+        收尾 while 里才确定），那里说「已停止」在 reset 失败时是假话；而收尾循环
+        持有 stream_mutex_（新任务发布门），锁内 Notify 会堵发布。故话术只能长在
+        收尾 while 之后：钉死「已停止/取消失败」Notify 出现在 reset 判定之后。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        start = source.index("void Job::Run()")
+        body = source[start : source.index("\n}\n", start)]
+
+        decided = body.index('"abort reset 恢复失败"')
+        stopped = body.index('Notify("已停止")')
+        failed = body.index("取消失败，写字机可能未停稳")
+        self.assertLess(decided, stopped)
+        self.assertLess(decided, failed)
+        # 两个播报都必须在收尾 while 的 break 之后（循环外、锁外）。
+        tail_break = body.rindex("break;")
+        self.assertLess(tail_break, stopped)
+        self.assertLess(tail_break, failed)
+
+    def test_paper_change_notify_is_once_gated(self):
+        """R21-F01：换纸播报两个入口（文件内换纸行 / 页尾与恢复的 ChangePaperAfterDraw）
+        共用 paper_change_notified_ 门控，整张任务只播一次；门控随 Run() 复位。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+
+        run_start = source.index("void Job::Run()")
+        run_body = source[run_start : source.index("\n}\n", run_start)]
+        self.assertIn("paper_change_notified_ = false;", run_body)
+
+        announces = source.count('Notify("正在换纸，请稍候")')
+        self.assertEqual(announces, 2)  # 恰好两个入口，文案一致
+        gates = source.count("if (!paper_change_notified_)")
+        self.assertEqual(gates, 2)  # 两个入口都在门控内
+        self.assertEqual(source.count("paper_change_notified_ = true;"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

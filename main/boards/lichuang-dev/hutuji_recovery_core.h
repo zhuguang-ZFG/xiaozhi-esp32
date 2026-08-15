@@ -104,6 +104,25 @@ inline const char* DescribeGrblError(int code) {
 }
 
 /**
+ * 下载/校验失败的用户面话术（R21-F03）：`last_error_` 是技术诊断串
+ * （HTTP/CRC32/PSRAM/Content-Length），直接 Notify 用户听不懂也无从行动。
+ * 按错误形态归类为可执行建议；技术串由调用方留 ESP 日志与 status。
+ * 404 单列：TTL（默认 600s，`HUTUJI_OUTPUT_TTL_SECONDS` 可调）过期是正常路径
+ * （CloudUX-F1），须引导重新生成而非重试。
+ */
+inline const char* DescribeTransferFailure(const std::string& error) {
+    if (error.find("404") != std::string::npos) {
+        return "文件已过期或不存在，请重新生成后再试";
+    }
+    if (error.find("CRC") != std::string::npos ||
+        error.find("Content-Length") != std::string::npos ||
+        error.find("512KB") != std::string::npos) {
+        return "文件内容不完整，请重新生成后再试";
+    }
+    return "下载图片失败，请检查网络后重试";
+}
+
+/**
  * 构造未授权探测行。`G1` 必须是第一个 G 字：商业固件 Protocol.cpp 的前置授权门
  * 只检查行首 G0~G3；若写成 `G53 G1 ...`，前置门看到 G53 会放过，GCode.cpp 内层
  * 又只是静默跳过未授权运动并最终返回 ok，S3 会把未授权误判成已授权。

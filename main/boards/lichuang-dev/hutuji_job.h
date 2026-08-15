@@ -165,6 +165,9 @@ private:
     std::atomic<bool> pen_test_active_{false};
 
     bool stream_disconnected_ = false;
+    // R21-F01：换纸播报一次性门控（多页连续换纸行不重复打扰）；仅任务线程读写。
+    bool paper_change_notified_ = false;
+
     uint32_t stream_connection_seq_ = 0;
 
     size_t lines_total_ = 0;
