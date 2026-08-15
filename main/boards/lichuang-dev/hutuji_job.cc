@@ -36,6 +36,8 @@ constexpr uint32_t kJobIdleTimeoutMs = 30 * 60 * 1000;
 constexpr uint32_t kPlannerSyncOkTimeoutMs = kJobIdleTimeoutMs;
 constexpr uint32_t kPostPaperIdleTimeoutMs = 5000;
 constexpr uint32_t kHomeIdleTimeoutMs = 30 * 1000;
+// R20-JOB-01：归位行 ok 预算独立命名，不与换纸状态查询常量耦合。
+constexpr uint32_t kHomeOkTimeoutMs = 5000;
 constexpr uint32_t kPenOriginIdleTimeoutMs = 5000;
 // 等 ok 超时后的状态兜底探测：只要一份新状态报告，2s 足够（`?` 是实时命令，
 // 不排 planner 队列）。
@@ -198,8 +200,11 @@ static bool LooksLikePlannerSyncLine(const std::string& line) {
     if (c != 'M') {
         return false;
     }
-    // MCP 产物中的笔控行为：M3=落笔，M5=抬笔。Grbl 侧会等待前序 planner
-    // 执行到该笔控点后才回 ok，因此行级等待窗口必须覆盖剩余绘图时间。
+    // R20-GW-06 更正（旧注释失实）：M3/M5 仅手工/恢复路径的笔控（Grbl
+    // USE_M3_M5_AS_PEN_UP_DOWN：M3→Z=5mm 落笔 / M5→Z=0 抬笔，GCode.cpp）；
+    // 生产 profile 纯 G1 Z 运动、文件不含任何 M 码（protocol.md §5 允许列表），
+    // 本分支对生产文件不可达，保留作超时分类的防御面。Grbl 侧会等前序 planner
+    // 执行到该笔控点后才回 ok，因此这类行的等待窗口必须覆盖剩余绘图时间。
     if ((line[1] == '3' || line[1] == '5') &&
         (line.size() == 2 || !std::isdigit(static_cast<unsigned char>(line[2])))) {
         return true;
@@ -839,7 +844,20 @@ void Job::Run() {
                 d->SetStatus("画好啦！");
         } else {
             SetState("error");
-            Notify(std::string("转发失败: ") + last_error_);
+            // R20-S3-04：裸 error:NN 用户读不懂；能抽出码就附中文描述（未知码保持原文）。
+            // last_error_ 多为复合句（如「归位被 Grbl 拒绝 (error:110)」），取首个
+            // "error:" 后的数字；ParseGrblErrorCode 要求消费到行尾，故这里直接读数。
+            std::string user_error = last_error_;
+            const size_t err_pos = last_error_.find("error:");
+            if (err_pos != std::string::npos) {
+                const char* p = last_error_.c_str() + err_pos + 6;
+                if (*p >= '0' && *p <= '9') {
+                    if (const char* desc = hutuji::DescribeGrblError(std::atoi(p))) {
+                        user_error += "（" + std::string(desc) + "）";
+                    }
+                }
+            }
+            Notify(std::string("转发失败: ") + user_error);
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("出错了");
         }
@@ -1039,11 +1057,15 @@ void Job::CommitPauseTimeoutCancel() {
             std::memory_order_release);
     }
     last_error_ = "暂停超时自动取消";
-    Notify("暂停超过 10 分钟，已自动取消这幅画；想画的话跟我说一声");
-    // 先启动唯一 owner；StreamToGrbl 退出发布 Quiesced 后 worker 才能发 reset。
+    // R20-S3-03：先启动唯一 owner，按结果分支话术。StartAbortResetTask 成功只代表
+    // worker 已创建，0x18 在异步 worker 里仍可能失败——成功分支只能说「已启动」；
+    // xTaskCreate 失败时 0x18 发不出，机器仍停 Hold，失败分支必须明说。
     // owner 的受控 0x18 能把 Hold 一并清掉，写字机不会卡在进给保持。
     if (!StartAbortResetTask()) {
         last_error_ = "暂停超时无法创建 abort reset 任务";
+        Notify("暂停超过 10 分钟，自动取消失败，写字机可能停在暂停状态，请断电重启");
+    } else {
+        Notify("暂停超过 10 分钟，已启动自动取消；请确认写字机已停止");
     }
 }
 
@@ -1376,7 +1398,14 @@ bool Job::ReturnHomeAfterDraw() {
 
     // 归位（2026-08-14 用户决策「画完一张之后要归位」）：画完一页先把笔架送回
     // 原点，再进换纸。必须用 G1 不能用 G0：固件「回原点后换纸」触发
-    // （GCode.cpp 页尾分支）只认本行实际执行的 G0/G28/G30 且落点 XY≈0，
+    // 本行与 M30 一样是 S3 编排命令、不属于下载文件；下载文件的 X0Y0 禁令不变。
+    // R20 补记三条刻意决策：
+    // ①quiescence 不置 Active——入口时流已被 StreamToGrbl 的 WindowGuard 发布为
+    //   Quiesced，abort 的 CanResetAfterStream 立即放行（与 ChangePaperAfterDraw
+    //   的 M30 编排同款：页尾单行编排不再触碰 quiescence 标记）。
+    // ②归位 error:8 不重试——换纸窗外不应出现 error:8，重试被拒运动无意义。
+    // ③归位窗口（~3-5s）内断连不可恢复（任务 error、纸留机上）——窗口在重画
+    //   循环之外，与 ChangePaperAfterDraw 的既有不可恢复窗口同性质，显式接受。
     // G1 落 (0,0) 不触发——归位与换纸因此仍是两个独立阶段，运动留在可即停的
     // 常规行里，不进 90s 不可即停的换纸窗口（既有 host test 钉死的口径）。
     // 本行与 M30 一样是 S3 编排命令、不属于下载文件；下载文件的 X0Y0 禁令不变。
@@ -1395,7 +1424,7 @@ bool Job::ReturnHomeAfterDraw() {
         }
     }
     int err = -1;
-    const WaitResult wr = pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &err);
+    const WaitResult wr = pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err);
     if (wr != WaitResult::Ok) {
         last_error_ = wr == WaitResult::Timeout
                           ? "等待归位应答超时"
@@ -1577,14 +1606,14 @@ bool Job::StreamToGrbl() {
         }
     } window_guard{pipe, stream_mutex_, stream_quiescence_};
 
-    // 照抄官方 stream.py 的 c_line / g_count 结构（§4.2）
+    // 照抄官方 stream.py 的 c_line / g_count 结构（§3）
     std::deque<size_t> c_line;    // 在途各行字节数（含 +1 换行，R1）
     size_t c_line_bytes_sum = 0;  // 在途字节数累加
     size_t next_ = 0;             // 下一条待发
 
     // paper_pending：遇到换纸行时先排空 c_line，排空后在此标记下走逐行模式。
     // 理由：换纸期主循环阻塞，若在途字节涌入会撑满 InputBuffer ②导致静默丢
-    // 字节（§3）；换纸行 ok 等数十秒且期间禁发 G0–G3（§4.3 第一条）。
+    // 字节（§3）；换纸行 ok 等数十秒且期间禁发 G0–G3（§3 换纸阻塞期条）。
     bool paper_pending = false;
     // 等 ok 超时后靠状态报告兜底的次数。Grbl WebUI Telnet 输出无 TX 缓冲，`ok` 与
     // `?` 报告同核并发写同一 socket，偶发被抢占会静默吞掉一个 `ok`。超上限仍失败，
@@ -1619,7 +1648,7 @@ bool Job::StreamToGrbl() {
             return false;
         }
 
-        // === 暂停（§4.3：停止灌新行，但必须继续收在途 ok）===
+        // === 暂停（§3：停止灌新行，但必须继续收在途 ok）===
         // 暂停且无在途 → 阻塞等恢复；有在途 → 落入收分支排空（不调 WaitWhilePaused，
         // 收分支不阻塞 — 否则 c_line 永不释放）。
         if (paused_.load() && !paper_active_.load() && !paper_pending && c_line.empty() &&
@@ -1635,7 +1664,7 @@ bool Job::StreamToGrbl() {
             continue;
         }
 
-        // === 换纸行：c_line 已排空，走逐行模式（§4.3 第一条）===
+        // === 换纸行：c_line 已排空，走逐行模式（§3 换纸阻塞期条）===
         if (paper_pending && c_line.empty()) {
             paper_pending = false;
             // §3：换纸期 Grbl 主循环不转、不回 `?`。本分支与 ChangePaperAfterDraw
@@ -1831,7 +1860,7 @@ bool Job::StreamToGrbl() {
             continue;
         }
 
-        // 按队首行类型选 timeout（§4.4：超时含义是「最老那条等了 timeout」）
+        // 按队首行类型选 timeout（§3：超时含义是「最老那条等了 timeout」）
         // c_line 队首对应 spans[lines_sent_]：FIFO + 每次 pop 即 ++lines_sent_，
         // 换纸行不在 c_line 但同样 ++lines_sent_，索引始终对齐。
         std::string_view front_sv = LineAt(spans[lines_sent_]);
@@ -1945,7 +1974,7 @@ bool Job::StreamToGrbl() {
             last_error_ = "error:" + std::to_string(err);
             return false;
         } else if (wr == WaitResult::Deferred) {
-            // §4.3：窗口化普通行不应收到 error:8（换纸期禁发 G0–G3，普通行不会撞
+            // §3 换纸阻塞期条：窗口化普通行不应收到 error:8（换纸期禁发 G0–G3，普通行不会撞
             // error:8）。若意外收到，按 Failed 处理并记日志（不应发生）。
             ESP_LOGW(TAG, "窗口化分支意外收到 error:8（err=%d），按失败处理", err);
             last_error_ = "error:8（窗口化不应发生）";
@@ -1974,7 +2003,7 @@ bool Job::StreamToGrbl() {
                 UpdateDisplayProgress();
                 continue;
             }
-            // §4.4：日志带 c_line 队首对应行内容，否则排障时行号是错的。
+            // 日志带 c_line 队首对应行内容，否则排障时行号是错的。
             ESP_LOGE(TAG, "等 ok 超时，队首在途行 [%zu]: %.*s", lines_sent_, (int)front_sv.size(),
                      front_sv.data());
             pipe.SendRealtime('?');

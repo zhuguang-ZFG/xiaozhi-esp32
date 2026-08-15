@@ -643,6 +643,52 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertNotIn("ReturnHomeAfterDraw", rec_body)
         self.assertNotIn("G1G90 X0Y0", rec_body)
 
+    def test_describe_grbl_error_mapping(self):
+        """R20-S3-04：用户面中文映射表——8/10/110 有描述；90（通用 MessageFailed）
+        与未知码必须回 nullptr（调用方保持原文），不得把通用码说成缺纸。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <cstring>
+
+            int main() {
+                using hutuji::DescribeGrblError;
+                assert(std::strstr(DescribeGrblError(8), "暂不能执行"));
+                assert(std::strstr(DescribeGrblError(10), "软限位"));
+                assert(std::strstr(DescribeGrblError(110), "未授权"));
+                assert(DescribeGrblError(90) == nullptr);   // 通用码不映射
+                assert(DescribeGrblError(999) == nullptr);  // 未知码
+                assert(DescribeGrblError(-1) == nullptr);
+                return 0;
+            }
+            """
+        )
+
+        self._compile_and_run(compiler, source, stem="hutuji_describe_error_test")
+
+    def test_pause_timeout_notify_follows_reset_outcome(self):
+        """R20-S3-03：暂停超时的取消话术必须跟随 reset owner 创建结果。
+
+        StartAbortResetTask 成功只代表 worker 已创建（0x18 在异步 worker 里仍可能
+        失败），故成功分支只许说「已启动自动取消」；「已自动取消」的完成式文案
+        与「先 Notify 后启动」的旧顺序都必须不存在。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        start = source.index("void Job::CommitPauseTimeoutCancel()")
+        body = source[start : source.index("\n}\n", start)]
+
+        self.assertNotIn("已自动取消这幅画", body)
+        self.assertIn("已启动自动取消", body)
+        self.assertIn("自动取消失败", body)
+        self.assertLess(body.index("StartAbortResetTask()"), body.index("Notify("))
+
     def test_recv_loop_rechecks_abort_hold_before_ok_fallback(self):
         """R11-PIPE-01：等待循环退出后必须再复核一次「abort 已提交且 Hold 已确认」。
 

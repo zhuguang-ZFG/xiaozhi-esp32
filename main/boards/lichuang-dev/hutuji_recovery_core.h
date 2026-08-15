@@ -81,6 +81,29 @@ inline int ParseGrblErrorCode(const std::string& line) {
 }
 
 /**
+ * 用户面中文描述（R20-S3-04）：裸 `error:NN` 经 `Notify("转发失败: " + last_error_)`
+ * 直达云端，用户听不懂。只对用户可行动/可理解的码给描述；未知名回 nullptr，
+ * 调用方保持原文。码表与上方 kVerboseNames 同源（Grbl Error 枚举）。
+ */
+inline const char* DescribeGrblError(int code) {
+    switch (code) {
+        case 8:
+            return "写字机正在换纸，暂不能执行该行";  // Error::IdleError
+        case 9:
+            return "写字机处于锁定/报警状态";  // Error::SystemGcLock
+        case 10:
+            return "超出软限位";  // Error::SoftLimitError
+        case 11:
+            return "指令行过长";  // Error::Overflow
+        // 90（MessageFailed）不映射：它是通用码；换纸路径的报错句已自带「换纸」上下文。
+        case 110:
+            return "写字机未授权";  // Error::AuthenticationFailed
+        default:
+            return nullptr;
+    }
+}
+
+/**
  * 构造未授权探测行。`G1` 必须是第一个 G 字：商业固件 Protocol.cpp 的前置授权门
  * 只检查行首 G0~G3；若写成 `G53 G1 ...`，前置门看到 G53 会放过，GCode.cpp 内层
  * 又只是静默跳过未授权运动并最终返回 ok，S3 会把未授权误判成已授权。
