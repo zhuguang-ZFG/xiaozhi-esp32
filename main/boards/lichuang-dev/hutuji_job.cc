@@ -346,6 +346,17 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
         return WaitForAbortReset();
     }
 
+    // R21-F04 残余：`!` 触发的 Hold 转移播报是「取消中」而非用户暂停；抑制窗
+    // RAII 覆盖本函数全程（含所有 break 早退）。pause 的 Hold 播报不受影响——
+    // pause 不进 PerformAbortReset。
+    struct TransitionNotifyGuard {
+        Pipe& p;
+        explicit TransitionNotifyGuard(Pipe& pipe) : p(pipe) {
+            p.SetTransitionNotifySuppressed(true);
+        }
+        ~TransitionNotifyGuard() { p.SetTransitionNotifySuppressed(false); }
+    } transition_notify_guard{pipe};
+
     const uint32_t session = pipe.GetConnectionSequence();
     abort_reset_session_.store(session, std::memory_order_release);
     const TickType_t began = xTaskGetTickCount();

@@ -835,6 +835,25 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 去抖：两个分支共用同一纪元。
         self.assertEqual(source.count("last_transition_notify_tick_"), 4)  # 两分支各一查一写
 
+    def test_abort_window_suppresses_hold_transition_notify(self):
+        """R21-F04 残余：abort 受限 reset 期（PerformAbortReset 全程，RAII）抑制
+        Run→Idle/Hold 转移播报——`!` 造成的 Hold 是「取消中」不是用户暂停；
+        正常 pause 不走该函数，其 Hold 播报不受影响。ALARM 转移不抑制（安全）。"""
+        pipe_cc = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(encoding="utf-8")
+        pipe_h = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.h").read_text(encoding="utf-8")
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+
+        # 两个转移分支都查抑制标记；ALARM 分支不查。
+        self.assertEqual(pipe_cc.count("!transition_notify_suppressed_.load()"), 2)
+        self.assertIn("SetTransitionNotifySuppressed", pipe_h)
+
+        start = job_cc.index("bool Job::PerformAbortReset(")
+        body = job_cc[start : job_cc.index("\n}\n", start)]
+        guard = body.index("TransitionNotifyGuard")
+        feed_hold = body.index("SendRealtime('!')")
+        self.assertLess(guard, feed_hold)  # 抑制必先于 `!`
+        self.assertIn("~TransitionNotifyGuard()", body)  # RAII 覆盖所有 break 早退
+
     def test_progress_notify_percent_only(self):
         """R21-F05：进度播报只留百分比；坐标/行号不再进 Notify（串口日志仍有）。"""
         source = (

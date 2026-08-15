@@ -763,12 +763,14 @@ void Pipe::ParseStatusReport(const std::string& line) {
             std::snprintf(buf, sizeof(buf), "写字机报警，代码 %d", sub_code);
             NotifyCloud(buf);
         } else if (prev == GrblState::Run && gs == GrblState::Idle) {
-            if (now - last_transition_notify_tick_ >= pdMS_TO_TICKS(10000)) {
+            if (!transition_notify_suppressed_.load() &&
+                now - last_transition_notify_tick_ >= pdMS_TO_TICKS(10000)) {
                 last_transition_notify_tick_ = now;
                 NotifyCloud("写字机运动完成");
             }
         } else if (gs == GrblState::Hold) {
-            if (now - last_transition_notify_tick_ >= pdMS_TO_TICKS(10000)) {
+            if (!transition_notify_suppressed_.load() &&
+                now - last_transition_notify_tick_ >= pdMS_TO_TICKS(10000)) {
                 last_transition_notify_tick_ = now;
                 NotifyCloud("写字机已暂停");
             }

@@ -247,6 +247,17 @@ private:
     // R21-F04：状态转移播报 10s 去抖（页尾归位会确定性连触发 Run→Idle 两次）；
     // 仅 PipeTask 单线程读写，无需 atomic。
     uint32_t last_transition_notify_tick_ = 0;
+    std::atomic<bool> transition_notify_suppressed_{false};
+
+public:
+    /** R21-F04 残余：abort 受限 reset 期抑制 Run→Idle/Hold 转移播报——`!` 造成的
+        Hold 是「取消中」而非用户暂停。仅 Job::PerformAbortReset 经 RAII 设置/清除；
+        正常 pause 的 Hold 播报不受影响（pause 不走该函数）。 */
+    void SetTransitionNotifySuppressed(bool suppressed) {
+        transition_notify_suppressed_.store(suppressed);
+    }
+
+private:
     // Grbl 的授权日志只发 CLIENT_SERIAL，Telnet `$I` 看不到。连接后用抬笔状态下的
     // G53 零位移运动探测 error:110；探测完成前 ready_ 保持 false，禁止绘图抢跑。
     AuthProbeStage auth_probe_stage_ = AuthProbeStage::Idle;
