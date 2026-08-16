@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import shutil
@@ -765,8 +764,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("GetMposReportSequence", fallback)
         self.assertIn("mpos_seq", fallback)
 
-    def test_open_hotspot_wifi_qr_payload_and_display_contract(self):
-        """扫码只传 open SoftAP SSID；板级只依赖 Display 能力，Emote 配网期间保住 QR。"""
+    def test_open_hotspot_wifi_qr_payload_escapes_ssid(self):
+        """扫码连小智热点只传 open SoftAP 的 SSID；SSID 分隔符必须按 ZXing 规则转义。"""
         compiler = find_compiler()
         if compiler is None:
             self.skipTest("no supported host C++ compiler found")
@@ -791,34 +790,22 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self._compile_and_run(compiler, source, stem="hutuji_hotspot_qr_test")
 
+        component = ROOT / "components/hutuji_qrcode/include/qrcode.h"
         board = (ROOT / "main/boards/lichuang-dev/lichuang_dev_board.cc").read_text(
             encoding="utf-8"
         )
-        display_h = (ROOT / "main/display/display.h").read_text(encoding="utf-8")
-        emote_h = (ROOT / "main/display/emote_display.h").read_text(encoding="utf-8")
-        emote_cc = (ROOT / "main/display/emote_display.cc").read_text(encoding="utf-8")
-
-        self.assertIn("ShowProvisioningQr", display_h)
-        self.assertIn("HideProvisioningQr", display_h)
-        self.assertIn("ShowProvisioningQr", emote_h)
-        self.assertIn("provisioning_qr_active_", emote_h)
-        self.assertIn("emote_set_qrcode_data", emote_cc)
-        self.assertIn("if (provisioning_qr_active_)", emote_cc)
-
+        self.assertTrue(component.is_file())
+        self.assertIn("esp_qrcode_generate", board)
         self.assertIn("BuildOpenHotspotWifiQrPayload", board)
         self.assertIn("void SetNetworkEventCallback(NetworkEventCallback callback) override", board)
         self.assertIn("WifiBoard::SetNetworkEventCallback(", board)
         self.assertIn("callback = std::move(callback)", board)
         self.assertNotIn("ConfigureHotspotQrCallback();", board)
-        self.assertNotIn("HotspotQrDisplay", board)
-        self.assertNotIn("static_cast<HotspotQrDisplay*>", board)
         callback_start = board.index("void SetNetworkEventCallback(NetworkEventCallback callback) override")
         callback_end = board.index("    LichuangDevBoard()", callback_start)
         callback_body = board[callback_start:callback_end]
         self.assertIn("WifiConfigModeEnter", callback_body)
-        self.assertIn("ShowProvisioningQr", callback_body)
         self.assertIn("WifiConfigModeExit", callback_body)
-        self.assertIn("HideProvisioningQr", callback_body)
         self.assertIn("if (callback)", callback_body)
 
     def test_window_error_requests_immediate_hold_and_controlled_reset(self):
@@ -1050,54 +1037,103 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("pdMS_TO_TICKS(30000)", rec_body)
         self.assertIn("等待写字机重连超时，请检查写字机电源和网络后重新开始", rec_body)
 
-    def test_lichuang_uses_official_emote_and_removes_grobot_renderer(self):
-        """lichuang-dev 为单一 Emote renderer；旧 Grobot/LVGL 状态钩子与本地 QR renderer
-        完成干净切换，不保留第二条显示路径。"""
-        board_config = json.loads(
-            (ROOT / "main/boards/lichuang-dev/config.json").read_text(encoding="utf-8")
-        )
-        sdkconfig_append = board_config["builds"][0]["sdkconfig_append"]
-        self.assertIn("CONFIG_USE_EMOTE_MESSAGE_STYLE=y", sdkconfig_append)
-        self.assertIn("CONFIG_FLASH_EXPRESSION_ASSETS=y", sdkconfig_append)
-        self.assertIn("CONFIG_MMAP_FILE_NAME_LENGTH=32", sdkconfig_append)
-
-        board = (ROOT / "main/boards/lichuang-dev/lichuang_dev_board.cc").read_text(
+    def test_grobot_eyes_gaze_wink_color_and_state_hooks(self):
+        """眼睛细化包（参考 FluxGarage/RoboEyes 语义）：MoodData 带 lookX/lookY 视线；
+        winking 必须不对称（右眼全闭）；情绪配色表存在；说话/聆听钩子接入
+        LcdDisplay::SetStatus 且调用基类保住状态栏文本。"""
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
             encoding="utf-8"
         )
-        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
         lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
-        main_cmake = (ROOT / "main/CMakeLists.txt").read_text(encoding="utf-8")
 
-        self.assertIn("new emote::EmoteDisplay", board)
-        self.assertNotIn("#if CONFIG_USE_EMOTE_MESSAGE_STYLE", board)
-        self.assertNotIn("HotspotQrDisplay", board)
-        self.assertNotIn("GrobotEyes", lcd_h)
-        self.assertNotIn("GrobotEyes", lcd_cc)
-        self.assertFalse((ROOT / "main/boards/lichuang-dev/grobot_eyes.h").exists())
-        self.assertFalse((ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").exists())
-        self.assertNotIn("hutuji_qrcode", main_cmake)
+        # 视线维度进情绪模型与弹簧插值
+        self.assertIn("float lookX;", eyes_h)
+        self.assertIn("float lookY;", eyes_h)
+        self.assertIn("SetSpeaking(bool on)", eyes_h)
+        self.assertIn("SetListening(bool on)", eyes_h)
+        self.assertIn("ApplySpring(c.lookX, c.vLookX, t.lookX, dt_, 120, 18)", eyes_cc)
+        # thinking 看右上（RoboEyes setPosition 语义）
+        self.assertIn("{10, 15, -20, 28, 43, 0.45f, -0.40f}", eyes_cc)
+        # 高光跟随瞳孔而非固定眼心
+        self.assertIn("pcx - eyeR / 4, pcy - eyeR / 4", eyes_cc)
 
-    def test_lichuang_320x240_emote_assets_cover_cloud_emotions(self):
-        """板级 320x240 映射覆盖云端现有情绪；官方 EAF 复用、不复制动画。
-        未知 emotion 由 EmoteDisplay 回落 neutral，不能留下黑屏。"""
-        emote_map_path = ROOT / "main/boards/lichuang-dev/assets/320_240/emote.json"
-        self.assertTrue(emote_map_path.is_file())
-        entries = json.loads(emote_map_path.read_text(encoding="utf-8"))
-        mapped = {entry["emote"] for entry in entries}
-        expected = {
-            "happy", "laughing", "funny", "sad", "angry", "crying", "loving",
-            "embarrassed", "surprised", "shocked", "thinking", "winking", "cool",
-            "relaxed", "delicious", "kissy", "confident", "sleepy", "silly",
-            "confused", "neutral", "idle",
-        }
-        self.assertEqual(mapped, expected)
-        self.assertTrue(all(entry["src"].endswith(".eaf") for entry in entries))
+        # winking 修复：i == 12 右眼全闭（topH=100 与 Blink() 全闭量一致）
+        self.assertIn("i == 12", eyes_cc)
+        wink_line = next(
+            line for line in eyes_cc.splitlines() if "right = {100, 0, 0, 25, 45" in line
+        )
+        self.assertIn("0.15f, 0", wink_line)
 
-        cmake = (ROOT / "main/CMakeLists.txt").read_text(encoding="utf-8")
-        emote_cc = (ROOT / "main/display/emote_display.cc").read_text(encoding="utf-8")
-        self.assertIn("LICHUANG_EMOTE_ASSETS", cmake)
-        self.assertIn('emote_set_anim_emoji(emote_handle_, "neutral")', emote_cc)
-        self.assertIn("Failed to set emotion", emote_cc)
+        # 情绪配色：angry 红 / loving 粉 / thinking 紫 必须在表内
+        self.assertIn("kMoodColors", eyes_cc)
+        self.assertIn("0xFF453A", eyes_cc)
+        self.assertIn("0xFF7EB6", eyes_cc)
+        self.assertIn("0xBF8FFF", eyes_cc)
+        self.assertIn("RecomputePalette(color != 0 ? lv_color_hex(color) : eye_color_default_)", eyes_cc)
+
+        # 说话/聆听钩子：LcdDisplay::SetStatus 先调基类再驱动眼睛
+        self.assertIn("void LcdDisplay::SetStatus(const char* status)", lcd_cc)
+        status_start = lcd_cc.index("void LcdDisplay::SetStatus(const char* status)")
+        status_end = lcd_cc.index("void LcdDisplay::SetEmotion", status_start)
+        status_body = lcd_cc[status_start:status_end]
+        self.assertIn("LvglDisplay::SetStatus(status);", status_body)
+        self.assertIn("grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0)", status_body)
+        self.assertIn("grobot_eyes_->SetListening(std::strcmp(status, Lang::Strings::LISTENING) == 0)", status_body)
+        # 基类调用必须在眼睛驱动之前（状态栏文本不能被截掉）
+        self.assertLess(
+            status_body.index("LvglDisplay::SetStatus(status);"),
+            status_body.index("grobot_eyes_->SetSpeaking"),
+        )
+        # 说话弹跳与聆听放大落在渲染侧
+        self.assertIn("speaking_", eyes_cc)
+        self.assertIn("listening_ ? 1.18f : 1.0f", eyes_cc)
+
+    def test_grobot_eyes_p2_saccade_arc_lids_heart_aa_and_palette(self):
+        """P2 细化包：空闲眼跳（RoboEyes setIdleMode 语义）/ 弧线眼睑 / loving·kissy
+        心形瞳 / 圆边抗锯齿（与底层像素混合）/ 配色族系重排（喜悦族暖金）。"""
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
+            encoding="utf-8"
+        )
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+
+        # 空闲眼跳：非说话/聆听时 1.5~4s 间隔 + 独立软弹簧 + 累加进视线
+        self.assertIn("saccade_interval_ms_ = 1500 + esp_random() % 2500", eyes_cc)
+        self.assertIn("ApplySpring(saccCurX_, saccVelX_, saccX_, dt_, 160, 20)", eyes_cc)
+        self.assertIn("(c.lookX + saccCurX_) * eyeR_px * 0.30f", eyes_cc)
+        sacc_start = eyes_cc.index("// 空闲眼跳")
+        sacc_body = eyes_cc[sacc_start : eyes_cc.index("ApplySpring(saccCurX_", sacc_start)]
+        self.assertIn("!speaking_ && !listening_", sacc_body)
+
+        # 弧线眼睑：逐列抛物线切割，全闭保持平切
+        self.assertIn("BufLidArc", eyes_h)
+        self.assertIn("lidH >= 100 ? lidH : (int)(lidH * (1.0f - 0.45f * nx * nx))", eyes_cc)
+        draw_start = eyes_cc.index("void GrobotEyes::DrawEye")
+        draw_body = eyes_cc[draw_start : eyes_cc.index("void GrobotEyes::Render", draw_start)]
+        self.assertIn("BufLidArc(cx, cy, eyeR, pad, lidH, true)", draw_body)
+        self.assertIn("BufLidArc(cx, cy, eyeR, pad, botH, false)", draw_body)
+        self.assertNotIn("(eyeR + pad) * 2, lidH + pad, bg_color_);", draw_body)
+
+        # 心形瞳：仅 loving(7)/kissy(16)
+        self.assertIn("void GrobotEyes::BufFillHeart", eyes_cc)
+        self.assertIn("mood_index_ == 7 || mood_index_ == 16", eyes_cc)
+        self.assertIn("heartPupil", eyes_h)
+
+        # 抗锯齿：圆边 1px 按覆盖率与底层像素混合（Blend565）
+        self.assertIn("Blend565", eyes_h)
+        self.assertIn("buf_[row * s + cl] = Blend565(cv, buf_[row * s + cl], frac)", eyes_cc)
+
+        # 配色族系：喜悦族暖金进表，happy/laughing/funny/winking 四席
+        self.assertEqual(eyes_cc.count("0xFFCF3F"), 4)
+        self.assertIn("0xD8B4E2", eyes_cc)  # embarrassed 薰衣草
+        self.assertIn("0xBDF3FF", eyes_cc)  # cool 冰蓝
+        self.assertIn("0xFF6B35", eyes_cc)  # delicious 橙
+        self.assertIn("0xFF9770", eyes_cc)  # silly 蜜桃
+
 
 
 if __name__ == "__main__":
