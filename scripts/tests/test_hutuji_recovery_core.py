@@ -1250,6 +1250,22 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("drawBrow", body)
         self.assertNotIn("cx - offset - halfW, yL - tiltL", body)
 
+    def test_grobot_speaking_mouth_is_clean_and_nose_has_contrast(self):
+        """张嘴时只画独立嘴腔/舌色，不叠闭嘴双唇；鼻色对黑底有足够辨识度。"""
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        nose_start = eyes_cc.index("void GrobotEyes::DrawNose")
+        mouth_start = eyes_cc.index("void GrobotEyes::DrawMouth", nose_start)
+        effects_start = eyes_cc.index("void GrobotEyes::DrawFacialEffects", mouth_start)
+        nose_body = eyes_cc[nose_start:mouth_start]
+        mouth_body = eyes_cc[mouth_start:effects_start]
+        self.assertIn("bg_color_, 105", nose_body)
+        self.assertIn("if (open > 5)", mouth_body)
+        self.assertIn("tongue", mouth_body)
+        self.assertIn("return;", mouth_body)
+        self.assertLess(mouth_body.index("return;"), mouth_body.index("int prevX"))
+
 if __name__ == "__main__":
     unittest.main()
 
