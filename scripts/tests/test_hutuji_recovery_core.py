@@ -1136,5 +1136,46 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
 
 
+    def test_grobot_full_face_layers_and_speaking_mouth_contract(self):
+        """全脸升级保持 Grobot renderer：眉毛/嘴巴/腮红泪滴汗滴火花均为程序化
+        LVGL 图层；speaking 通过嘴部开合表达，且脸部画布为 280x190。"""
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
+            encoding="utf-8"
+        )
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+
+        # 全脸参数由情绪 preset 驱动，并用弹簧平滑过渡
+        self.assertIn("struct FacialData", eyes_h)
+        self.assertIn("kFacialMoods", eyes_cc)
+        self.assertIn("ApplyFacialData", eyes_cc)
+        self.assertIn("ApplySpring(curMouthOpen_", eyes_cc)
+        self.assertIn("ApplySpring(curBrowL_", eyes_cc)
+
+        # 程序化图层：不依赖 GIF/Emote 资源
+        self.assertIn("BufFillEllipse", eyes_h)
+        self.assertIn("BufLine", eyes_h)
+        self.assertIn("DrawEyebrows", eyes_cc)
+        self.assertIn("DrawMouth", eyes_cc)
+        self.assertIn("DrawFacialEffects", eyes_cc)
+        self.assertIn("blush", eyes_cc)
+        self.assertIn("tears", eyes_cc)
+        self.assertIn("sweat", eyes_cc)
+        self.assertIn("sparkle", eyes_cc)
+
+        # speaking 的可见反馈是嘴部开合，不只是眼睛 bounce
+        self.assertIn("speaking_ ?", eyes_cc)
+        self.assertIn("mouthOpenTarget", eyes_cc)
+        self.assertIn("DrawMouth", eyes_cc)
+
+        # 给全脸留出纵向构图空间；二维码显示路径不换 renderer
+        self.assertIn("lv_obj_set_size(emoji_box_, 280, 190)", lcd_cc)
+        self.assertNotIn("CONFIG_USE_EMOTE_MESSAGE_STYLE", lcd_cc)
+        self.assertNotIn("otto_emoji_gif", eyes_cc)
+        self.assertNotIn("emote::EmoteDisplay", lcd_cc)
+
+
 if __name__ == "__main__":
     unittest.main()
