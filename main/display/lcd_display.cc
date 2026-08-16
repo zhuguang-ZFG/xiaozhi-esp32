@@ -5,22 +5,87 @@
 #include "settings.h"
 
 #include <esp_err.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
 #include <material_symbols.h>
 #include <noto_emoji.h>
+#include <qrcode.h>
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
 #include "board.h"
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
 #include "boards/lichuang-dev/grobot_eyes.h"
 #endif
 
 #define TAG "LcdDisplay"
+
+namespace {
+
+void QrPixelCallback(esp_qrcode_handle_t qrcode, void* user_data) {
+    auto* modules = static_cast<std::vector<uint8_t>*>(user_data);
+    const int qr_size = esp_qrcode_get_size(qrcode);
+    if (qr_size <= 0 || qr_size > 177) {
+        modules->clear();
+        return;
+    }
+    modules->resize(static_cast<size_t>(qr_size) * qr_size);
+    for (int y = 0; y < qr_size; ++y) {
+        for (int x = 0; x < qr_size; ++x) {
+            (*modules)[static_cast<size_t>(y) * qr_size + x] =
+                esp_qrcode_get_module(qrcode, x, y) ? 1 : 0;
+        }
+    }
+}
+
+std::unique_ptr<LvglImage> BuildProvisioningQrImage(const std::string& payload, int target_size) {
+    std::vector<uint8_t> modules;
+    esp_qrcode_config_t config = {
+        .display_func_with_cb = QrPixelCallback,
+        .max_qrcode_version = 8,
+        .qrcode_ecc_level = ESP_QRCODE_ECC_MED,
+        .user_data = &modules,
+    };
+    if (esp_qrcode_generate(&config, payload.c_str()) != ESP_OK || modules.empty()) {
+        return nullptr;
+    }
+
+    const int qr_size = static_cast<int>(std::sqrt(modules.size()));
+    const int full_size = qr_size + 8;  // ISO/IEC 18004 quiet zone: four modules per side.
+    const int scale = target_size / full_size;
+    if (qr_size <= 0 || scale <= 0) {
+        return nullptr;
+    }
+    const int display_size = full_size * scale;
+    const size_t bytes = static_cast<size_t>(display_size) * display_size * sizeof(uint16_t);
+    auto* pixels = static_cast<uint16_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
+    if (pixels == nullptr) {
+        return nullptr;
+    }
+
+    constexpr uint16_t kForeground = 0x0000;
+    constexpr uint16_t kBackground = 0xFFFF;
+    for (int y = 0; y < display_size; ++y) {
+        for (int x = 0; x < display_size; ++x) {
+            const int module_x = x / scale - 4;
+            const int module_y = y / scale - 4;
+            const bool dark = module_x >= 0 && module_x < qr_size && module_y >= 0 &&
+                              module_y < qr_size &&
+                              modules[static_cast<size_t>(module_y) * qr_size + module_x] != 0;
+            pixels[static_cast<size_t>(y) * display_size + x] = dark ? kForeground : kBackground;
+        }
+    }
+    return std::make_unique<LvglAllocatedImage>(pixels, bytes, display_size, display_size,
+                                                display_size * sizeof(uint16_t),
+                                                LV_COLOR_FORMAT_RGB565);
+}
+
+}  // namespace
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
@@ -81,7 +146,7 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
 
     // Load theme from settings
     Settings settings("display", false);
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     std::string theme_name = "dark";
     settings.SetString("theme", "dark");
 #else
@@ -296,6 +361,69 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
         lv_display_set_offset(display_, offset_x, offset_y);
     }
 }
+void LcdDisplay::EnsureProvisioningQrUi() {
+    if (provisioning_qr_root_ != nullptr) {
+        return;
+    }
+
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    provisioning_qr_root_ = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(provisioning_qr_root_, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_radius(provisioning_qr_root_, 0, 0);
+    lv_obj_set_style_border_width(provisioning_qr_root_, 0, 0);
+    lv_obj_set_style_bg_color(provisioning_qr_root_, theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(provisioning_qr_root_, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(provisioning_qr_root_, 0, 0);
+    lv_obj_set_flex_flow(provisioning_qr_root_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(provisioning_qr_root_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(provisioning_qr_root_, theme->spacing(4), 0);
+    lv_obj_clear_flag(provisioning_qr_root_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(provisioning_qr_root_, LV_OBJ_FLAG_CLICKABLE);
+
+    provisioning_qr_code_ = lv_image_create(provisioning_qr_root_);
+    provisioning_qr_hint_ = lv_label_create(provisioning_qr_root_);
+    lv_obj_set_width(provisioning_qr_hint_, LV_HOR_RES - theme->spacing(8));
+    lv_obj_set_style_text_font(provisioning_qr_hint_, theme->text_font()->font(), 0);
+    lv_obj_set_style_text_color(provisioning_qr_hint_, theme->text_color(), 0);
+    lv_obj_set_style_text_align(provisioning_qr_hint_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(provisioning_qr_hint_, LV_LABEL_LONG_WRAP);
+    lv_obj_add_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void LcdDisplay::ShowProvisioningQr(const std::string& payload, const std::string& hint) {
+    DisplayLockGuard lock(this);
+    EnsureProvisioningQrUi();
+    if (provisioning_qr_root_ == nullptr) {
+        return;
+    }
+
+    const int target_size = height_ >= 300 ? 200 : 150;
+    auto image = BuildProvisioningQrImage(payload, target_size);
+    if (image == nullptr) {
+        ESP_LOGE(TAG, "Failed to generate provisioning QR code");
+        lv_obj_add_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(provisioning_qr_code_, nullptr);
+        provisioning_qr_image_.reset();
+        return;
+    }
+
+    lv_image_set_src(provisioning_qr_code_, nullptr);
+    provisioning_qr_image_ = std::move(image);
+    lv_image_set_src(provisioning_qr_code_, provisioning_qr_image_->image_dsc());
+    lv_obj_move_foreground(provisioning_qr_root_);
+    lv_obj_remove_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void LcdDisplay::HideProvisioningQr() {
+    DisplayLockGuard lock(this);
+    if (provisioning_qr_root_ == nullptr) {
+        return;
+    }
+    lv_obj_add_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_src(provisioning_qr_code_, nullptr);
+    provisioning_qr_image_.reset();
+}
 
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
@@ -309,6 +437,13 @@ LcdDisplay::~LcdDisplay() {
     if (preview_timer_ != nullptr) {
         esp_timer_stop(preview_timer_);
         esp_timer_delete(preview_timer_);
+    }
+    if (provisioning_qr_root_ != nullptr) {
+        lv_obj_del(provisioning_qr_root_);
+        provisioning_qr_root_ = nullptr;
+        provisioning_qr_code_ = nullptr;
+        provisioning_qr_hint_ = nullptr;
+        provisioning_qr_image_.reset();
     }
 
     if (preview_image_ != nullptr) {
@@ -359,6 +494,46 @@ LcdDisplay::~LcdDisplay() {
 bool LcdDisplay::Lock(int timeout_ms) { return lvgl_port_lock(timeout_ms); }
 
 void LcdDisplay::Unlock() { lvgl_port_unlock(); }
+void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
+                                     const lv_font_t* large_icon_font) {
+    emoji_box_ = lv_obj_create(screen);
+    lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(emoji_box_, 0, 0);
+    lv_obj_set_style_border_width(emoji_box_, 0, 0);
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+
+    emoji_label_ = lv_label_create(emoji_box_);
+    lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
+    lv_obj_set_style_text_color(emoji_label_, theme->text_color(), 0);
+    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_EDIT_SQUARE);
+
+    emoji_image_ = lv_image_create(emoji_box_);
+    lv_obj_center(emoji_image_);
+    lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
+    auto eye_color = lv_color_make(0x00, 0xD4, 0xFF);
+    auto eyes = std::make_unique<GrobotEyes>(eye_color, theme->background_color());
+#if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+    // 480x320 横屏：四边仅留约 10px 安全边距，状态栏继续独立叠在最前层。
+    constexpr int kFaceWidth = 460;
+    constexpr int kFaceHeight = 300;
+#else
+    constexpr int kFaceWidth = 280;
+    constexpr int kFaceHeight = 190;
+#endif
+    lv_obj_set_size(emoji_box_, kFaceWidth, kFaceHeight);
+    if (eyes->Init(emoji_box_, kFaceWidth, kFaceHeight)) {
+        grobot_eyes_ = std::move(eyes);
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "GrobotEyes initialized: %dx%d", kFaceWidth, kFaceHeight);
+    } else {
+        ESP_LOGE(TAG, "Failed to initialize GrobotEyes; using emoji fallback");
+    }
+#endif
+}
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
 void LcdDisplay::SetupUI() {
@@ -499,16 +674,10 @@ void LcdDisplay::SetupUI() {
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
 
-    emoji_image_ = lv_img_create(screen);
-    lv_obj_align(emoji_image_, LV_ALIGN_TOP_MID, 0,
-                 text_font->line_height + lvgl_theme->spacing(8));
-
-    // Display AI logo while booting
-    emoji_label_ = lv_label_create(screen);
-    lv_obj_center(emoji_label_);
-    lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
-    lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_EDIT_SQUARE);
+    InitializeEmotionUi(screen, lvgl_theme, large_icon_font);
+    if (provisioning_qr_root_ != nullptr) {
+        lv_obj_move_foreground(provisioning_qr_root_);
+    }
 }
 #if CONFIG_IDF_TARGET_ESP32P4
 #define MAX_MESSAGES 40
@@ -520,7 +689,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
                  role, content);
     }
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     if (grobot_eyes_ != nullptr) {
         // 全脸模式保留状态栏与情绪，不让聊天气泡/字幕覆盖嘴巴和下半脸。
         DisplayLockGuard lock(this);
@@ -833,7 +1002,7 @@ void LcdDisplay::ClearChatMessages() {
     chat_message_label_ = nullptr;
 
     // Grobot 全脸没有独立 AI logo；其它 LVGL 聊天界面清屏后才恢复 logo。
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     if (grobot_eyes_ == nullptr && emoji_label_ != nullptr) {
         lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
@@ -874,37 +1043,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     lv_obj_set_style_border_color(container_, lvgl_theme->border_color(), 0);
 
-    /* Bottom layer: emoji_box_ - centered display */
-    emoji_box_ = lv_obj_create(screen);
-    lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_all(emoji_box_, 0, 0);
-    lv_obj_set_style_border_width(emoji_box_, 0, 0);
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
-
-    emoji_label_ = lv_label_create(emoji_box_);
-    lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
-    lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_EDIT_SQUARE);
-
-    emoji_image_ = lv_img_create(emoji_box_);
-    lv_obj_center(emoji_image_);
-    lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
-    {
-        auto eye_c = lv_color_make(0x00, 0xD4, 0xFF);
-        auto eyes = std::make_unique<GrobotEyes>(eye_c, lvgl_theme->background_color());
-        lv_obj_set_size(emoji_box_, 280, 190);
-        if (eyes->Init(emoji_box_, 280, 190)) {
-            grobot_eyes_ = std::move(eyes);
-            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            ESP_LOGE(TAG, "Failed to initialize GrobotEyes; using emoji fallback");
-        }
-    }
-#endif
+    /* Bottom layer: Grobot face or emoji fallback, centered on the screen. */
+    InitializeEmotionUi(screen, lvgl_theme, large_icon_font);
 
     /* Middle layer: preview_image_ - centered display */
     preview_image_ = lv_image_create(screen);
@@ -1055,6 +1195,9 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+    if (provisioning_qr_root_ != nullptr) {
+        lv_obj_move_foreground(provisioning_qr_root_);
+    }
 }
 
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
@@ -1098,7 +1241,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
                  role, content);
     }
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     if (grobot_eyes_ != nullptr) {
         // 全脸模式保留状态栏与情绪，不让聊天气泡/字幕覆盖嘴巴和下半脸。
         DisplayLockGuard lock(this);
@@ -1153,7 +1296,7 @@ void LcdDisplay::ClearChatMessages() {
 #endif
 void LcdDisplay::SetStatus(const char* status) {
     LvglDisplay::SetStatus(status);
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     // 说话/聆听状态驱动全脸：说话嘴部开合+微弹跳、聆听瞳孔放大。
     // 状态写入与 33ms LVGL timer 读取必须在同一显示锁内。
     if (grobot_eyes_ != nullptr && status != nullptr) {
@@ -1169,7 +1312,7 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
                  emotion);
     }
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     if (grobot_eyes_) {
         DisplayLockGuard lock(this);
         grobot_eyes_->SetEmotion(emotion);

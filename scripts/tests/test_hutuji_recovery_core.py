@@ -765,7 +765,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("mpos_seq", fallback)
 
     def test_open_hotspot_wifi_qr_payload_escapes_ssid(self):
-        """扫码连小智热点只传 open SoftAP 的 SSID；SSID 分隔符必须按 ZXing 规则转义。"""
+        """二维码 payload 按 ZXing 规则转义，LCD 共享覆盖层覆盖两块板。"""
         compiler = find_compiler()
         if compiler is None:
             self.skipTest("no supported host C++ compiler found")
@@ -773,17 +773,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         source = textwrap.dedent(
             r"""
             #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
-
             #include <cassert>
             #include <string>
-
             int main() {
                 assert(hutuji::BuildOpenHotspotWifiQrPayload("Xiaozhi-ABCD") ==
                        "WIFI:T:nopass;S:Xiaozhi-ABCD;;");
                 assert(hutuji::BuildOpenHotspotWifiQrPayload("My;Wifi:Name\\x,\"y\"") ==
                        "WIFI:T:nopass;S:My\\;Wifi\\:Name\\\\x\\,\\\"y\\\";;");
-                assert(hutuji::BuildOpenHotspotWifiQrPayload("Xiaozhi-ABCD")
-                           .find("P:") == std::string::npos);
                 return 0;
             }
             """
@@ -791,22 +787,68 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self._compile_and_run(compiler, source, stem="hutuji_hotspot_qr_test")
 
         component = ROOT / "components/hutuji_qrcode/include/qrcode.h"
-        board = (ROOT / "main/boards/lichuang-dev/lichuang_dev_board.cc").read_text(
+        display_h = (ROOT / "main/display/display.h").read_text(encoding="utf-8")
+        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        lichuang = (ROOT / "main/boards/lichuang-dev/lichuang_dev_board.cc").read_text(
+            encoding="utf-8"
+        )
+        waveshare = (ROOT / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc").read_text(
             encoding="utf-8"
         )
         self.assertTrue(component.is_file())
-        self.assertIn("esp_qrcode_generate", board)
-        self.assertIn("BuildOpenHotspotWifiQrPayload", board)
-        self.assertIn("void SetNetworkEventCallback(NetworkEventCallback callback) override", board)
-        self.assertIn("WifiBoard::SetNetworkEventCallback(", board)
-        self.assertIn("callback = std::move(callback)", board)
-        self.assertNotIn("ConfigureHotspotQrCallback();", board)
-        callback_start = board.index("void SetNetworkEventCallback(NetworkEventCallback callback) override")
-        callback_end = board.index("    LichuangDevBoard()", callback_start)
-        callback_body = board[callback_start:callback_end]
-        self.assertIn("WifiConfigModeEnter", callback_body)
-        self.assertIn("WifiConfigModeExit", callback_body)
-        self.assertIn("if (callback)", callback_body)
+        self.assertIn("virtual void ShowProvisioningQr", display_h)
+        self.assertIn("void ShowProvisioningQr", lcd_h)
+        self.assertIn("esp_qrcode_generate", lcd_cc)
+        self.assertIn("LV_OBJ_FLAG_CLICKABLE", lcd_cc)
+        self.assertIn("LV_OBJ_FLAG_SCROLLABLE", lcd_cc)
+        for board, constructor in ((lichuang, "LichuangDevBoard"), (waveshare, "CustomBoard")):
+            self.assertIn("BuildOpenHotspotWifiQrPayload", board)
+            self.assertIn("void SetNetworkEventCallback(NetworkEventCallback callback) override", board)
+            self.assertIn("WifiBoard::SetNetworkEventCallback(", board)
+            self.assertIn("callback = std::move(callback)", board)
+            callback_start = board.index("void SetNetworkEventCallback(NetworkEventCallback callback) override")
+            callback_end = board.index(f"\n    {constructor}(", callback_start)
+            callback_body = board[callback_start:callback_end]
+            self.assertIn("WifiConfigModeEnter", callback_body)
+            self.assertIn("WifiConfigModeExit", callback_body)
+            self.assertIn("ShowProvisioningQr", callback_body)
+            self.assertIn("HideProvisioningQr", callback_body)
+            self.assertIn("if (callback)", callback_body)
+        self.assertNotIn("class HotspotQrDisplay", lichuang)
+
+    def test_waveshare_uses_grobot_face_gate_and_scaled_canvas(self):
+        """Waveshare 使用独立 Grobot 门控、460x300 画布，且两套 UI 都初始化。"""
+        cmake = (ROOT / "main/CMakeLists.txt").read_text(encoding="utf-8")
+        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        self.assertIn("HUTUJI_GROBOT_FACE", cmake)
+        self.assertIn("boards/lichuang-dev/grobot_eyes.cc", cmake)
+        self.assertIn("CONFIG_HUTUJI_GROBOT_FACE", lcd_h)
+        self.assertIn("CONFIG_HUTUJI_GROBOT_FACE", lcd_cc)
+        self.assertIn("constexpr int kFaceWidth = 460", lcd_cc)
+        self.assertIn("constexpr int kFaceHeight = 300", lcd_cc)
+        self.assertIn("void LcdDisplay::InitializeEmotionUi", lcd_cc)
+        self.assertEqual(lcd_cc.count("InitializeEmotionUi(screen, lvgl_theme, large_icon_font)"), 2)
+    def test_waveshare_writer_keeps_power_on_after_idle(self):
+        """写字机需保持联网待命：可降亮度，但不得五分钟后由 AXP2101 断电。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PowerSaveTimer(-1, 60, -1)", board)
+        self.assertIn("pmic_->PowerOff()", board)
+    def test_waveshare_boot_button_wakes_power_save(self):
+        """省电后按 BOOT 必须先恢复背光和正常电源状态，再切换聊天。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        start = board.index("void InitializeButtons()")
+        end = board.index("    // 初始化工具", start)
+        body = board[start:end]
+        self.assertIn("power_save_timer_->WakeUp();", body)
+        self.assertLess(body.index("power_save_timer_->WakeUp();"), body.index("app.ToggleChatState();"))
 
     def test_window_error_requests_immediate_hold_and_controlled_reset(self):
         """P1：窗口 error 后 RX 后续行仍会执行；必须立即 hold 并在退窗后受控 reset。"""
@@ -1172,8 +1214,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("mouthOpenTarget", eyes_cc)
         self.assertIn("DrawMouth", eyes_cc)
 
-        # 给全脸留出纵向构图空间；二维码显示路径不换 renderer
-        self.assertIn("lv_obj_set_size(emoji_box_, 280, 190)", lcd_cc)
+        # 给全脸留出纵向构图空间；Waveshare 使用更大画布，二维码显示路径不换 renderer
+        self.assertIn("constexpr int kFaceWidth = 460", lcd_cc)
+        self.assertIn("constexpr int kFaceHeight = 300", lcd_cc)
         self.assertNotIn("CONFIG_USE_EMOTE_MESSAGE_STYLE", lcd_cc)
         self.assertNotIn("otto_emoji_gif", eyes_cc)
         self.assertNotIn("emote::EmoteDisplay", lcd_cc)
@@ -1229,9 +1272,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self.assertIn("DrawNose", eyes_h)
         self.assertIn("void GrobotEyes::DrawNose", eyes_cc)
-        self.assertIn("DrawNose(cx", eyes_cc)
-        self.assertIn("const int width = eyeR + 28", eyes_cc)
-        self.assertIn("const int lipGap = std::max(3, open / 2)", eyes_cc)
+        self.assertIn("const int width = eyeR * 9 / 5", eyes_cc)
+        self.assertIn("const int lipGap = std::max(4, open / 2)", eyes_cc)
         self.assertIn("upperY", eyes_cc)
         self.assertIn("lowerY", eyes_cc)
         self.assertIn("{0, 0, 0, 0, 0.22f, 0.16f", eyes_cc)
@@ -1247,6 +1289,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("for (int i = 1; i <= 12; i++)", body)
         self.assertIn("1.0f - nx * nx", body)
         self.assertIn("browArch", body)
+        self.assertIn("const int halfW = eyeR * 4 / 5", body)
+        self.assertIn("const int browArch = std::max(10, eyeR / 6)", body)
+        self.assertIn("const int browWeight = std::max(2, eyeR / 20)", body)
+        self.assertIn("browGlowWeight", body)
+        self.assertIn("glow_[0]", body)
+        self.assertIn("brow, browWeight", body)
         self.assertIn("drawBrow", body)
         self.assertNotIn("cx - offset - halfW, yL - tiltL", body)
 
@@ -1260,9 +1308,14 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         effects_start = eyes_cc.index("void GrobotEyes::DrawFacialEffects", mouth_start)
         nose_body = eyes_cc[nose_start:mouth_start]
         mouth_body = eyes_cc[mouth_start:effects_start]
-        self.assertIn("bg_color_, 105", nose_body)
+        self.assertIn("bg_color_, 145", nose_body)
+        self.assertIn("const int noseRx = std::max(12, eyeR / 4)", nose_body)
+        self.assertIn("noseHighlight", nose_body)
+        self.assertNotIn("BufFillEllipse(cx, noseY - 1", nose_body)
         self.assertIn("if (open > 5)", mouth_body)
         self.assertIn("tongue", mouth_body)
+        self.assertIn("upperLipWeight", mouth_body)
+        self.assertIn("lowerLipWeight", mouth_body)
         self.assertIn("return;", mouth_body)
         self.assertLess(mouth_body.index("return;"), mouth_body.index("int prevX"))
 
@@ -1301,7 +1354,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("if (timer_ == nullptr)", init_body)
         self.assertIn("return false", init_body)
         self.assertIn("return true", init_body)
-        self.assertIn("if (eyes->Init(emoji_box_, 280, 190))", lcd_cc)
+        self.assertIn("if (eyes->Init(emoji_box_, kFaceWidth, kFaceHeight))", lcd_cc)
         self.assertIn("Failed to initialize GrobotEyes", lcd_cc)
 
         self.assertIn("static_assert(std::size(kMoods) == std::size(kNames))", eyes_cc)

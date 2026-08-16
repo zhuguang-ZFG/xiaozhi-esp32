@@ -310,13 +310,15 @@ void GrobotEyes::BufLine(int x0, int y0, int x1, int y1, lv_color_t c, int thick
 }
 
 void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
-    const int yL = cy - eyeR - 24 - (int)(face_cur_.browLiftL * 18);
-    const int yR = cy - eyeR - 24 - (int)(face_cur_.browLiftR * 18);
-    const int halfW = eyeR * 2 / 3;
+    const int yL = cy - eyeR - eyeR / 2 - (int)(face_cur_.browLiftL * eyeR * 2 / 5);
+    const int yR = cy - eyeR - eyeR / 2 - (int)(face_cur_.browLiftR * eyeR * 2 / 5);
+    const int halfW = eyeR * 4 / 5;
     const int tiltL = (int)(face_cur_.browTiltL * 0.35f);
     const int tiltR = (int)(face_cur_.browTiltR * 0.35f);
-    const int browArch = 8;
-    const lv_color_t brow = lv_color_mix(eye_color_, lv_color_white(), 45);
+    const int browArch = std::max(10, eyeR / 6);
+    const int browWeight = std::max(2, eyeR / 20);
+    const int browGlowWeight = browWeight + 1;
+    const lv_color_t brow = lv_color_mix(eye_color_, lv_color_white(), 55);
     auto drawBrow = [&](int browCx, int browY, int tilt) {
         int prevX = browCx - halfW;
         int prevY = browY - tilt;
@@ -325,7 +327,8 @@ void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
             const int x = browCx - halfW + 2 * halfW * i / 12;
             const int slope = -tilt + 2 * tilt * i / 12;
             const int y = browY + slope - (int)(browArch * (1.0f - nx * nx));
-            BufLine(prevX, prevY, x, y, brow, 2);
+            BufLine(prevX, prevY + 2, x, y + 2, glow_[0], browGlowWeight);
+            BufLine(prevX, prevY, x, y, brow, browWeight);
             prevX = x;
             prevY = y;
         }
@@ -335,27 +338,34 @@ void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
 }
 
 void GrobotEyes::DrawNose(int cx, int cy, int eyeR) {
-    const int noseY = cy + eyeR / 2 + 3;
-    const lv_color_t nose = lv_color_mix(eye_color_, bg_color_, 105);
-    // 低对比度圆角胶囊：给全脸一个中心锚点，但不画写实鼻梁/鼻孔。
-    BufFillEllipse(cx, noseY, 9, 4, nose);
-    BufFillEllipse(cx, noseY - 1, 6, 2, bg_color_);
+    const int noseY = cy + eyeR / 2 + std::max(4, eyeR / 12);
+    const int noseRx = std::max(12, eyeR / 4);
+    const int noseRy = std::max(6, eyeR / 9);
+    const lv_color_t nose = lv_color_mix(eye_color_, bg_color_, 145);
+    const lv_color_t noseHighlight = lv_color_mix(lv_color_white(), eye_color_, 45);
+    // 实体圆角机器人鼻：比旧挖空短划更像完整五官，但仍弱于眼睛和嘴。
+    BufFillEllipse(cx, noseY, noseRx, noseRy, glow_[1]);
+    BufFillEllipse(cx, noseY, noseRx - 2, noseRy - 2, nose);
+    BufLine(cx - noseRx / 2, noseY - noseRy / 2, cx + noseRx / 3, noseY - noseRy / 2, noseHighlight,
+            1);
 }
 
 void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
-    const int width = eyeR + 28;
-    const int curve = (int)(face_cur_.mouthCurve * 18);
-    const int open = std::max(2, (int)(face_cur_.mouthOpen * 22));
-    const int lipGap = std::max(3, open / 2);
-    const int mouthY = cy + eyeR + 19;
+    const int width = eyeR * 9 / 5;
+    const int curve = (int)(face_cur_.mouthCurve * eyeR * 2 / 5);
+    const int open = std::max(3, (int)(face_cur_.mouthOpen * eyeR / 2));
+    const int lipGap = std::max(4, open / 2);
+    const int mouthY = cy + eyeR + eyeR * 2 / 5;
     const int upperY = mouthY - lipGap / 2;
     const int lowerY = mouthY + lipGap / 2;
-    const lv_color_t mouth = lv_color_mix(eye_color_, lv_color_white(), 35);
+    const lv_color_t mouth = lv_color_mix(eye_color_, lv_color_white(), 45);
+    const int upperLipWeight = std::max(2, eyeR / 20);
+    const int lowerLipWeight = std::max(1, eyeR / 28);
     if (open > 5) {
         const lv_color_t tongue = lv_color_hex(0xFF7EB6);
         BufFillEllipse(cx, mouthY + curve / 4, width / 2, open, mouth);
-        BufFillEllipse(cx, mouthY + curve / 4, width / 2 - 3, std::max(2, open - 3), bg_color_);
-        BufFillEllipse(cx, mouthY + open / 2 + curve / 4, width / 3, std::max(2, open / 3), tongue);
+        BufFillEllipse(cx, mouthY + curve / 4, width / 2 - 4, std::max(3, open - 4), bg_color_);
+        BufFillEllipse(cx, mouthY + open / 2 + curve / 4, width / 3, std::max(3, open / 3), tongue);
         return;
     }
     int prevX = cx - width / 2;
@@ -367,8 +377,8 @@ void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
         const int arc = (int)(curve * (1.0f - nx * nx));
         const int nextUpperY = upperY + arc;
         const int nextLowerY = lowerY + arc / 2;
-        BufLine(prevX, prevUpperY, x, nextUpperY, mouth, 2);
-        BufLine(prevX, prevLowerY, x, nextLowerY, glow_[2], 1);
+        BufLine(prevX, prevUpperY, x, nextUpperY, mouth, upperLipWeight);
+        BufLine(prevX, prevLowerY, x, nextLowerY, glow_[2], lowerLipWeight);
         prevX = x;
         prevUpperY = nextUpperY;
         prevLowerY = nextLowerY;

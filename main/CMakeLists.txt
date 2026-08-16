@@ -439,6 +439,7 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    set(HUTUJI_GROBOT_FACE TRUE)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-touch-lcd-3.5b")
@@ -887,6 +888,15 @@ else()
     )
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
+    list(APPEND SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pipe.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_job.cc
+    )
+endif()
+if(HUTUJI_GROBOT_FACE AND NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+    list(APPEND SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/grobot_eyes.cc)
+endif()
 
 # Select one audio engine for each chip family
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
@@ -1101,6 +1111,9 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     PRIVATE TEXT_FONT_SIZE=${TEXT_FONT_SIZE} TEXT_FONT_BPP=${TEXT_FONT_BPP}
                     )
+if(HUTUJI_GROBOT_FACE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE CONFIG_HUTUJI_GROBOT_FACE=1)
+endif()
 
 option(HUTUJI_AUTO_TEST_DRAW "Enable hutuji auto-test draw on lichuang-dev after pipe ready" OFF)
 set(HUTUJI_AUTO_TEST_DRAW_URL "" CACHE STRING "hutuji auto-test G-code URL; keep empty unless building a local test image")

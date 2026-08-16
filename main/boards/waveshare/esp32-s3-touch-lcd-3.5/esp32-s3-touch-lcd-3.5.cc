@@ -3,6 +3,9 @@
 #include "display/lcd_display.h"
 #include "system_reset.h"
 #include "application.h"
+#include "boards/lichuang-dev/hutuji_job.h"
+#include "boards/lichuang-dev/hutuji_pipe.h"
+#include "boards/lichuang-dev/hutuji_recovery_core.h"
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
@@ -16,6 +19,7 @@
 #include <esp_lcd_panel_ops.h>
 
 #include <esp_timer.h>
+#include <wifi_manager.h>
 #include "esp_io_expander_tca9554.h"
 
 #include "axp2101.h"
@@ -109,7 +113,8 @@ private:
     EspVideo* camera_;
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // 写字机需长期保持 Wi-Fi/Telnet 待命；保留低亮度省电，禁用五分钟自动断电。
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(20);
@@ -297,6 +302,7 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            power_save_timer_->WakeUp();
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -315,6 +321,66 @@ private:
             PropertyList(), [this](const PropertyList& properties) {
                 EnterWifiConfigMode();
                 return true;
+            });
+
+        // hutuji 写字机 Telnet 哑管道（TCP 客户端 → Grbl_Esp32 Telnet:23）。
+        hutuji::Pipe::GetInstance().Start();
+
+        mcp_server.AddTool("hutuji.status",
+            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、任务状态。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().StatusJson();
+            });
+
+        mcp_server.AddTool("hutuji.draw",
+            "执行出纸：url 必须是云端 hutuji_draw 返回的 G-code 下载地址。",
+            PropertyList({Property("url", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string& url = properties["url"].value<std::string>();
+                return hutuji::Job::GetInstance().StartDraw(url);
+            });
+
+        mcp_server.AddTool("hutuji.abort", "中止当前绘图转发。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestAbort();
+            });
+
+        mcp_server.AddTool("hutuji.pause", "暂停当前绘图（可恢复）。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestPause();
+            });
+
+        mcp_server.AddTool("hutuji.resume", "恢复之前暂停的绘图。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestResume();
+            });
+
+        mcp_server.AddTool("hutuji.repeat", "把上一张画再画一遍。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestRepeat();
+            });
+
+        mcp_server.AddTool("hutuji.pen_test", "笔测试：落笔停 1 秒再抬笔。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestPenTest();
+            });
+    }
+
+    void SetNetworkEventCallback(NetworkEventCallback callback) override {
+        WifiBoard::SetNetworkEventCallback(
+            [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
+                if (event == NetworkEvent::WifiConfigModeEnter) {
+                    const std::string ap_ssid = WifiManager::GetInstance().GetApSsid();
+                    display_->ShowProvisioningQr(
+                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid),
+                        "Scan: " + ap_ssid + "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
+                } else if (event == NetworkEvent::WifiConfigModeExit ||
+                           event == NetworkEvent::Connected) {
+                    display_->HideProvisioningQr();
+                }
+                if (callback) {
+                    callback(event, data);
+                }
             });
     }
 

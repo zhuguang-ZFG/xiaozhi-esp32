@@ -37,136 +37,9 @@
 #include <lvgl.h>
 #include <stdexcept>
 
-#include <qrcode.h>
 #include <wifi_manager.h>
-#include "display/lvgl_display/lvgl_image.h"
 #include "display/lvgl_display/lvgl_theme.h"
 #include "hutuji_recovery_core.h"
-
-/** Lichuang 热点配网二维码页：只编码设备 open SoftAP 的 SSID，不包含家庭 Wi-Fi 凭据。 */
-class HotspotQrDisplay : public SpiLcdDisplay {
-public:
-    using SpiLcdDisplay::SpiLcdDisplay;
-
-    void ShowHotspotQr(const std::string& ap_ssid, const std::string& portal_url) {
-        EnsureQrUi();
-        DisplayLockGuard lock(this);
-        if (qr_root_ == nullptr) {
-            return;
-        }
-        std::string payload = hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid);
-        auto image = BuildQrImage(payload);
-        if (image == nullptr) {
-            return;
-        }
-        lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        qr_image_ = std::move(image);
-        lv_image_set_src(qr_code_, qr_image_->image_dsc());
-        // 只放 ASCII：当前动态字形/字体缓存链路对配网页中文布局有运行时风险，先保
-        // 证扫码路径稳定；中文说明仍由原有通知/语音链路承担。
-        lv_label_set_text(qr_hint_, ("Scan: " + ap_ssid + "\nOpen: " + portal_url).c_str());
-        lv_obj_clear_flag(qr_root_, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    void HideHotspotQr() {
-        DisplayLockGuard lock(this);
-        if (qr_root_ == nullptr) {
-            return;
-        }
-        lv_obj_add_flag(qr_root_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-        qr_image_.reset();
-    }
-    void SetupUI() override { SpiLcdDisplay::SetupUI(); }
-
-private:
-    void EnsureQrUi() {
-        if (qr_root_ != nullptr) {
-            return;
-        }
-        DisplayLockGuard lock(this);
-        auto* theme = static_cast<LvglTheme*>(current_theme_);
-        qr_root_ = lv_obj_create(lv_screen_active());
-        lv_obj_set_size(qr_root_, LV_HOR_RES, LV_VER_RES);
-        lv_obj_set_style_radius(qr_root_, 0, 0);
-        lv_obj_set_style_border_width(qr_root_, 0, 0);
-        lv_obj_set_style_bg_color(qr_root_, theme->background_color(), 0);
-        lv_obj_set_style_pad_all(qr_root_, 0, 0);
-        lv_obj_set_flex_flow(qr_root_, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(qr_root_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_row(qr_root_, theme->spacing(4), 0);
-        lv_obj_clear_flag(qr_root_, LV_OBJ_FLAG_SCROLLABLE);
-
-        qr_code_ = lv_image_create(qr_root_);
-        lv_obj_set_size(qr_code_, 150, 150);
-
-        qr_hint_ = lv_label_create(qr_root_);
-        lv_obj_set_width(qr_hint_, LV_HOR_RES - theme->spacing(8));
-        lv_obj_set_style_text_font(qr_hint_, theme->text_font()->font(), 0);
-        lv_obj_set_style_text_align(qr_hint_, LV_TEXT_ALIGN_CENTER, 0);
-        lv_label_set_long_mode(qr_hint_, LV_LABEL_LONG_WRAP);
-        lv_obj_add_flag(qr_root_, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    static void QrPixelCallback(esp_qrcode_handle_t qrcode, void* user_data) {
-        auto* out = static_cast<std::vector<uint8_t>*>(user_data);
-        const int qr_size = esp_qrcode_get_size(qrcode);
-        out->resize(qr_size * qr_size);
-        for (int y = 0; y < qr_size; ++y) {
-            for (int x = 0; x < qr_size; ++x) {
-                (*out)[y * qr_size + x] = esp_qrcode_get_module(qrcode, x, y) ? 1 : 0;
-            }
-        }
-    }
-
-public:
-    ~HotspotQrDisplay() {
-        if (qr_root_ != nullptr) {
-            lv_obj_del(qr_root_);
-        }
-    }
-
-    static std::unique_ptr<LvglImage> BuildQrImage(const std::string& payload) {
-        std::vector<uint8_t> modules;
-        esp_qrcode_config_t config = {
-            .display_func_with_cb = QrPixelCallback,
-            .max_qrcode_version = 8,
-            .qrcode_ecc_level = ESP_QRCODE_ECC_MED,
-            .user_data = &modules,
-        };
-        if (esp_qrcode_generate(&config, payload.c_str()) != ESP_OK || modules.empty()) {
-            return nullptr;
-        }
-        const int qr_size = static_cast<int>(std::sqrt(modules.size()));
-        const int scale = 150 / qr_size;
-        const int display_size = qr_size * (scale < 1 ? 1 : scale);
-        auto* pixels = static_cast<uint8_t*>(
-            heap_caps_malloc(display_size * display_size * 2, MALLOC_CAP_SPIRAM));
-        if (pixels == nullptr) {
-            return nullptr;
-        }
-        auto* rgb = reinterpret_cast<uint16_t*>(pixels);
-        const uint16_t foreground = 0x0000;
-        const uint16_t background = 0xFFFF;
-        for (int y = 0; y < display_size; ++y) {
-            for (int x = 0; x < display_size; ++x) {
-                rgb[y * display_size + x] =
-                    modules[(y / scale) * qr_size + (x / scale)] ? foreground : background;
-            }
-        }
-        return std::make_unique<LvglAllocatedImage>(pixels, display_size * display_size * 2,
-                                                    display_size, display_size, display_size * 2,
-                                                    LV_COLOR_FORMAT_RGB565);
-    }
-
-    lv_obj_t* qr_root_ = nullptr;
-    lv_obj_t* qr_code_ = nullptr;
-    lv_obj_t* qr_hint_ = nullptr;
-    std::unique_ptr<LvglImage> qr_image_;
-};
 
 #define TAG "LichuangDevBoard"
 
@@ -322,9 +195,9 @@ private:
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
         display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 #else
-        display_ = new HotspotQrDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
-                                        DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
-                                        DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                     DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                     DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 #endif
     }
 
@@ -552,12 +425,13 @@ public:
         WifiBoard::SetNetworkEventCallback(
             [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
                 if (event == NetworkEvent::WifiConfigModeEnter) {
-                    static_cast<HotspotQrDisplay*>(display_)->ShowHotspotQr(
-                        WifiManager::GetInstance().GetApSsid(),
-                        WifiManager::GetInstance().GetApWebUrl());
+                    const std::string ap_ssid = WifiManager::GetInstance().GetApSsid();
+                    display_->ShowProvisioningQr(
+                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid),
+                        "Scan: " + ap_ssid + "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
                 } else if (event == NetworkEvent::WifiConfigModeExit ||
                            event == NetworkEvent::Connected) {
-                    static_cast<HotspotQrDisplay*>(display_)->HideHotspotQr();
+                    display_->HideProvisioningQr();
                 }
                 if (callback) {
                     callback(event, data);

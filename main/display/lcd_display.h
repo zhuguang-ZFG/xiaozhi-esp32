@@ -9,11 +9,13 @@
 #include <atomic>
 #include <memory>
 
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
 class GrobotEyes;
 #endif
 
 #define PREVIEW_IMAGE_DURATION_MS 5000
+
+class LvglTheme;
 
 class LcdDisplay : public LvglDisplay {
 protected:
@@ -36,11 +38,17 @@ protected:
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
-#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    lv_obj_t* provisioning_qr_root_ = nullptr;
+    lv_obj_t* provisioning_qr_code_ = nullptr;
+    lv_obj_t* provisioning_qr_hint_ = nullptr;
+    std::unique_ptr<LvglImage> provisioning_qr_image_;
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     std::unique_ptr<GrobotEyes> grobot_eyes_;
 #endif
 
     void InitializeLcdThemes();
+    void EnsureProvisioningQrUi();
+    void InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme, const lv_font_t* large_icon_font);
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 
@@ -53,6 +61,8 @@ public:
     ~LcdDisplay();
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetStatus(const char* status) override;
+    virtual void ShowProvisioningQr(const std::string& payload, const std::string& hint) override;
+    virtual void HideProvisioningQr() override;
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
