@@ -1091,6 +1091,50 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("speaking_", eyes_cc)
         self.assertIn("listening_ ? 1.18f : 1.0f", eyes_cc)
 
+    def test_grobot_eyes_p2_saccade_arc_lids_heart_aa_and_palette(self):
+        """P2 细化包：空闲眼跳（RoboEyes setIdleMode 语义）/ 弧线眼睑 / loving·kissy
+        心形瞳 / 圆边抗锯齿（与底层像素混合）/ 配色族系重排（喜悦族暖金）。"""
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
+            encoding="utf-8"
+        )
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+
+        # 空闲眼跳：非说话/聆听时 1.5~4s 间隔 + 独立软弹簧 + 累加进视线
+        self.assertIn("saccade_interval_ms_ = 1500 + esp_random() % 2500", eyes_cc)
+        self.assertIn("ApplySpring(saccCurX_, saccVelX_, saccX_, dt_, 160, 20)", eyes_cc)
+        self.assertIn("(c.lookX + saccCurX_) * eyeR_px * 0.30f", eyes_cc)
+        sacc_start = eyes_cc.index("// 空闲眼跳")
+        sacc_body = eyes_cc[sacc_start : eyes_cc.index("ApplySpring(saccCurX_", sacc_start)]
+        self.assertIn("!speaking_ && !listening_", sacc_body)
+
+        # 弧线眼睑：逐列抛物线切割，全闭保持平切
+        self.assertIn("BufLidArc", eyes_h)
+        self.assertIn("lidH >= 100 ? lidH : (int)(lidH * (1.0f - 0.45f * nx * nx))", eyes_cc)
+        draw_start = eyes_cc.index("void GrobotEyes::DrawEye")
+        draw_body = eyes_cc[draw_start : eyes_cc.index("void GrobotEyes::Render", draw_start)]
+        self.assertIn("BufLidArc(cx, cy, eyeR, pad, lidH, true)", draw_body)
+        self.assertIn("BufLidArc(cx, cy, eyeR, pad, botH, false)", draw_body)
+        self.assertNotIn("(eyeR + pad) * 2, lidH + pad, bg_color_);", draw_body)
+
+        # 心形瞳：仅 loving(7)/kissy(16)
+        self.assertIn("void GrobotEyes::BufFillHeart", eyes_cc)
+        self.assertIn("mood_index_ == 7 || mood_index_ == 16", eyes_cc)
+        self.assertIn("heartPupil", eyes_h)
+
+        # 抗锯齿：圆边 1px 按覆盖率与底层像素混合（Blend565）
+        self.assertIn("Blend565", eyes_h)
+        self.assertIn("buf_[row * s + cl] = Blend565(cv, buf_[row * s + cl], frac)", eyes_cc)
+
+        # 配色族系：喜悦族暖金进表，happy/laughing/funny/winking 四席
+        self.assertEqual(eyes_cc.count("0xFFCF3F"), 4)
+        self.assertIn("0xD8B4E2", eyes_cc)  # embarrassed 薰衣草
+        self.assertIn("0xBDF3FF", eyes_cc)  # cool 冰蓝
+        self.assertIn("0xFF6B35", eyes_cc)  # delicious 橙
+        self.assertIn("0xFF9770", eyes_cc)  # silly 蜜桃
+
+
 
 if __name__ == "__main__":
     unittest.main()

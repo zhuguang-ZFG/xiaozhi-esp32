@@ -41,12 +41,19 @@ private:
     void ApplySpring(float& cur, float& vel, float target, float dt, float stiffness = 180.0f,
                      float damping = 15.0f);
     void DrawEye(int cx, int cy, int gazeX, int gazeY, int pR, int eyeR, int lidH, int botH,
-                 int tilt, bool isLeft);
+                 int tilt, bool isLeft, bool heartPupil);
     void DrawBackground();
     void BufFillRect(int x, int y, int w, int h, lv_color_t c);
     void BufFillCircle(int cx, int cy, int r, lv_color_t c);
     void BufFillTriangle(int x0, int y0, int x1, int y1, int x2, int y2, lv_color_t c);
     void BufHLine(int x0, int x1, int y, uint16_t cv);
+    /** 弧线眼睑：逐列抛物线切割（中央最高、边缘收 45%），替代直边矩形。 */
+    void BufLidArc(int cx, int cy, int eyeR, int pad, int lidH, bool top);
+    /** 心形瞳：两圆一三角拼装，loving/kissy 专用。 */
+    void BufFillHeart(int cx, int cy, int r, lv_color_t c);
+    /** RGB565 空间按 alpha 混合（圆边抗锯齿用，与底层像素混合而非背景色）。 */
+    static uint16_t Blend565(uint16_t fg, uint16_t bg, uint8_t alpha);
+
     void RecomputePalette(lv_color_t eye_color);
 
     lv_obj_t* canvas_ = nullptr;
@@ -64,6 +71,15 @@ private:
     lv_color_t eye_color_default_;
     bool speaking_ = false;
     bool listening_ = false;
+    // 当前情绪索引（loving=7/kissy=16 画心形瞳）；未识别情绪为 -1。
+    int mood_index_ = 0;
+    // 空闲眼跳（RoboEyes setIdleMode 语义：间隔+随机变化量）：非说话/聆听时
+    // 视线每 1.5~4s 小跳一次并滑回，经独立软弹簧避免跳切。
+    float saccX_ = 0, saccY_ = 0;
+    float saccCurX_ = 0, saccCurY_ = 0, saccVelX_ = 0, saccVelY_ = 0;
+    int64_t last_saccade_us_ = 0;
+    int64_t saccade_until_us_ = 0;
+    int saccade_interval_ms_ = 2000;
 
     EyeState curL_{}, curR_{}, targetL_{}, targetR_{}, baseL_{}, baseR_{};
 
