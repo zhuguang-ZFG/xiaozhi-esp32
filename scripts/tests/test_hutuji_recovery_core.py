@@ -1236,6 +1236,20 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("lowerY", eyes_cc)
         self.assertIn("{0, 0, 0, 0, 0.22f, 0.16f", eyes_cc)
 
+    def test_grobot_eyebrows_use_mirrored_quadratic_curves(self):
+        """眉毛不能是机械直杆：左右眉各用 12 段二次曲线，保留情绪倾角并镜像。"""
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        start = eyes_cc.index("void GrobotEyes::DrawEyebrows")
+        end = eyes_cc.index("void GrobotEyes::DrawNose", start)
+        body = eyes_cc[start:end]
+        self.assertIn("for (int i = 1; i <= 12; i++)", body)
+        self.assertIn("1.0f - nx * nx", body)
+        self.assertIn("browArch", body)
+        self.assertIn("drawBrow", body)
+        self.assertNotIn("cx - offset - halfW, yL - tiltL", body)
+
 if __name__ == "__main__":
     unittest.main()
 
