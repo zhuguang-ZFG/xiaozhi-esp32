@@ -305,7 +305,7 @@ void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
 
 void GrobotEyes::DrawNose(int cx, int cy, int eyeR) {
     const int noseY = cy + eyeR / 2 + 3;
-    const lv_color_t nose = lv_color_mix(eye_color_, bg_color_, 55);
+    const lv_color_t nose = lv_color_mix(eye_color_, bg_color_, 105);
     // 低对比度圆角胶囊：给全脸一个中心锚点，但不画写实鼻梁/鼻孔。
     BufFillEllipse(cx, noseY, 9, 4, nose);
     BufFillEllipse(cx, noseY - 1, 6, 2, bg_color_);
@@ -321,8 +321,11 @@ void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
     const int lowerY = mouthY + lipGap / 2;
     const lv_color_t mouth = lv_color_mix(eye_color_, lv_color_white(), 35);
     if (open > 5) {
-        BufFillEllipse(cx, mouthY + curve / 4, width / 2, open, glow_[1]);
+        const lv_color_t tongue = lv_color_hex(0xFF7EB6);
+        BufFillEllipse(cx, mouthY + curve / 4, width / 2, open, mouth);
         BufFillEllipse(cx, mouthY + curve / 4, width / 2 - 3, std::max(2, open - 3), bg_color_);
+        BufFillEllipse(cx, mouthY + open / 2 + curve / 4, width / 3, std::max(2, open / 3), tongue);
+        return;
     }
     int prevX = cx - width / 2;
     int prevUpperY = upperY;
