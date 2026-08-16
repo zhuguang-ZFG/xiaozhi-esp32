@@ -1208,13 +1208,14 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         bg_start = eyes_cc.index("void GrobotEyes::DrawBackground")
         bg_end = eyes_cc.index("void GrobotEyes::DrawEye", bg_start)
         bg_body = eyes_cc[bg_start:bg_end]
-        self.assertIn("lv_color_mix(eye_color_, bg_color_, 7)", eyes_cc)
+        self.assertEqual(eyes_cc.count("scan_color_ ="), 1)
+        self.assertIn("scan_color_ = lv_color_mix(eye_color_, bg_color_, 7)", eyes_cc)
         self.assertNotIn("BufHLine(0, w_ - 1, h_ / 2", bg_body)
 
         clear_start = lcd_cc.index("void LcdDisplay::ClearChatMessages")
         clear_end = lcd_cc.index("#else", clear_start)
         clear_body = lcd_cc[clear_start:clear_end]
-        self.assertIn("if (grobot_eyes_ == nullptr)", clear_body)
+        self.assertIn("grobot_eyes_ == nullptr", clear_body)
         self.assertIn("lv_obj_remove_flag(emoji_label_", clear_body)
 
 if __name__ == "__main__":

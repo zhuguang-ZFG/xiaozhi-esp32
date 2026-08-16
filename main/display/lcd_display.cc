@@ -832,10 +832,16 @@ void LcdDisplay::ClearChatMessages() {
     // Reset chat_message_label_ as it has been deleted
     chat_message_label_ = nullptr;
 
-    // Show the centered AI logo (emoji_label_) again
+    // Grobot 全脸没有独立 AI logo；其它 LVGL 聊天界面清屏后才恢复 logo。
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    if (grobot_eyes_ == nullptr && emoji_label_ != nullptr) {
+        lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+#else
     if (emoji_label_ != nullptr) {
         lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
+#endif
 
     ESP_LOGI(TAG, "Chat messages cleared");
 }

@@ -100,7 +100,7 @@ GrobotEyes::GrobotEyes(lv_color_t eyeColor, lv_color_t bgColor)
 }
 
 void GrobotEyes::RecomputePalette(lv_color_t eye_color) {
-    eye_color_ = eye_color;
+    scan_color_ = lv_color_mix(eye_color_, bg_color_, 7);
     glow_[0] = lv_color_mix(eye_color_, bg_color_, 38);
     glow_[1] = lv_color_mix(eye_color_, bg_color_, 77);
     glow_[2] = lv_color_mix(eye_color_, bg_color_, 128);
@@ -109,7 +109,6 @@ void GrobotEyes::RecomputePalette(lv_color_t eye_color) {
     iris_[2] = lv_color_mix(lv_color_white(), eye_color_, 77);
     pupil_color_ = lv_color_mix(eye_color_, bg_color_, 25);
     highlight_color_ = lv_color_mix(lv_color_white(), eye_color_, 180);
-    scan_color_ = lv_color_mix(eye_color_, bg_color_, 12);
 }
 
 GrobotEyes::~GrobotEyes() {
@@ -407,7 +406,6 @@ void GrobotEyes::DrawBackground() {
     uint16_t sc = lv_color_to_u16(scan_color_);
     for (int y = 3; y < h_; y += 4)
         BufHLine(0, w_ - 1, y, sc);
-    BufHLine(0, w_ - 1, h_ / 2, lv_color_to_u16(glow_[0]));
     int b = 12;
     BufFillRect(0, 0, b, 1, glow_[1]);
     BufFillRect(0, 0, 1, b, glow_[1]);
