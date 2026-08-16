@@ -1179,5 +1179,26 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertNotIn("emote::EmoteDisplay", lcd_cc)
 
 
+    def test_grobot_full_face_suppresses_chat_overlay(self):
+        """全脸模式不显示聊天正文：字幕栏会覆盖嘴巴/下半脸，必须在统一入口
+        清空并保持隐藏；状态栏与 SetStatus 不受影响。"""
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        bodies = []
+        cursor = 0
+        while True:
+            start = lcd_cc.find("void LcdDisplay::SetChatMessage", cursor)
+            if start < 0:
+                break
+            end = lcd_cc.find("void LcdDisplay::ClearChatMessages", start)
+            self.assertGreaterEqual(end, 0)
+            bodies.append(lcd_cc[start:end])
+            cursor = end
+        self.assertGreaterEqual(len(bodies), 2)
+        for body in bodies:
+            self.assertIn("if (grobot_eyes_ != nullptr)", body)
+            self.assertIn("lv_label_set_text(chat_message_label_, \"\")", body)
+            self.assertIn("lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN)", body)
+            self.assertIn("return;", body)
+
 if __name__ == "__main__":
     unittest.main()
