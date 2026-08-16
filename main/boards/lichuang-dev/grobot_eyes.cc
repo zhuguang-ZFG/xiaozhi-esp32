@@ -35,7 +35,7 @@ static const MoodData kMoods[] = {
 // 构图参考 M5Stack-Avatar，动画机制参考 LVGL Kawaii Face；仅采用公开视觉思想，
 // 不复制第三方实现。正 mouthCurve=上扬，负值=下垂；效果量归一化为 0..1。
 static const FacialData kFacialMoods[] = {
-    {0, 0, 0, 0, 0.10f, 0.05f, 0, 0, 0, 0},                    // neutral
+    {0, 0, 0, 0, 0.22f, 0.16f, 0, 0, 0, 0},                    // neutral
     {0, 0, 0.10f, 0.10f, 0.85f, 0.18f, 0.45f, 0, 0, 0},        // happy
     {-4, -4, 0.15f, 0.15f, 1.00f, 0.75f, 0.55f, 0, 0, 0.5f},   // laughing
     {-8, 10, 0.05f, 0.16f, 0.75f, 0.35f, 0.35f, 0, 0, 0.4f},   // funny
@@ -289,25 +289,41 @@ void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
     BufLine(cx + offset - halfW, yR + tiltR, cx + offset + halfW, yR - tiltR, brow, 2);
 }
 
+void GrobotEyes::DrawNose(int cx, int cy, int eyeR) {
+    const int noseY = cy + eyeR / 2 + 3;
+    const lv_color_t nose = lv_color_mix(eye_color_, bg_color_, 55);
+    // 低对比度圆角胶囊：给全脸一个中心锚点，但不画写实鼻梁/鼻孔。
+    BufFillEllipse(cx, noseY, 9, 4, nose);
+    BufFillEllipse(cx, noseY - 1, 6, 2, bg_color_);
+}
+
 void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
-    const int width = eyeR + 18;
+    const int width = eyeR + 28;
     const int curve = (int)(face_cur_.mouthCurve * 18);
     const int open = std::max(2, (int)(face_cur_.mouthOpen * 22));
+    const int lipGap = std::max(3, open / 2);
     const int mouthY = cy + eyeR + 19;
+    const int upperY = mouthY - lipGap / 2;
+    const int lowerY = mouthY + lipGap / 2;
     const lv_color_t mouth = lv_color_mix(eye_color_, lv_color_white(), 35);
     if (open > 5) {
         BufFillEllipse(cx, mouthY + curve / 4, width / 2, open, glow_[1]);
         BufFillEllipse(cx, mouthY + curve / 4, width / 2 - 3, std::max(2, open - 3), bg_color_);
     }
     int prevX = cx - width / 2;
-    int prevY = mouthY;
+    int prevUpperY = upperY;
+    int prevLowerY = lowerY;
     for (int i = 1; i <= 16; i++) {
         const float nx = -1.0f + (2.0f * i / 16.0f);
         const int x = cx - width / 2 + width * i / 16;
-        const int y = mouthY + (int)(curve * (1.0f - nx * nx));
-        BufLine(prevX, prevY, x, y, mouth, 2);
+        const int arc = (int)(curve * (1.0f - nx * nx));
+        const int nextUpperY = upperY + arc;
+        const int nextLowerY = lowerY + arc / 2;
+        BufLine(prevX, prevUpperY, x, nextUpperY, mouth, 2);
+        BufLine(prevX, prevLowerY, x, nextLowerY, glow_[2], 1);
         prevX = x;
-        prevY = y;
+        prevUpperY = nextUpperY;
+        prevLowerY = nextLowerY;
     }
 }
 void GrobotEyes::DrawFacialEffects(int cx, int cy, int eyeR, int offset) {
@@ -527,6 +543,7 @@ void GrobotEyes::Render() {
             s(curL_.botH), s(curL_.tilt), true, heart);
     DrawEye(cx + offset, cy + bounce, gxR, gyR, (int)(s(curR_.pR) * dilate), erR, s(curR_.topH),
             s(curR_.botH), s(curR_.tilt), false, heart);
+    DrawNose(cx, cy + bounce, std::max(erL, erR));
     DrawFacialEffects(cx, cy + bounce, std::max(erL, erR), offset);
     DrawMouth(cx, cy + bounce, std::max(erL, erR));
     lv_obj_invalidate(canvas_);

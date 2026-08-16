@@ -57,6 +57,7 @@ private:
                  int tilt, bool isLeft, bool heartPupil);
     void ApplyFacialData(const FacialData& data);
     void DrawEyebrows(int cx, int cy, int eyeR, int offset);
+    void DrawNose(int cx, int cy, int eyeR);
     void DrawMouth(int cx, int cy, int eyeR);
     void DrawFacialEffects(int cx, int cy, int eyeR, int offset);
     void BufFillEllipse(int cx, int cy, int rx, int ry, lv_color_t c);
