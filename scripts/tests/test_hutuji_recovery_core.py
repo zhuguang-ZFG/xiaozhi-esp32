@@ -764,6 +764,50 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("GetMposReportSequence", fallback)
         self.assertIn("mpos_seq", fallback)
 
+    def test_open_hotspot_wifi_qr_payload_escapes_ssid(self):
+        """扫码连小智热点只传 open SoftAP 的 SSID；SSID 分隔符必须按 ZXing 规则转义。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <string>
+
+            int main() {
+                assert(hutuji::BuildOpenHotspotWifiQrPayload("Xiaozhi-ABCD") ==
+                       "WIFI:T:nopass;S:Xiaozhi-ABCD;;");
+                assert(hutuji::BuildOpenHotspotWifiQrPayload("My;Wifi:Name\\x,\"y\"") ==
+                       "WIFI:T:nopass;S:My\\;Wifi\\:Name\\\\x\\,\\\"y\\\";;");
+                assert(hutuji::BuildOpenHotspotWifiQrPayload("Xiaozhi-ABCD")
+                           .find("P:") == std::string::npos);
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_hotspot_qr_test")
+
+        component = ROOT / "components/hutuji_qrcode/include/qrcode.h"
+        board = (ROOT / "main/boards/lichuang-dev/lichuang_dev_board.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(component.is_file())
+        self.assertIn("esp_qrcode_generate", board)
+        self.assertIn("BuildOpenHotspotWifiQrPayload", board)
+        self.assertIn("void SetNetworkEventCallback(NetworkEventCallback callback) override", board)
+        self.assertIn("WifiBoard::SetNetworkEventCallback(", board)
+        self.assertIn("callback = std::move(callback)", board)
+        self.assertNotIn("ConfigureHotspotQrCallback();", board)
+        callback_start = board.index("void SetNetworkEventCallback(NetworkEventCallback callback) override")
+        callback_end = board.index("    LichuangDevBoard()", callback_start)
+        callback_body = board[callback_start:callback_end]
+        self.assertIn("WifiConfigModeEnter", callback_body)
+        self.assertIn("WifiConfigModeExit", callback_body)
+        self.assertIn("if (callback)", callback_body)
+
     def test_window_error_requests_immediate_hold_and_controlled_reset(self):
         """P1：窗口 error 后 RX 后续行仍会执行；必须立即 hold 并在退窗后受控 reset。"""
         source = (

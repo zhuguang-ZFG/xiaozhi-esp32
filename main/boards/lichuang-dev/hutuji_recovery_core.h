@@ -103,6 +103,19 @@ inline bool ParseFiniteMPos(const std::string& status, float& x, float& y, float
     return true;
 }
 
+/** 生成 ZXing/Android/iOS 识别的 open SoftAP 二维码内容；不包含家庭 Wi-Fi 凭据。 */
+inline std::string BuildOpenHotspotWifiQrPayload(const std::string& ssid) {
+    std::string escaped;
+    escaped.reserve(ssid.size() + 16);
+    for (char ch : ssid) {
+        if (ch == '\\' || ch == ';' || ch == ',' || ch == '"' || ch == ':') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(ch);
+    }
+    return "WIFI:T:nopass;S:" + escaped + ";;";
+}
+
 /**
  * 用户面中文描述（R20-S3-04）：裸 `error:NN` 经 `Notify("转发失败: " + last_error_)`
  * 直达云端，用户听不懂。只对用户可行动/可理解的码给描述；未知名回 nullptr，

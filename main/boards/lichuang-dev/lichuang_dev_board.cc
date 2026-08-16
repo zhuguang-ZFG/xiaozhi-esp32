@@ -1,16 +1,16 @@
-#include "wifi_board.h"
-#include "codecs/box_audio_codec.h"
-#include "display/lcd_display.h"
-#include "display/emote_display.h"
 #include "application.h"
 #include "button.h"
+#include "codecs/box_audio_codec.h"
 #include "config.h"
-#include "i2c_device.h"
+#include "display/emote_display.h"
+#include "display/lcd_display.h"
 #include "esp32_camera.h"
+#include "hutuji_job.h"
+#include "hutuji_pipe.h"
+#include "i2c_device.h"
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
-#include "hutuji_pipe.h"
-#include "hutuji_job.h"
+#include "wifi_board.h"
 
 // 调试用：需要本地工程回归时，在编译参数里同时定义：
 //   HUTUJI_AUTO_TEST_DRAW
@@ -27,15 +27,146 @@
 // 调 hutuji.abort 等价入口。需与 HUTUJI_AUTO_TEST_DRAW 搭配才会自动产生窗口。
 // 默认关闭；取证完成后必须回刷不带此宏的镜像，别让脚手架进产品镜像。
 
-#include <cJSON.h>
-#include <esp_log.h>
-#include <stdexcept>
-#include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
+#include <esp_lcd_panel_vendor.h>
 #include <esp_lcd_touch_ft5x06.h>
+#include <esp_log.h>
 #include <esp_lvgl_port.h>
+#include <cJSON.h>
 #include <lvgl.h>
+#include <stdexcept>
+
+#include <qrcode.h>
+#include <wifi_manager.h>
+#include "display/lvgl_display/lvgl_image.h"
+#include "display/lvgl_display/lvgl_theme.h"
+#include "hutuji_recovery_core.h"
+
+/** Lichuang 热点配网二维码页：只编码设备 open SoftAP 的 SSID，不包含家庭 Wi-Fi 凭据。 */
+class HotspotQrDisplay : public SpiLcdDisplay {
+public:
+    using SpiLcdDisplay::SpiLcdDisplay;
+
+    void ShowHotspotQr(const std::string& ap_ssid, const std::string& portal_url) {
+        EnsureQrUi();
+        DisplayLockGuard lock(this);
+        if (qr_root_ == nullptr) {
+            return;
+        }
+        std::string payload = hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid);
+        auto image = BuildQrImage(payload);
+        if (image == nullptr) {
+            return;
+        }
+        lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        qr_image_ = std::move(image);
+        lv_image_set_src(qr_code_, qr_image_->image_dsc());
+        // 只放 ASCII：当前动态字形/字体缓存链路对配网页中文布局有运行时风险，先保
+        // 证扫码路径稳定；中文说明仍由原有通知/语音链路承担。
+        lv_label_set_text(qr_hint_, ("Scan: " + ap_ssid + "\nOpen: " + portal_url).c_str());
+        lv_obj_clear_flag(qr_root_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    void HideHotspotQr() {
+        DisplayLockGuard lock(this);
+        if (qr_root_ == nullptr) {
+            return;
+        }
+        lv_obj_add_flag(qr_root_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        qr_image_.reset();
+    }
+    void SetupUI() override { SpiLcdDisplay::SetupUI(); }
+
+private:
+    void EnsureQrUi() {
+        if (qr_root_ != nullptr) {
+            return;
+        }
+        DisplayLockGuard lock(this);
+        auto* theme = static_cast<LvglTheme*>(current_theme_);
+        qr_root_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(qr_root_, LV_HOR_RES, LV_VER_RES);
+        lv_obj_set_style_radius(qr_root_, 0, 0);
+        lv_obj_set_style_border_width(qr_root_, 0, 0);
+        lv_obj_set_style_bg_color(qr_root_, theme->background_color(), 0);
+        lv_obj_set_style_pad_all(qr_root_, 0, 0);
+        lv_obj_set_flex_flow(qr_root_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(qr_root_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(qr_root_, theme->spacing(4), 0);
+        lv_obj_clear_flag(qr_root_, LV_OBJ_FLAG_SCROLLABLE);
+
+        qr_code_ = lv_image_create(qr_root_);
+        lv_obj_set_size(qr_code_, 150, 150);
+
+        qr_hint_ = lv_label_create(qr_root_);
+        lv_obj_set_width(qr_hint_, LV_HOR_RES - theme->spacing(8));
+        lv_obj_set_style_text_font(qr_hint_, theme->text_font()->font(), 0);
+        lv_obj_set_style_text_align(qr_hint_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(qr_hint_, LV_LABEL_LONG_WRAP);
+        lv_obj_add_flag(qr_root_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    static void QrPixelCallback(esp_qrcode_handle_t qrcode, void* user_data) {
+        auto* out = static_cast<std::vector<uint8_t>*>(user_data);
+        const int qr_size = esp_qrcode_get_size(qrcode);
+        out->resize(qr_size * qr_size);
+        for (int y = 0; y < qr_size; ++y) {
+            for (int x = 0; x < qr_size; ++x) {
+                (*out)[y * qr_size + x] = esp_qrcode_get_module(qrcode, x, y) ? 1 : 0;
+            }
+        }
+    }
+
+public:
+    ~HotspotQrDisplay() {
+        if (qr_root_ != nullptr) {
+            lv_obj_del(qr_root_);
+        }
+    }
+
+    static std::unique_ptr<LvglImage> BuildQrImage(const std::string& payload) {
+        std::vector<uint8_t> modules;
+        esp_qrcode_config_t config = {
+            .display_func_with_cb = QrPixelCallback,
+            .max_qrcode_version = 8,
+            .qrcode_ecc_level = ESP_QRCODE_ECC_MED,
+            .user_data = &modules,
+        };
+        if (esp_qrcode_generate(&config, payload.c_str()) != ESP_OK || modules.empty()) {
+            return nullptr;
+        }
+        const int qr_size = static_cast<int>(std::sqrt(modules.size()));
+        const int scale = 150 / qr_size;
+        const int display_size = qr_size * (scale < 1 ? 1 : scale);
+        auto* pixels = static_cast<uint8_t*>(
+            heap_caps_malloc(display_size * display_size * 2, MALLOC_CAP_SPIRAM));
+        if (pixels == nullptr) {
+            return nullptr;
+        }
+        auto* rgb = reinterpret_cast<uint16_t*>(pixels);
+        const uint16_t foreground = 0x0000;
+        const uint16_t background = 0xFFFF;
+        for (int y = 0; y < display_size; ++y) {
+            for (int x = 0; x < display_size; ++x) {
+                rgb[y * display_size + x] =
+                    modules[(y / scale) * qr_size + (x / scale)] ? foreground : background;
+            }
+        }
+        return std::make_unique<LvglAllocatedImage>(pixels, display_size * display_size * 2,
+                                                    display_size, display_size, display_size * 2,
+                                                    LV_COLOR_FORMAT_RGB565);
+    }
+
+    lv_obj_t* qr_root_ = nullptr;
+    lv_obj_t* qr_code_ = nullptr;
+    lv_obj_t* qr_hint_ = nullptr;
+    std::unique_ptr<LvglImage> qr_image_;
+};
 
 #define TAG "LichuangDevBoard"
 
@@ -98,9 +229,10 @@ private:
             .glitch_ignore_cnt = 7,
             .intr_priority = 0,
             .trans_queue_depth = 0,
-            .flags = {
-                .enable_internal_pullup = 1,
-            },
+            .flags =
+                {
+                    .enable_internal_pullup = 1,
+                },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
 
@@ -122,7 +254,8 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            // During startup (before connected), pressing BOOT button enters Wi-Fi config mode without reboot
+            // During startup (before connected), pressing BOOT button enters Wi-Fi config mode
+            // without reboot
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
@@ -176,7 +309,7 @@ private:
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
-        
+
         esp_lcd_panel_reset(panel);
         pca9557_->SetOutputState(0, 0);
 
@@ -189,28 +322,30 @@ private:
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
         display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 #else
-        display_ = new SpiLcdDisplay(panel_io, panel,
-            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new HotspotQrDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                        DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                        DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 #endif
     }
 
-    void InitializeTouch()
-    {
+    void InitializeTouch() {
         esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
             .x_max = DISPLAY_HEIGHT,
             .y_max = DISPLAY_WIDTH,
-            .rst_gpio_num = GPIO_NUM_NC, // Shared with LCD reset
-            .int_gpio_num = GPIO_NUM_NC, 
-            .levels = {
-                .reset = 0,
-                .interrupt = 0,
-            },
-            .flags = {
-                .swap_xy = 1,
-                .mirror_x = 1,
-                .mirror_y = 0,
-            },
+            .rst_gpio_num = GPIO_NUM_NC,  // Shared with LCD reset
+            .int_gpio_num = GPIO_NUM_NC,
+            .levels =
+                {
+                    .reset = 0,
+                    .interrupt = 0,
+                },
+            .flags =
+                {
+                    .swap_xy = 1,
+                    .mirror_x = 1,
+                    .mirror_y = 0,
+                },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = {
@@ -218,11 +353,9 @@ private:
             .control_phase_bytes = 1,
             .dc_bit_offset = 0,
             .lcd_cmd_bits = 8,
-            .flags =
-            {
+            .flags = {
                 .disable_control_phase = 1,
-            }
-        };
+            }};
         tp_io_config.scl_speed_hz = 400000;
 
         esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle);
@@ -231,11 +364,11 @@ private:
 
         /* Add touch input (for selected screen) */
         const lvgl_port_touch_cfg_t touch_cfg = {
-            .disp = lv_display_get_default(), 
+            .disp = lv_display_get_default(),
             .handle = tp,
         };
 
-        if(touch_cfg.disp) {
+        if (touch_cfg.disp) {
             lvgl_port_add_touch(&touch_cfg);
         } else {
             ESP_LOGE(TAG, "Touch display is not initialized");
@@ -278,14 +411,14 @@ private:
     }
 
     void InitializeTools() {
-        auto &mcp_server = McpServer::GetInstance();
+        auto& mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
-            "End this conversation and enter WiFi configuration mode.\n"
-            "**CAUTION** You must ask the user to confirm this action.",
-            PropertyList(), [this](const PropertyList& properties) {
-                EnterWifiConfigMode();
-                return true;
-            });
+                           "End this conversation and enter WiFi configuration mode.\n"
+                           "**CAUTION** You must ask the user to confirm this action.",
+                           PropertyList(), [this](const PropertyList& properties) {
+                               EnterWifiConfigMode();
+                               return true;
+                           });
 
         // Allow switching between press-to-talk (长按说话) and click-to-talk (单击唤醒)
         press_to_talk_tool_ = new PressToTalkMcpTool();
@@ -294,8 +427,10 @@ private:
         // hutuji 写字机 Telnet 哑管道（方案 E：TCP 客户端 → Grbl_Esp32 Telnet:23）
         hutuji::Pipe::GetInstance().Start();
 
-        mcp_server.AddTool("hutuji.status",
-            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、是否授权、任务状态、最近应答行。"
+        mcp_server.AddTool(
+            "hutuji.status",
+            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl "
+            "是否就绪、是否授权、任务状态、最近应答行。"
             "用户问「写字机连上了吗/能不能动」时用；云端生成服务请用 hutuji_status。"
             "state 字段含义：idle 空闲、downloading 下载中、verifying 校验中、streaming 绘图中、"
             "paused 已暂停、paper_change 换纸中、reconnecting 断线恢复中、done 完成、"
@@ -305,24 +440,25 @@ private:
             });
 
         mcp_server.AddTool("hutuji.draw",
-            "执行出纸：参数 url 必须是云端 hutuji_draw 返回的 G-code 下载地址。"
-            "设备全量下载、CRC 校验、授权门通过后逐行经 Telnet 转发。进行中再调会返回「写字机正忙」提示。"
-            "用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
-            PropertyList({
-                Property("url", kPropertyTypeString)
-            }), [](const PropertyList& properties) -> ReturnValue {
-                const std::string& url = properties["url"].value<std::string>();
-                return hutuji::Job::GetInstance().StartDraw(url);
-            });
+                           "执行出纸：参数 url 必须是云端 hutuji_draw 返回的 G-code 下载地址。"
+                           "设备全量下载、CRC 校验、授权门通过后逐行经 Telnet "
+                           "转发。进行中再调会返回「写字机正忙」提示。"
+                           "用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
+                           PropertyList({Property("url", kPropertyTypeString)}),
+                           [](const PropertyList& properties) -> ReturnValue {
+                               const std::string& url = properties["url"].value<std::string>();
+                               return hutuji::Job::GetInstance().StartDraw(url);
+                           });
 
         mcp_server.AddTool("hutuji.abort",
-            "中止当前绘图转发。用户说停下/取消时用。"
-            "若正在换纸，可能无法立刻停，完成后才会停——须如实告诉用户。",
-            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
-                return hutuji::Job::GetInstance().RequestAbort();
-            });
+                           "中止当前绘图转发。用户说停下/取消时用。"
+                           "若正在换纸，可能无法立刻停，完成后才会停——须如实告诉用户。",
+                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                               return hutuji::Job::GetInstance().RequestAbort();
+                           });
 
-        mcp_server.AddTool("hutuji.pause",
+        mcp_server.AddTool(
+            "hutuji.pause",
             "暂停当前绘图（笔停在原地，进度不丢）。用户说「暂停/等一下/停一下」时用。"
             "与 hutuji.abort 不同：pause 可以用 hutuji.resume 接着画，abort 是彻底放弃。"
             "换纸中无法暂停，此时会如实返回提示。",
@@ -331,12 +467,13 @@ private:
             });
 
         mcp_server.AddTool("hutuji.resume",
-            "恢复之前暂停的绘图，从暂停处接着画。用户说「继续/接着画」时用。",
-            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
-                return hutuji::Job::GetInstance().RequestResume();
-            });
+                           "恢复之前暂停的绘图，从暂停处接着画。用户说「继续/接着画」时用。",
+                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                               return hutuji::Job::GetInstance().RequestResume();
+                           });
 
-        mcp_server.AddTool("hutuji.repeat",
+        mcp_server.AddTool(
+            "hutuji.repeat",
             "把上一张画再画一遍（复用设备里存的 G-code，不用重新生成，也不用再问云端）。"
             "用户说「再画一张/再来一个/一样的再画一次」时用。"
             "注意：需要先换上白纸；没画过东西时会返回错误。",
@@ -344,7 +481,8 @@ private:
                 return hutuji::Job::GetInstance().RequestRepeat();
             });
 
-        mcp_server.AddTool("hutuji.pen_test",
+        mcp_server.AddTool(
+            "hutuji.pen_test",
             "笔测试：落笔停 1 秒再抬笔，用来确认笔能不能碰到纸、有没有墨。"
             "用户说「试一下笔/笔能用吗/怎么画不出来」时用。测完让用户看纸上有没有点。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
@@ -352,26 +490,31 @@ private:
             });
 
 #ifdef HUTUJI_AUTO_TEST_DRAW
-        xTaskCreate([](void*) {
-            auto& pipe = hutuji::Pipe::GetInstance();
-            for (int i = 0; i < 60; ++i) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                if (pipe.IsConnected() && pipe.IsReady()) break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            if (pipe.IsConnected() && pipe.IsReady()) {
-                const char* url = HUTUJI_AUTO_TEST_DRAW_URL;
-                if (url[0] == '\0') {
-                    ESP_LOGE("AutoTest", "已启用 HUTUJI_AUTO_TEST_DRAW，但未定义 HUTUJI_AUTO_TEST_DRAW_URL");
-                    vTaskDelete(nullptr);
-                    return;
+        xTaskCreate(
+            [](void*) {
+                auto& pipe = hutuji::Pipe::GetInstance();
+                for (int i = 0; i < 60; ++i) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    if (pipe.IsConnected() && pipe.IsReady())
+                        break;
                 }
-                ESP_LOGW("AutoTest", "触发自动测试绘图");
-                auto result = hutuji::Job::GetInstance().StartDraw(url);
-                ESP_LOGW("AutoTest", "StartDraw 返回: %s", result.c_str());
-            }
-            vTaskDelete(nullptr);
-        }, "auto_test", 4096, nullptr, 3, nullptr);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                if (pipe.IsConnected() && pipe.IsReady()) {
+                    const char* url = HUTUJI_AUTO_TEST_DRAW_URL;
+                    if (url[0] == '\0') {
+                        ESP_LOGE(
+                            "AutoTest",
+                            "已启用 HUTUJI_AUTO_TEST_DRAW，但未定义 HUTUJI_AUTO_TEST_DRAW_URL");
+                        vTaskDelete(nullptr);
+                        return;
+                    }
+                    ESP_LOGW("AutoTest", "触发自动测试绘图");
+                    auto result = hutuji::Job::GetInstance().StartDraw(url);
+                    ESP_LOGW("AutoTest", "StartDraw 返回: %s", result.c_str());
+                }
+                vTaskDelete(nullptr);
+            },
+            "auto_test", 4096, nullptr, 3, nullptr);
 #endif
 
 #ifdef HUTUJI_AUTO_TEST_ABORT_ON_PAPER
@@ -380,29 +523,48 @@ private:
         // 语音/控制台下发都难稳定命中；这里在 paper_active 翻真的第一时间本地调用。
         // 默认不定义此宏，正常镜像行为不变；取证后必须回刷不带宏的镜像。
         // 注意：paper_active 也覆盖断连恢复保护窗，故触发前后都打 status 自证窗口类型。
-        xTaskCreate([](void*) {
-            auto& job = hutuji::Job::GetInstance();
-            // ponytail: 50ms 轮询、20 分钟上限，够覆盖单张 A4 出图到页尾换纸；
-            // 超时即退出，不让脚手架任务常驻。上限不够就调大循环次数。
-            for (int i = 0; i < 24000; ++i) {
-                if (job.IsPaperActive()) {
-                    ESP_LOGW("AutoTest", "换纸窗口命中，abort 前 status: %s",
-                             job.StatusJson().c_str());
-                    auto result = job.RequestAbort();
-                    ESP_LOGW("AutoTest", "换纸中 abort 返回: %s", result.c_str());
-                    ESP_LOGW("AutoTest", "abort 后 status: %s", job.StatusJson().c_str());
-                    vTaskDelete(nullptr);
-                    return;
+        xTaskCreate(
+            [](void*) {
+                auto& job = hutuji::Job::GetInstance();
+                // ponytail: 50ms 轮询、20 分钟上限，够覆盖单张 A4 出图到页尾换纸；
+                // 超时即退出，不让脚手架任务常驻。上限不够就调大循环次数。
+                for (int i = 0; i < 24000; ++i) {
+                    if (job.IsPaperActive()) {
+                        ESP_LOGW("AutoTest", "换纸窗口命中，abort 前 status: %s",
+                                 job.StatusJson().c_str());
+                        auto result = job.RequestAbort();
+                        ESP_LOGW("AutoTest", "换纸中 abort 返回: %s", result.c_str());
+                        ESP_LOGW("AutoTest", "abort 后 status: %s", job.StatusJson().c_str());
+                        vTaskDelete(nullptr);
+                        return;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
                 }
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            ESP_LOGW("AutoTest", "20 分钟内未观察到换纸窗口，abort 脚手架退出");
-            vTaskDelete(nullptr);
-        }, "auto_test_abort", 3072, nullptr, 4, nullptr);
+                ESP_LOGW("AutoTest", "20 分钟内未观察到换纸窗口，abort 脚手架退出");
+                vTaskDelete(nullptr);
+            },
+            "auto_test_abort", 3072, nullptr, 4, nullptr);
 #endif
     }
 
 public:
+    void SetNetworkEventCallback(NetworkEventCallback callback) override {
+        WifiBoard::SetNetworkEventCallback(
+            [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
+                if (event == NetworkEvent::WifiConfigModeEnter) {
+                    static_cast<HotspotQrDisplay*>(display_)->ShowHotspotQr(
+                        WifiManager::GetInstance().GetApSsid(),
+                        WifiManager::GetInstance().GetApWebUrl());
+                } else if (event == NetworkEvent::WifiConfigModeExit ||
+                           event == NetworkEvent::Connected) {
+                    static_cast<HotspotQrDisplay*>(display_)->HideHotspotQr();
+                }
+                if (callback) {
+                    callback(event, data);
+                }
+            });
+    }
+
     LichuangDevBoard() : boot_button_(BOOT_BUTTON_GPIO) {
         InitializeI2c();
         InitializeSpi();
@@ -416,24 +578,17 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static CustomAudioCodec audio_codec(
-            i2c_bus_, 
-            pca9557_);
+        static CustomAudioCodec audio_codec(i2c_bus_, pca9557_);
         return &audio_codec;
     }
+    virtual Display* GetDisplay() override { return display_; }
 
-    virtual Display* GetDisplay() override {
-        return display_;
-    }
-    
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
     }
 
-    virtual Camera* GetCamera() override {
-        return camera_;
-    }
+    virtual Camera* GetCamera() override { return camera_; }
 };
 
 DECLARE_BOARD(LichuangDevBoard);

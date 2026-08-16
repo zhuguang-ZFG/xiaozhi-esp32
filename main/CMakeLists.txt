@@ -1082,6 +1082,7 @@ idf_component_register(SRCS ${SOURCES}
                         fatfs
                         xiaozhi-fonts
                         ${MAIN_PRIV_REQUIRES_EXTRA}
+                        hutuji_qrcode
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
