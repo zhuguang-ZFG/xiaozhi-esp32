@@ -255,7 +255,16 @@ private:
             .disp = lv_display_get_default(), 
             .handle = tp,
         };
-        lvgl_port_add_touch(&touch_cfg);
+        lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);
+        if (touch_indev != nullptr) {
+            lv_indev_add_event_cb(
+                touch_indev,
+                [](lv_event_t* event) {
+                    auto* timer = static_cast<PowerSaveTimer*>(lv_event_get_user_data(event));
+                    timer->WakeUp();
+                },
+                LV_EVENT_PRESSED, power_save_timer_);
+        }
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 

@@ -35,6 +35,13 @@ struct EyeState {
     float vTop, vBot, vTilt, vPR, vRadius, vLookX, vLookY;
 };
 
+struct FaceLayout {
+    float scale;
+    int centerY;
+    int eyeRadius;
+    int eyeOffset;
+};
+
 class GrobotEyes {
 public:
     GrobotEyes(lv_color_t eyeColor, lv_color_t bgColor);
@@ -104,6 +111,7 @@ private:
     EyeState curL_{}, curR_{}, targetL_{}, targetR_{}, baseL_{}, baseR_{};
     FacialData face_cur_{}, face_target_{}, face_vel_{};
 
+    FaceLayout layout_{};
     int64_t last_frame_us_ = 0;
     int64_t last_blink_us_ = 0;
     int blink_interval_ms_ = 3000;

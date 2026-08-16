@@ -16,9 +16,11 @@
 
 G-code 仍只在云端生成；设备仅下载、校验并通过 Wi-Fi Telnet `:23` 转发到 Grbl。
 
-显示层启用程序化 Grobot 全脸，Waveshare 使用 `460x300` 画布。热点配网二维码由共享 `Display` / `LcdDisplay` 覆盖层负责，板级代码只组合网络事件。
+显示层启用程序化 Grobot 全脸，Waveshare 使用 `460x300` 画布。构图采用黄金比例约束眼距和纵向节奏，并针对未成年人收敛极端情绪：负面状态保留可识别语义，但限制眉压、瞪视、刺激色和持续弹跳；`sleepy` 固定半闭眼、居中视线、嘴角上扬，不眨眼或随机眼跳。视觉原则参考 [M5Stack-Avatar](https://github.com/stack-chan/m5stack-avatar)、[LVGL Kawaii Face](https://github.com/0015/lvgl_kawaii_face) 与 [RoboEyes](https://github.com/FluxGarage/RoboEyes)，未复制第三方实现或引入运行时依赖。
 
-写字机需要长期在线待命：空闲 60 秒后降低背光，但不再由 AXP2101 在 5 分钟后自动断电；按 BOOT 会先退出省电状态，再执行原有配网或聊天动作。
+热点配网二维码由共享 `Display` / `LcdDisplay` 覆盖层负责，板级代码只组合网络事件。
+
+写字机需要长期在线待命：空闲 60 秒后降低背光，但不再由 AXP2101 在 5 分钟后自动断电；BOOT 和 FT5x06 首次触摸都会先退出省电状态，再继续原有按键或 LVGL 触摸分发。
 
 ## 构建
 
@@ -37,7 +39,8 @@ idf.py -B build-waveshare-35 build
 
 ## 已验证边界
 
-- ESP-IDF v6.0.1 构建通过；host 回归 48/48。
+- ESP-IDF v6.0.1 构建通过；host 回归 54/54。
 - COM14 实机启动确认 8MB PSRAM、LCD、触摸、音频、OV5640、Grobot `460x300`、Wi-Fi、Grbl Telnet 与授权探测。
-- 60 秒省电过渡已观察，无 panic/assert/OOM。
-- 尚未完成最终二维码扫码/触摸、BOOT 实体唤醒目视、完整 5 分钟不关机长测、云端 device-call 与真实出图/换纸验证。
+- 儿童友好 UI 已由用户目视接受；触摸退出省电已实机确认。
+- 45 秒启动日志无 panic/assert/OOM，最低 SRAM `49551B`。
+- 尚未完成最终二维码扫码/触摸、完整 5 分钟不关机长测、云端 device-call 与真实出图/换纸验证。

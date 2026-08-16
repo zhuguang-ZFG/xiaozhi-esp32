@@ -17,13 +17,13 @@ static const MoodData kMoods[] = {
     {0, 50, 0, 30, 45, 0, -0.10f},         // happy
     {10, 65, 0, 25, 45, 0, -0.15f},        // laughing
     {5, 55, 0, 28, 45, 0.15f, 0},          // funny
-    {0, 0, -60, 27, 45, 0, 0.35f},         // sad（垂眼向下）
-    {0, 0, 60, 30, 45, 0, -0.05f},         // angry（瞪视）
-    {20, 0, -50, 22, 42, 0, 0.30f},        // crying
+    {0, 0, -32, 27, 45, 0, 0.15f},         // sad（柔和垂眼）
+    {0, 0, 35, 30, 45, 0, 0},              // angry（可识别但不瞪视）
+    {24, 0, -30, 24, 43, 0, 0.15f},        // crying
     {0, 45, 0, 32, 48, 0, -0.10f},         // loving
     {25, 15, 0, 22, 40, -0.25f, 0.25f},    // embarrassed（移开视线）
     {0, 0, 0, 38, 52, 0, 0},               // surprised（居中放大）
-    {0, 0, -10, 42, 55, 0, 0},             // shocked
+    {0, 0, -6, 38, 50, 0, 0},              // shocked
     {10, 15, -20, 28, 43, 0.45f, -0.40f},  // thinking（看右上）
     {0, 35, 25, 0, 45, 0.15f, 0},          // winking
     {15, 20, 10, 28, 45, 0.40f, 0},        // cool（侧视）
@@ -31,7 +31,7 @@ static const MoodData kMoods[] = {
     {5, 60, 0, 28, 45, 0.20f, -0.20f},     // delicious
     {0, 50, 0, 18, 40, 0, -0.05f},         // kissy
     {10, 15, 15, 30, 45, 0.25f, -0.10f},   // confident
-    {55, 0, 0, 20, 42, 0, 0.30f},          // sleepy
+    {55, 0, 0, 20, 42, 0, 0},              // sleepy（半闭眼、视线居中）
     {0, 40, 0, 30, 45, -0.15f, 0},         // silly
     {5, 0, -30, 25, 43, -0.30f, 0},        // confused
 };
@@ -39,17 +39,17 @@ static const MoodData kMoods[] = {
 // 构图参考 M5Stack-Avatar，动画机制参考 LVGL Kawaii Face；仅采用公开视觉思想，
 // 不复制第三方实现。正 mouthCurve=上扬，负值=下垂；效果量归一化为 0..1。
 static const FacialData kFacialMoods[] = {
-    {0, 0, 0, 0, 0.22f, 0.16f, 0, 0, 0, 0},                    // neutral
+    {0, 0, 0, 0, 0.48f, 0.12f, 0, 0, 0, 0},                    // neutral
     {0, 0, 0.10f, 0.10f, 0.85f, 0.18f, 0.45f, 0, 0, 0},        // happy
     {-4, -4, 0.15f, 0.15f, 1.00f, 0.75f, 0.55f, 0, 0, 0.5f},   // laughing
     {-8, 10, 0.05f, 0.16f, 0.75f, 0.35f, 0.35f, 0, 0, 0.4f},   // funny
-    {-14, -14, -0.08f, -0.08f, -0.75f, 0.08f, 0, 0, 0, 0},     // sad
-    {30, 30, -0.08f, -0.08f, -0.45f, 0.10f, 0, 0, 0, 0},       // angry
-    {-14, -14, -0.12f, -0.12f, -0.85f, 0.35f, 0, 1, 0, 0},     // crying
+    {-8, -8, -0.03f, -0.03f, -0.35f, 0.05f, 0, 0, 0, 0},       // sad
+    {18, 18, -0.04f, -0.04f, -0.20f, 0.06f, 0, 0, 0, 0},       // angry
+    {-8, -8, -0.06f, -0.06f, -0.40f, 0.18f, 0, 1, 0, 0},       // crying
     {-5, -5, 0.12f, 0.12f, 0.90f, 0.12f, 0.80f, 0, 0, 0.8f},   // loving
     {-10, 12, 0, 0.05f, 0.20f, 0.05f, 0.85f, 0, 0.25f, 0},     // embarrassed
     {0, 0, 0.20f, 0.20f, 0.05f, 0.65f, 0, 0, 0, 0},            // surprised
-    {0, 0, 0.25f, 0.25f, 0, 1.00f, 0, 0, 0.65f, 0},            // shocked
+    {0, 0, 0.18f, 0.18f, 0, 0.72f, 0, 0, 0.40f, 0},            // shocked
     {-18, 22, 0.12f, -0.02f, -0.10f, 0.04f, 0, 0, 0, 0},       // thinking
     {-8, 12, 0.10f, 0.05f, 0.72f, 0.10f, 0.30f, 0, 0, 0.3f},   // winking
     {-4, 8, -0.02f, 0.06f, 0.22f, 0.04f, 0, 0, 0, 0.2f},       // cool
@@ -57,7 +57,7 @@ static const FacialData kFacialMoods[] = {
     {-8, 10, 0.05f, 0.10f, 0.88f, 0.25f, 0.55f, 0, 0, 0.4f},   // delicious
     {-6, -6, 0.08f, 0.08f, 0.65f, 0.02f, 0.75f, 0, 0, 0.5f},   // kissy
     {8, 8, 0.06f, 0.06f, 0.38f, 0.04f, 0, 0, 0, 0},            // confident
-    {0, 0, -0.18f, -0.18f, -0.08f, 0.04f, 0, 0, 0, 0},         // sleepy
+    {0, 0, 0.22f, 0.02f, 0.45f, 0.02f, 0, 0, 0, 0},            // sleepy
     {18, -6, 0.14f, 0.03f, 0.80f, 0.40f, 0.30f, 0, 0, 0.25f},  // silly
     {20, -18, 0.12f, -0.04f, -0.22f, 0.06f, 0, 0, 0.2f, 0},    // confused
 };
@@ -70,12 +70,12 @@ static const uint32_t kMoodColors[] = {
     0xFFCF3F,  // laughing：暖金
     0xFFCF3F,  // funny：暖金
     0x5E9BFF,  // sad：柔蓝
-    0xFF453A,  // angry：红
-    0x7FB3FF,  // crying：浅蓝
+    0xFF7A70,  // angry：柔珊瑚
+    0xA8CAFF,  // crying：柔浅蓝
     0xFF7EB6,  // loving：粉
     0xD8B4E2,  // embarrassed：薰衣草
     0,         // surprised：品牌青
-    0xFFD60A,  // shocked：琥珀
+    0xFFD166,  // shocked：暖金
     0xBF8FFF,  // thinking：紫
     0xFFCF3F,  // winking：暖金
     0xBDF3FF,  // cool：冰蓝
@@ -83,7 +83,7 @@ static const uint32_t kMoodColors[] = {
     0xFF6B35,  // delicious：橙
     0xFF7EB6,  // kissy：粉
     0,         // confident：品牌青
-    0x3E8E96,  // sleepy：暗青
+    0,         // sleepy：品牌青
     0xFF9770,  // silly：蜜桃
     0,         // confused：品牌青
 };
@@ -96,6 +96,7 @@ static_assert(std::size(kMoods) == std::size(kNames));
 static_assert(std::size(kFacialMoods) == std::size(kNames));
 static_assert(std::size(kMoodColors) == std::size(kNames));
 static constexpr size_t kMoodCount = std::size(kNames);
+static constexpr int kSleepyMoodIndex = 18;
 
 GrobotEyes::GrobotEyes(lv_color_t eyeColor, lv_color_t bgColor)
     : eye_color_(eyeColor), bg_color_(bgColor), eye_color_default_(eyeColor) {
@@ -131,6 +132,18 @@ GrobotEyes::~GrobotEyes() {
 bool GrobotEyes::Init(lv_obj_t* parent, int w, int h) {
     w_ = w;
     h_ = h;
+    layout_.scale = (float)h_ / kBaseH;
+    layout_.centerY = h_ / 2;
+    layout_.eyeRadius = (int)lroundf(kEyeRadius * layout_.scale);
+    layout_.eyeOffset = (int)lroundf((kEyeRadius + kEyeGap) * layout_.scale);
+    if (w_ >= 400 && h_ >= 280) {
+        constexpr float kPhi = 1.61803398875f;
+        layout_.scale *= 1.08f;
+        layout_.eyeRadius = (int)lroundf(kEyeRadius * layout_.scale);
+        layout_.eyeOffset = (int)lroundf(layout_.eyeRadius * kPhi * 0.90f);
+        const int eyeR = layout_.eyeRadius;
+        layout_.centerY = h_ / 2 + eyeR / 5;
+    }
     draw_buf_ = lv_draw_buf_create(w, h, LV_COLOR_FORMAT_RGB565, 0);
     if (draw_buf_ == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate GrobotEyes draw buffer (%dx%d)", w, h);
@@ -174,6 +187,11 @@ void GrobotEyes::UpdateDeltaTime() {
 }
 
 void GrobotEyes::Blink() {
+    if (mood_index_ == kSleepyMoodIndex) {
+        targetL_.topH = baseL_.topH;
+        targetR_.topH = baseR_.topH;
+        return;
+    }
     int64_t elapsed = (esp_timer_get_time() - last_blink_us_) / 1000;
     if (elapsed > blink_interval_ms_)
         targetL_.topH = targetR_.topH = 100;
@@ -223,6 +241,7 @@ void GrobotEyes::SetEmotion(const char* emotion) {
     set(baseL_, targetL_, left);
     set(baseR_, targetR_, right);
     RecomputePalette(color != 0 ? lv_color_hex(color) : eye_color_default_);
+    last_blink_us_ = esp_timer_get_time();
 }
 
 void GrobotEyes::SetSpeaking(bool on) { speaking_ = on; }
@@ -312,14 +331,16 @@ void GrobotEyes::BufLine(int x0, int y0, int x1, int y1, lv_color_t c, int thick
 void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
     const int yL = cy - eyeR - eyeR / 2 - (int)(face_cur_.browLiftL * eyeR * 2 / 5);
     const int yR = cy - eyeR - eyeR / 2 - (int)(face_cur_.browLiftR * eyeR * 2 / 5);
-    const int halfW = eyeR * 4 / 5;
+    const int halfW = eyeR * 3 / 4;
     const int tiltL = (int)(face_cur_.browTiltL * 0.35f);
     const int tiltR = (int)(face_cur_.browTiltR * 0.35f);
     const int browArch = std::max(10, eyeR / 6);
-    const int browWeight = std::max(2, eyeR / 20);
+    const int browBaseOffset = eyeR / 10;
+    const int browWeight = std::max(2, eyeR / 24);
     const int browGlowWeight = browWeight + 1;
     const lv_color_t brow = lv_color_mix(eye_color_, lv_color_white(), 55);
     auto drawBrow = [&](int browCx, int browY, int tilt) {
+        browY += browBaseOffset;
         int prevX = browCx - halfW;
         int prevY = browY - tilt;
         for (int i = 1; i <= 12; i++) {
@@ -339,26 +360,27 @@ void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
 
 void GrobotEyes::DrawNose(int cx, int cy, int eyeR) {
     const int noseY = cy + eyeR / 2 + std::max(4, eyeR / 12);
-    const int noseRx = std::max(12, eyeR / 4);
-    const int noseRy = std::max(6, eyeR / 9);
+    const int noseRx = std::max(14, eyeR / 3);
+    const int noseRy = std::max(7, eyeR / 8);
     const lv_color_t nose = lv_color_mix(eye_color_, bg_color_, 145);
     const lv_color_t noseHighlight = lv_color_mix(lv_color_white(), eye_color_, 45);
+    const lv_color_t noseShadow = lv_color_mix(bg_color_, eye_color_, 25);
     // 实体圆角机器人鼻：比旧挖空短划更像完整五官，但仍弱于眼睛和嘴。
     BufFillEllipse(cx, noseY, noseRx, noseRy, glow_[1]);
+    BufFillEllipse(cx, noseY + 3, noseRx - 1, noseRy, noseShadow);
     BufFillEllipse(cx, noseY, noseRx - 2, noseRy - 2, nose);
     BufLine(cx - noseRx / 2, noseY - noseRy / 2, cx + noseRx / 3, noseY - noseRy / 2, noseHighlight,
             1);
 }
 
 void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
-    const int width = eyeR * 9 / 5;
+    const int width = eyeR * 11 / 5;
     const int curve = (int)(face_cur_.mouthCurve * eyeR * 2 / 5);
     const int open = std::max(3, (int)(face_cur_.mouthOpen * eyeR / 2));
-    const int lipGap = std::max(4, open / 2);
-    const int mouthY = cy + eyeR + eyeR * 2 / 5;
-    const int upperY = mouthY - lipGap / 2;
-    const int lowerY = mouthY + lipGap / 2;
+    const int lipGap = std::max(6, open / 2);
+    const int mouthY = cy + eyeR + eyeR * 11 / 40;
     const lv_color_t mouth = lv_color_mix(eye_color_, lv_color_white(), 45);
+    const lv_color_t mouthCorner = lv_color_mix(mouth, bg_color_, 48);
     const int upperLipWeight = std::max(2, eyeR / 20);
     const int lowerLipWeight = std::max(1, eyeR / 28);
     if (open > 5) {
@@ -369,20 +391,24 @@ void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
         return;
     }
     int prevX = cx - width / 2;
-    int prevUpperY = upperY;
-    int prevLowerY = lowerY;
+    int prevUpperY = mouthY;
+    int prevLowerY = mouthY;
     for (int i = 1; i <= 16; i++) {
         const float nx = -1.0f + (2.0f * i / 16.0f);
         const int x = cx - width / 2 + width * i / 16;
-        const int arc = (int)(curve * (1.0f - nx * nx));
-        const int nextUpperY = upperY + arc;
-        const int nextLowerY = lowerY + arc / 2;
+        const int lipArc = (int)(curve * (1.0f - nx * nx));
+        const int iabs = std::abs(i - 8);
+        const int lipSeparation = lipGap - lipGap * iabs / 8;
+        const int nextUpperY = mouthY + lipArc - lipSeparation / 2;
+        const int nextLowerY = mouthY + lipArc + lipSeparation / 2;
         BufLine(prevX, prevUpperY, x, nextUpperY, mouth, upperLipWeight);
         BufLine(prevX, prevLowerY, x, nextLowerY, glow_[2], lowerLipWeight);
         prevX = x;
         prevUpperY = nextUpperY;
         prevLowerY = nextLowerY;
     }
+    BufFillCircle(cx - width / 2, mouthY, upperLipWeight + 1, mouthCorner);
+    BufFillCircle(cx + width / 2, mouthY, upperLipWeight + 1, mouthCorner);
 }
 void GrobotEyes::DrawFacialEffects(int cx, int cy, int eyeR, int offset) {
     const int blush = (int)(face_cur_.blush * 18);
@@ -478,28 +504,19 @@ void GrobotEyes::DrawBackground() {
     lv_canvas_fill_bg(canvas_, bg_color_, LV_OPA_COVER);
     buf_ = (uint16_t*)draw_buf_->data;
     uint16_t sc = lv_color_to_u16(scan_color_);
-    for (int y = 3; y < h_; y += 4)
+    for (int y = 5; y < h_; y += 6)
         BufHLine(0, w_ - 1, y, sc);
-    int b = 12;
-    BufFillRect(0, 0, b, 1, glow_[1]);
-    BufFillRect(0, 0, 1, b, glow_[1]);
-    BufFillRect(w_ - b, 0, b, 1, glow_[1]);
-    BufFillRect(w_ - 1, 0, 1, b, glow_[1]);
-    BufFillRect(0, h_ - 1, b, 1, glow_[1]);
-    BufFillRect(0, h_ - b, 1, b, glow_[1]);
-    BufFillRect(w_ - b, h_ - 1, b, 1, glow_[1]);
-    BufFillRect(w_ - 1, h_ - b, 1, b, glow_[1]);
 }
 
 void GrobotEyes::DrawEye(int cx, int cy, int gazeX, int gazeY, int pR, int eyeR, int lidH, int botH,
                          int tilt, bool isLeft, bool heartPupil) {
     float phase = (float)(last_frame_us_ % 10000000) / 10000000.0f * 6.2832f;
-    int pulse = (int)(2.0f * sinf(phase));
-    BufFillCircle(cx, cy, eyeR + 15 + pulse, glow_[0]);
-    BufFillCircle(cx, cy, eyeR + 14 + pulse, bg_color_);
-    BufFillCircle(cx, cy, eyeR + 10, glow_[0]);
-    BufFillCircle(cx, cy, eyeR + 6, glow_[1]);
-    BufFillCircle(cx, cy, eyeR + 3, glow_[2]);
+    int pulse = mood_index_ == kSleepyMoodIndex ? 0 : (int)(1.0f * sinf(phase));
+    BufFillCircle(cx, cy, eyeR + 10 + pulse, glow_[0]);
+    BufFillCircle(cx, cy, eyeR + 9 + pulse, bg_color_);
+    BufFillCircle(cx, cy, eyeR + 7, glow_[0]);
+    BufFillCircle(cx, cy, eyeR + 4, glow_[1]);
+    BufFillCircle(cx, cy, eyeR + 2, glow_[2]);
     BufFillCircle(cx, cy, eyeR, eye_color_);
     // 眼球（虹膜+瞳+高光）随视线偏移；辉光环与眼睑遮罩保持原位，视线偏移上界
     // 在 Render 侧按 eyeR 比例限制，虹膜不会跑出眼白。
@@ -530,9 +547,6 @@ void GrobotEyes::Render() {
     UpdateDeltaTime();
     DrawBackground();
     Blink();
-    float scale = (float)h_ / kBaseH;
-    int offset = (int)(kEyeRadius + kEyeGap) * scale;
-    int cx = w_ / 2, cy = h_ / 2;
     auto spring = [&](EyeState& c, EyeState& t) {
         ApplySpring(c.topH, c.vTop, t.topH, dt_);
         ApplySpring(c.botH, c.vBot, t.botH, dt_);
@@ -543,6 +557,10 @@ void GrobotEyes::Render() {
         ApplySpring(c.lookX, c.vLookX, t.lookX, dt_, 120, 18);
         ApplySpring(c.lookY, c.vLookY, t.lookY, dt_, 120, 18);
     };
+    auto s = [&](float v) { return (int)lroundf(v * layout_.scale); };
+    const int offset = layout_.eyeOffset;
+    const int cx = w_ / 2;
+    const int cy = layout_.centerY;
     spring(curL_, targetL_);
     spring(curR_, targetR_);
     ApplySpring(face_cur_.browTiltL, face_vel_.browTiltL, face_target_.browTiltL, dt_, 150, 19);
@@ -561,7 +579,7 @@ void GrobotEyes::Render() {
     ApplySpring(face_cur_.sparkle, face_vel_.sparkle, face_target_.sparkle, dt_, 120, 18);
     // 空闲眼跳（RoboEyes setIdleMode 惯例：间隔+随机变化量）：非说话/聆听时
     // 每 1.5~4s 视线小跳（±0.30/±0.15），停留 300~700ms 后滑回，独立软弹簧。
-    if (!speaking_ && !listening_) {
+    if (!speaking_ && !listening_ && mood_index_ != kSleepyMoodIndex) {
         const int64_t now = esp_timer_get_time();
         if (now - last_saccade_us_ > (int64_t)saccade_interval_ms_ * 1000) {
             saccX_ = ((int)(esp_random() % 61) - 30) / 100.0f;
@@ -578,12 +596,11 @@ void GrobotEyes::Render() {
     }
     ApplySpring(saccCurX_, saccVelX_, saccX_, dt_, 160, 20);
     ApplySpring(saccCurY_, saccVelY_, saccY_, dt_, 160, 20);
-    auto s = [&](float v) { return (int)(v * scale); };
-    // 说话弹跳：约 6Hz ±2px，参照 RoboEyes anim_laugh 的垂直抖动语义但收敛到
-    // 微幅，避免长句时视觉疲劳；聆听时瞳孔放大 18%。
+    // 说话弹跳约 6Hz ±1px；保留活动反馈，同时限制未成年人界面的持续视觉刺激。
+    // 聆听时瞳孔放大 18%。
     int bounce = 0;
     if (speaking_) {
-        bounce = (int)(2.0f * sinf((float)(last_frame_us_ % 166667) / 166667.0f * 6.2832f));
+        bounce = (int)(1.0f * sinf((float)(last_frame_us_ % 166667) / 166667.0f * 6.2832f));
     }
     const float dilate = listening_ ? 1.18f : 1.0f;
     auto gaze = [&](EyeState& c, int eyeR_px, int& gx, int& gy) {

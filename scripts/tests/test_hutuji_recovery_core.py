@@ -876,6 +876,20 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         publish_at = run_body.index('SetState("error")', reset_at)
         self.assertLess(reset_at, publish_at)
 
+    def test_waveshare_touch_wakes_power_save(self):
+        """FT5x06 首次触摸应退出低亮度省电，同时保留 LVGL 原触摸分发。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        start = board.index("void InitializeTouch()")
+        end = board.index("void InitializeLcdDisplay()", start)
+        body = board[start:end]
+        self.assertIn("lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg)", body)
+        self.assertIn("lv_indev_add_event_cb(", body)
+        self.assertIn("touch_indev,", body)
+        self.assertIn("LV_EVENT_PRESSED", body)
+        self.assertIn("timer->WakeUp();", body)
 
     def test_paper_change_resets_blocking_peer_by_raii(self):
         """R11-PIPE-02：换纸编排的 blocking 标记必须 RAII 复位，不留手工出口。
@@ -1111,7 +1125,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         # 情绪配色：angry 红 / loving 粉 / thinking 紫 必须在表内
         self.assertIn("kMoodColors", eyes_cc)
-        self.assertIn("0xFF453A", eyes_cc)
+        self.assertIn("0xFF7A70", eyes_cc)
         self.assertIn("0xFF7EB6", eyes_cc)
         self.assertIn("0xBF8FFF", eyes_cc)
         self.assertIn("RecomputePalette(color != 0 ? lv_color_hex(color) : eye_color_default_)", eyes_cc)
@@ -1206,7 +1220,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("tears", eyes_cc)
         self.assertIn("sweat", eyes_cc)
         self.assertIn("sparkle", eyes_cc)
-        self.assertIn("{30, 30", eyes_cc)  # angry 双眉镜像内压
+        self.assertIn("{18, 18", eyes_cc)  # angry 双眉镜像内压但限制攻击性
         self.assertIn("for (int i = 1; i <= 16; i++)", eyes_cc)  # 嘴线分段平滑
 
         # speaking 的可见反馈是嘴部开合，不只是眼睛 bounce
@@ -1272,11 +1286,42 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self.assertIn("DrawNose", eyes_h)
         self.assertIn("void GrobotEyes::DrawNose", eyes_cc)
-        self.assertIn("const int width = eyeR * 9 / 5", eyes_cc)
-        self.assertIn("const int lipGap = std::max(4, open / 2)", eyes_cc)
-        self.assertIn("upperY", eyes_cc)
-        self.assertIn("lowerY", eyes_cc)
-        self.assertIn("{0, 0, 0, 0, 0.22f, 0.16f", eyes_cc)
+        self.assertIn("const int width = eyeR * 11 / 5", eyes_cc)
+        self.assertIn("const int lipGap = std::max(6, open / 2)", eyes_cc)
+        self.assertIn("const int lipSeparation = lipGap - lipGap * iabs / 8", eyes_cc)
+        self.assertIn("nextUpperY", eyes_cc)
+        self.assertIn("nextLowerY", eyes_cc)
+        self.assertIn("{0, 0, 0, 0, 0.48f, 0.12f", eyes_cc)
+
+    def test_grobot_sleepy_face_is_relaxed_not_sad(self):
+        """sleepy 用半闭眼表达困倦，不得叠加低头、压眉和暗色造成 sad 语义。"""
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("{55, 0, 0, 20, 42, 0, 0}", eyes_cc)
+        self.assertIn("{0, 0, 0.22f, 0.02f, 0.45f, 0.02f", eyes_cc)
+        self.assertNotIn("0x3E8E96,  // sleepy", eyes_cc)
+        self.assertIn("0,         // sleepy：品牌青", eyes_cc)
+
+    def test_grobot_sleepy_disables_blink_and_idle_saccade(self):
+        """sleepy 保持稳定半闭眼和居中视线，退出后重新开始眨眼间隔。"""
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("kSleepyMoodIndex", eyes_cc)
+        blink_start = eyes_cc.index("void GrobotEyes::Blink()")
+        blink_end = eyes_cc.index("void GrobotEyes::ApplyFacialData", blink_start)
+        blink_body = eyes_cc[blink_start:blink_end]
+        self.assertIn("if (mood_index_ == kSleepyMoodIndex)", blink_body)
+        self.assertIn("targetL_.topH = baseL_.topH", blink_body)
+        set_start = eyes_cc.index("void GrobotEyes::SetEmotion")
+        set_end = eyes_cc.index("void GrobotEyes::SetSpeaking", set_start)
+        set_body = eyes_cc[set_start:set_end]
+        self.assertIn("last_blink_us_ = esp_timer_get_time()", set_body)
+        saccade_start = eyes_cc.index("// 空闲眼跳")
+        saccade_end = eyes_cc.index("ApplySpring(saccCurX_", saccade_start)
+        saccade_body = eyes_cc[saccade_start:saccade_end]
+        self.assertIn("mood_index_ != kSleepyMoodIndex", saccade_body)
 
     def test_grobot_eyebrows_use_mirrored_quadratic_curves(self):
         """眉毛不能是机械直杆：左右眉各用 12 段二次曲线，保留情绪倾角并镜像。"""
@@ -1289,14 +1334,34 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("for (int i = 1; i <= 12; i++)", body)
         self.assertIn("1.0f - nx * nx", body)
         self.assertIn("browArch", body)
-        self.assertIn("const int halfW = eyeR * 4 / 5", body)
+        self.assertIn("const int halfW = eyeR * 3 / 4", body)
         self.assertIn("const int browArch = std::max(10, eyeR / 6)", body)
-        self.assertIn("const int browWeight = std::max(2, eyeR / 20)", body)
+        self.assertIn("const int browWeight = std::max(2, eyeR / 24)", body)
         self.assertIn("browGlowWeight", body)
         self.assertIn("glow_[0]", body)
         self.assertIn("brow, browWeight", body)
         self.assertIn("drawBrow", body)
         self.assertNotIn("cx - offset - halfW, yL - tiltL", body)
+
+    def test_grobot_child_friendly_emotions_bound_extremes(self):
+        """未成年人界面保留负面情绪语义，但限制攻击性角度、刺激色和剧烈动画。"""
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("{0, 0, -32, 27, 45, 0, 0.15f}", eyes_cc)  # sad
+        self.assertIn("{0, 0, 35, 30, 45, 0, 0}", eyes_cc)  # angry
+        self.assertIn("{24, 0, -30, 24, 43, 0, 0.15f}", eyes_cc)  # crying
+        self.assertIn("{0, 0, -6, 38, 50, 0, 0}", eyes_cc)  # shocked
+        self.assertIn("{-8, -8, -0.03f, -0.03f, -0.35f, 0.05f", eyes_cc)
+        self.assertIn("{18, 18, -0.04f, -0.04f, -0.20f, 0.06f", eyes_cc)
+        self.assertIn("{-8, -8, -0.06f, -0.06f, -0.40f, 0.18f", eyes_cc)
+        self.assertIn("{0, 0, 0.18f, 0.18f, 0, 0.72f", eyes_cc)
+        self.assertIn("0xFF7A70,  // angry：柔珊瑚", eyes_cc)
+        self.assertIn("0xA8CAFF,  // crying：柔浅蓝", eyes_cc)
+        self.assertIn("0xFFD166,  // shocked：暖金", eyes_cc)
+        self.assertIn("mood_index_ == kSleepyMoodIndex ? 0", eyes_cc)
+        self.assertIn("1.0f * sinf", eyes_cc)
+        self.assertNotIn("2.0f * sinf", eyes_cc)
 
     def test_grobot_speaking_mouth_is_clean_and_nose_has_contrast(self):
         """张嘴时只画独立嘴腔/舌色，不叠闭嘴双唇；鼻色对黑底有足够辨识度。"""
@@ -1309,7 +1374,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         nose_body = eyes_cc[nose_start:mouth_start]
         mouth_body = eyes_cc[mouth_start:effects_start]
         self.assertIn("bg_color_, 145", nose_body)
-        self.assertIn("const int noseRx = std::max(12, eyeR / 4)", nose_body)
+        self.assertIn("const int noseRx = std::max(14, eyeR / 3)", nose_body)
         self.assertIn("noseHighlight", nose_body)
         self.assertNotIn("BufFillEllipse(cx, noseY - 1", nose_body)
         self.assertIn("if (open > 5)", mouth_body)
@@ -1318,6 +1383,48 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("lowerLipWeight", mouth_body)
         self.assertIn("return;", mouth_body)
         self.assertLess(mouth_body.index("return;"), mouth_body.index("int prevX"))
+
+    def test_grobot_waveshare_visual_polish_contract(self):
+        """Waveshare 大屏细化：降低背景竞争、收窄眼环、压紧眉鼻嘴节奏。"""
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("for (int y = 5; y < h_; y += 6)", eyes_cc)
+        self.assertNotIn("BufFillRect(0, 0, corner", eyes_cc)
+        self.assertNotIn("const int corner =", eyes_cc)
+        self.assertIn("eyeR + 10 + pulse", eyes_cc)
+        self.assertNotIn("eyeR + 15 + pulse", eyes_cc)
+        self.assertIn("const int browBaseOffset = eyeR / 10", eyes_cc)
+        self.assertIn("const int halfW = eyeR * 3 / 4", eyes_cc)
+        self.assertIn("const int browWeight = std::max(2, eyeR / 24)", eyes_cc)
+        self.assertIn("const int noseRx = std::max(14, eyeR / 3)", eyes_cc)
+        self.assertIn("noseShadow", eyes_cc)
+        self.assertIn("const int width = eyeR * 11 / 5", eyes_cc)
+        self.assertIn("const int lipGap = std::max(6, open / 2)", eyes_cc)
+        self.assertIn("{0, 0, 0, 0, 0.48f, 0.12f", eyes_cc)
+        self.assertIn("const int lipArc = (int)(curve * (1.0f - nx * nx))", eyes_cc)
+        self.assertIn("const int lipSeparation = lipGap - lipGap * iabs", eyes_cc)
+        self.assertIn("layout_.scale *= 1.08f", eyes_cc)
+        self.assertIn("layout_.centerY = h_ / 2 + eyeR / 5", eyes_cc)
+        self.assertIn("mouthCorner", eyes_cc)
+        self.assertIn("const int cy = layout_.centerY", eyes_cc)
+    def test_grobot_uses_cached_golden_ratio_layout(self):
+        """全脸采用缓存的黄金比例构图，避免按画布高度直接把眼睛撑满。"""
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
+            encoding="utf-8"
+        )
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("struct FaceLayout", eyes_h)
+        self.assertIn("FaceLayout layout_", eyes_h)
+        self.assertIn("constexpr float kPhi = 1.61803398875f", eyes_cc)
+        self.assertIn("layout_.eyeRadius = (int)lroundf(kEyeRadius * layout_.scale)", eyes_cc)
+        self.assertIn("layout_.centerY = h_ / 2 + eyeR / 5", eyes_cc)
+        self.assertNotIn("usableHeight / (kPhi * kPhi * kPhi)", eyes_cc)
+        render_start = eyes_cc.index("void GrobotEyes::Render()")
+        render_body = eyes_cc[render_start:]
+        self.assertNotIn("float scale = (float)h_ / kBaseH", render_body)
 
     def test_grobot_review_hardening_palette_lock_init_and_tables(self):
         """审查修复：语义色真实应用；状态更新持锁；canvas 分配失败回落；
