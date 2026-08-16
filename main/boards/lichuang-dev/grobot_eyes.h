@@ -16,6 +16,19 @@ struct MoodData {
     float lookY;
 };
 
+struct FacialData {
+    float browTiltL;
+    float browTiltR;
+    float browLiftL;
+    float browLiftR;
+    float mouthCurve;
+    float mouthOpen;
+    float blush;
+    float tears;
+    float sweat;
+    float sparkle;
+};
+
 struct EyeState {
     float topH, botH, tilt, pR, eyeRadius;
     float lookX, lookY;
@@ -28,7 +41,7 @@ public:
     ~GrobotEyes();
     void Init(lv_obj_t* parent, int w, int h);
     void SetEmotion(const char* emotion);
-    /** 说话中：双眼随语速微弹跳（幅度 ±2px，约 6Hz）。 */
+    /** 说话中：嘴巴随节律开合，整张脸轻微弹跳。 */
     void SetSpeaking(bool on);
     /** 聆听中：瞳孔放大 ~18%（专注倾听的视觉反馈）。 */
     void SetListening(bool on);
@@ -42,6 +55,12 @@ private:
                      float damping = 15.0f);
     void DrawEye(int cx, int cy, int gazeX, int gazeY, int pR, int eyeR, int lidH, int botH,
                  int tilt, bool isLeft, bool heartPupil);
+    void ApplyFacialData(const FacialData& data);
+    void DrawEyebrows(int cx, int cy, int eyeR, int offset);
+    void DrawMouth(int cx, int cy, int eyeR);
+    void DrawFacialEffects(int cx, int cy, int eyeR, int offset);
+    void BufFillEllipse(int cx, int cy, int rx, int ry, lv_color_t c);
+    void BufLine(int x0, int y0, int x1, int y1, lv_color_t c, int thickness = 1);
     void DrawBackground();
     void BufFillRect(int x, int y, int w, int h, lv_color_t c);
     void BufFillCircle(int cx, int cy, int r, lv_color_t c);
@@ -82,6 +101,7 @@ private:
     int saccade_interval_ms_ = 2000;
 
     EyeState curL_{}, curR_{}, targetL_{}, targetR_{}, baseL_{}, baseR_{};
+    FacialData face_cur_{}, face_target_{}, face_vel_{};
 
     int64_t last_frame_us_ = 0;
     int64_t last_blink_us_ = 0;
@@ -92,7 +112,7 @@ private:
     static constexpr float kEyeRadius = 45.0f;
     static constexpr float kPupilRadius = 30.0f;
     static constexpr int kEyeGap = 20;
-    static constexpr float kBaseH = 120.0f;
+    static constexpr float kBaseH = 190.0f;
 };
 
 #endif

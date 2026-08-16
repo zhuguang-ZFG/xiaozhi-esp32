@@ -876,8 +876,8 @@ void LcdDisplay::SetupUI() {
     {
         auto eye_c = lv_color_make(0x00, 0xD4, 0xFF);
         grobot_eyes_ = std::make_unique<GrobotEyes>(eye_c, lvgl_theme->background_color());
-        lv_obj_set_size(emoji_box_, 280, 140);
-        grobot_eyes_->Init(emoji_box_, 280, 140);
+        lv_obj_set_size(emoji_box_, 280, 190);
+        grobot_eyes_->Init(emoji_box_, 280, 190);
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1118,7 +1118,7 @@ void LcdDisplay::ClearChatMessages() {
 void LcdDisplay::SetStatus(const char* status) {
     LvglDisplay::SetStatus(status);
 #ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
-    // 说话/聆听状态驱动眼睛行为：说话微弹跳、聆听瞳孔放大（grobot_eyes.cc）。
+    // 说话/聆听状态驱动全脸：说话嘴部开合+微弹跳、聆听瞳孔放大。
     // 只在 lichuang-dev 分支生效，其它板型保持基类行为。
     if (grobot_eyes_ != nullptr && status != nullptr) {
         grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0);

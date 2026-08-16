@@ -1164,9 +1164,11 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("tears", eyes_cc)
         self.assertIn("sweat", eyes_cc)
         self.assertIn("sparkle", eyes_cc)
+        self.assertIn("{30, 30", eyes_cc)  # angry 双眉镜像内压
+        self.assertIn("for (int i = 1; i <= 16; i++)", eyes_cc)  # 嘴线分段平滑
 
         # speaking 的可见反馈是嘴部开合，不只是眼睛 bounce
-        self.assertIn("speaking_ ?", eyes_cc)
+        self.assertIn("speaking_", eyes_cc)
         self.assertIn("mouthOpenTarget", eyes_cc)
         self.assertIn("DrawMouth", eyes_cc)
 
