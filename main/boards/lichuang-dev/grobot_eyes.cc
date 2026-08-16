@@ -1,9 +1,13 @@
 #include "grobot_eyes.h"
+#include <esp_log.h>
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
+
+static const char* TAG = "GrobotEyes";
 
 // 每情绪 7 参：topH, botH, tilt, pR, radius, lookX, lookY。
 // 视线取值参考社区 RoboEyes setPosition() 方位语义：thinking 看右上、sad 垂眼、
@@ -88,7 +92,10 @@ static const char* kNames[] = {
     "loving",  "embarrassed", "surprised", "shocked",   "thinking", "winking", "cool",
     "relaxed", "delicious",   "kissy",     "confident", "sleepy",   "silly",   "confused",
 };
-static constexpr int kMoodCount = 21;
+static_assert(std::size(kMoods) == std::size(kNames));
+static_assert(std::size(kFacialMoods) == std::size(kNames));
+static_assert(std::size(kMoodColors) == std::size(kNames));
+static constexpr size_t kMoodCount = std::size(kNames);
 
 GrobotEyes::GrobotEyes(lv_color_t eyeColor, lv_color_t bgColor)
     : eye_color_(eyeColor), bg_color_(bgColor), eye_color_default_(eyeColor) {
@@ -100,6 +107,7 @@ GrobotEyes::GrobotEyes(lv_color_t eyeColor, lv_color_t bgColor)
 }
 
 void GrobotEyes::RecomputePalette(lv_color_t eye_color) {
+    eye_color_ = eye_color;
     scan_color_ = lv_color_mix(eye_color_, bg_color_, 7);
     glow_[0] = lv_color_mix(eye_color_, bg_color_, 38);
     glow_[1] = lv_color_mix(eye_color_, bg_color_, 77);
@@ -120,15 +128,35 @@ GrobotEyes::~GrobotEyes() {
         lv_draw_buf_destroy(draw_buf_);
 }
 
-void GrobotEyes::Init(lv_obj_t* parent, int w, int h) {
+bool GrobotEyes::Init(lv_obj_t* parent, int w, int h) {
     w_ = w;
     h_ = h;
     draw_buf_ = lv_draw_buf_create(w, h, LV_COLOR_FORMAT_RGB565, 0);
+    if (draw_buf_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate GrobotEyes draw buffer (%dx%d)", w, h);
+        return false;
+    }
     canvas_ = lv_canvas_create(parent);
+    if (canvas_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create GrobotEyes canvas");
+        lv_draw_buf_destroy(draw_buf_);
+        draw_buf_ = nullptr;
+        return false;
+    }
     lv_canvas_set_draw_buf(canvas_, draw_buf_);
     lv_obj_center(canvas_);
     buf_ = (uint16_t*)draw_buf_->data;
     timer_ = lv_timer_create(TimerCb, 33, this);
+    if (timer_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create GrobotEyes timer");
+        lv_obj_delete(canvas_);
+        canvas_ = nullptr;
+        lv_draw_buf_destroy(draw_buf_);
+        draw_buf_ = nullptr;
+        buf_ = nullptr;
+        return false;
+    }
+    return true;
 }
 
 void GrobotEyes::TimerCb(lv_timer_t* t) { ((GrobotEyes*)lv_timer_get_user_data(t))->Render(); }
@@ -161,6 +189,9 @@ void GrobotEyes::Blink() {
 void GrobotEyes::ApplyFacialData(const FacialData& data) { face_target_ = data; }
 
 void GrobotEyes::SetEmotion(const char* emotion) {
+    if (emotion == nullptr) {
+        emotion = "neutral";
+    }
     MoodData left = kMoods[0], right = kMoods[0];
     uint32_t color = 0;
     mood_index_ = -1;

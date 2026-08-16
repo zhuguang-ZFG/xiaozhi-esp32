@@ -39,7 +39,7 @@ class GrobotEyes {
 public:
     GrobotEyes(lv_color_t eyeColor, lv_color_t bgColor);
     ~GrobotEyes();
-    void Init(lv_obj_t* parent, int w, int h);
+    bool Init(lv_obj_t* parent, int w, int h);
     void SetEmotion(const char* emotion);
     /** 说话中：嘴巴随节律开合，整张脸轻微弹跳。 */
     void SetSpeaking(bool on);

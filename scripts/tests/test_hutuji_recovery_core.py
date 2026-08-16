@@ -1266,6 +1266,49 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("return;", mouth_body)
         self.assertLess(mouth_body.index("return;"), mouth_body.index("int prevX"))
 
+    def test_grobot_review_hardening_palette_lock_init_and_tables(self):
+        """审查修复：语义色真实应用；状态更新持锁；canvas 分配失败回落；
+        四张情绪表由编译期不变量保证同长。"""
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
+            encoding="utf-8"
+        )
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+
+        palette_start = eyes_cc.index("void GrobotEyes::RecomputePalette")
+        palette_end = eyes_cc.index("GrobotEyes::~GrobotEyes", palette_start)
+        palette_body = eyes_cc[palette_start:palette_end]
+        self.assertIn("eye_color_ = eye_color", palette_body)
+        self.assertIn("void GrobotEyes::UpdateDeltaTime()", eyes_cc)
+
+        status_start = lcd_cc.index("void LcdDisplay::SetStatus")
+        status_end = lcd_cc.index("void LcdDisplay::SetEmotion", status_start)
+        status_body = lcd_cc[status_start:status_end]
+        self.assertIn("DisplayLockGuard lock(this)", status_body)
+        self.assertLess(
+            status_body.index("DisplayLockGuard lock(this)"),
+            status_body.index("grobot_eyes_->SetSpeaking"),
+        )
+
+        self.assertIn("bool Init(lv_obj_t* parent, int w, int h)", eyes_h)
+        init_start = eyes_cc.index("bool GrobotEyes::Init")
+        init_end = eyes_cc.index("void GrobotEyes::TimerCb", init_start)
+        init_body = eyes_cc[init_start:init_end]
+        self.assertIn("if (draw_buf_ == nullptr)", init_body)
+        self.assertIn("if (canvas_ == nullptr)", init_body)
+        self.assertIn("if (timer_ == nullptr)", init_body)
+        self.assertIn("return false", init_body)
+        self.assertIn("return true", init_body)
+        self.assertIn("if (eyes->Init(emoji_box_, 280, 190))", lcd_cc)
+        self.assertIn("Failed to initialize GrobotEyes", lcd_cc)
+
+        self.assertIn("static_assert(std::size(kMoods) == std::size(kNames))", eyes_cc)
+        self.assertIn("static_assert(std::size(kFacialMoods) == std::size(kNames))", eyes_cc)
+        self.assertIn("static_assert(std::size(kMoodColors) == std::size(kNames))", eyes_cc)
+        self.assertIn("kMoodCount = std::size(kNames)", eyes_cc)
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -894,11 +894,15 @@ void LcdDisplay::SetupUI() {
 #ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
     {
         auto eye_c = lv_color_make(0x00, 0xD4, 0xFF);
-        grobot_eyes_ = std::make_unique<GrobotEyes>(eye_c, lvgl_theme->background_color());
+        auto eyes = std::make_unique<GrobotEyes>(eye_c, lvgl_theme->background_color());
         lv_obj_set_size(emoji_box_, 280, 190);
-        grobot_eyes_->Init(emoji_box_, 280, 190);
-        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        if (eyes->Init(emoji_box_, 280, 190)) {
+            grobot_eyes_ = std::move(eyes);
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize GrobotEyes; using emoji fallback");
+        }
     }
 #endif
 
@@ -1151,8 +1155,9 @@ void LcdDisplay::SetStatus(const char* status) {
     LvglDisplay::SetStatus(status);
 #ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
     // 说话/聆听状态驱动全脸：说话嘴部开合+微弹跳、聆听瞳孔放大。
-    // 只在 lichuang-dev 分支生效，其它板型保持基类行为。
+    // 状态写入与 33ms LVGL timer 读取必须在同一显示锁内。
     if (grobot_eyes_ != nullptr && status != nullptr) {
+        DisplayLockGuard lock(this);
         grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0);
         grobot_eyes_->SetListening(std::strcmp(status, Lang::Strings::LISTENING) == 0);
     }
