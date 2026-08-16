@@ -1218,6 +1218,24 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("grobot_eyes_ == nullptr", clear_body)
         self.assertIn("lv_obj_remove_flag(emoji_label_", clear_body)
 
+    def test_grobot_neutral_face_has_nose_and_fuller_resting_lips(self):
+        """neutral 不能只有一条嘴线：需要低对比度圆角机器人鼻、较宽上下唇弧，
+        同时保留 speaking 张合嘴腔。"""
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
+            encoding="utf-8"
+        )
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("DrawNose", eyes_h)
+        self.assertIn("void GrobotEyes::DrawNose", eyes_cc)
+        self.assertIn("DrawNose(cx", eyes_cc)
+        self.assertIn("const int width = eyeR + 28", eyes_cc)
+        self.assertIn("const int lipGap = std::max(3, open / 2)", eyes_cc)
+        self.assertIn("upperY", eyes_cc)
+        self.assertIn("lowerY", eyes_cc)
+        self.assertIn("{0, 0, 0, 0, 0.22f, 0.16f", eyes_cc)
+
 if __name__ == "__main__":
     unittest.main()
 
