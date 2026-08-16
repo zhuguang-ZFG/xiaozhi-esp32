@@ -1115,6 +1115,17 @@ void LcdDisplay::ClearChatMessages() {
     }
 }
 #endif
+void LcdDisplay::SetStatus(const char* status) {
+    LvglDisplay::SetStatus(status);
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    // 说话/聆听状态驱动眼睛行为：说话微弹跳、聆听瞳孔放大（grobot_eyes.cc）。
+    // 只在 lichuang-dev 分支生效，其它板型保持基类行为。
+    if (grobot_eyes_ != nullptr && status != nullptr) {
+        grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0);
+        grobot_eyes_->SetListening(std::strcmp(status, Lang::Strings::LISTENING) == 0);
+    }
+#endif
+}
 
 void LcdDisplay::SetEmotion(const char* emotion) {
     if (!setup_ui_called_) {

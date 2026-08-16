@@ -1037,6 +1037,60 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("pdMS_TO_TICKS(30000)", rec_body)
         self.assertIn("等待写字机重连超时，请检查写字机电源和网络后重新开始", rec_body)
 
+    def test_grobot_eyes_gaze_wink_color_and_state_hooks(self):
+        """眼睛细化包（参考 FluxGarage/RoboEyes 语义）：MoodData 带 lookX/lookY 视线；
+        winking 必须不对称（右眼全闭）；情绪配色表存在；说话/聆听钩子接入
+        LcdDisplay::SetStatus 且调用基类保住状态栏文本。"""
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
+            encoding="utf-8"
+        )
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+
+        # 视线维度进情绪模型与弹簧插值
+        self.assertIn("float lookX;", eyes_h)
+        self.assertIn("float lookY;", eyes_h)
+        self.assertIn("SetSpeaking(bool on)", eyes_h)
+        self.assertIn("SetListening(bool on)", eyes_h)
+        self.assertIn("ApplySpring(c.lookX, c.vLookX, t.lookX, dt_, 120, 18)", eyes_cc)
+        # thinking 看右上（RoboEyes setPosition 语义）
+        self.assertIn("{10, 15, -20, 28, 43, 0.45f, -0.40f}", eyes_cc)
+        # 高光跟随瞳孔而非固定眼心
+        self.assertIn("pcx - eyeR / 4, pcy - eyeR / 4", eyes_cc)
+
+        # winking 修复：i == 12 右眼全闭（topH=100 与 Blink() 全闭量一致）
+        self.assertIn("i == 12", eyes_cc)
+        wink_line = next(
+            line for line in eyes_cc.splitlines() if "right = {100, 0, 0, 25, 45" in line
+        )
+        self.assertIn("0.15f, 0", wink_line)
+
+        # 情绪配色：angry 红 / loving 粉 / thinking 紫 必须在表内
+        self.assertIn("kMoodColors", eyes_cc)
+        self.assertIn("0xFF453A", eyes_cc)
+        self.assertIn("0xFF7EB6", eyes_cc)
+        self.assertIn("0xBF8FFF", eyes_cc)
+        self.assertIn("RecomputePalette(color != 0 ? lv_color_hex(color) : eye_color_default_)", eyes_cc)
+
+        # 说话/聆听钩子：LcdDisplay::SetStatus 先调基类再驱动眼睛
+        self.assertIn("void LcdDisplay::SetStatus(const char* status)", lcd_cc)
+        status_start = lcd_cc.index("void LcdDisplay::SetStatus(const char* status)")
+        status_end = lcd_cc.index("void LcdDisplay::SetEmotion", status_start)
+        status_body = lcd_cc[status_start:status_end]
+        self.assertIn("LvglDisplay::SetStatus(status);", status_body)
+        self.assertIn("grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0)", status_body)
+        self.assertIn("grobot_eyes_->SetListening(std::strcmp(status, Lang::Strings::LISTENING) == 0)", status_body)
+        # 基类调用必须在眼睛驱动之前（状态栏文本不能被截掉）
+        self.assertLess(
+            status_body.index("LvglDisplay::SetStatus(status);"),
+            status_body.index("grobot_eyes_->SetSpeaking"),
+        )
+        # 说话弹跳与聆听放大落在渲染侧
+        self.assertIn("speaking_", eyes_cc)
+        self.assertIn("listening_ ? 1.18f : 1.0f", eyes_cc)
+
 
 if __name__ == "__main__":
     unittest.main()

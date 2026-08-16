@@ -10,11 +10,16 @@ struct MoodData {
     float tilt;
     float pR;
     float radius;
+    // 归一化视线方向（-1..1；lookX>0 向右，lookY>0 向下），语义对齐社区
+    // FluxGarage/RoboEyes 的 setPosition() 方位参数。
+    float lookX;
+    float lookY;
 };
 
 struct EyeState {
     float topH, botH, tilt, pR, eyeRadius;
-    float vTop, vBot, vTilt, vPR, vRadius;
+    float lookX, lookY;
+    float vTop, vBot, vTilt, vPR, vRadius, vLookX, vLookY;
 };
 
 class GrobotEyes {
@@ -23,22 +28,26 @@ public:
     ~GrobotEyes();
     void Init(lv_obj_t* parent, int w, int h);
     void SetEmotion(const char* emotion);
+    /** 说话中：双眼随语速微弹跳（幅度 ±2px，约 6Hz）。 */
+    void SetSpeaking(bool on);
+    /** 聆听中：瞳孔放大 ~18%（专注倾听的视觉反馈）。 */
+    void SetListening(bool on);
 
 private:
     static void TimerCb(lv_timer_t* t);
     void Render();
     void UpdateDeltaTime();
     void Blink();
-    void ApplySpring(float& cur, float& vel, float target, float dt,
-                     float stiffness = 180.0f, float damping = 15.0f);
-    void DrawEye(int cx, int cy, int pR, int eyeR, int lidH, int botH,
+    void ApplySpring(float& cur, float& vel, float target, float dt, float stiffness = 180.0f,
+                     float damping = 15.0f);
+    void DrawEye(int cx, int cy, int gazeX, int gazeY, int pR, int eyeR, int lidH, int botH,
                  int tilt, bool isLeft);
     void DrawBackground();
     void BufFillRect(int x, int y, int w, int h, lv_color_t c);
     void BufFillCircle(int cx, int cy, int r, lv_color_t c);
-    void BufFillTriangle(int x0, int y0, int x1, int y1, int x2, int y2,
-                         lv_color_t c);
+    void BufFillTriangle(int x0, int y0, int x1, int y1, int x2, int y2, lv_color_t c);
     void BufHLine(int x0, int x1, int y, uint16_t cv);
+    void RecomputePalette(lv_color_t eye_color);
 
     lv_obj_t* canvas_ = nullptr;
     lv_draw_buf_t* draw_buf_ = nullptr;
@@ -52,6 +61,9 @@ private:
     lv_color_t pupil_color_;
     lv_color_t highlight_color_;
     lv_color_t scan_color_;
+    lv_color_t eye_color_default_;
+    bool speaking_ = false;
+    bool listening_ = false;
 
     EyeState curL_{}, curR_{}, targetL_{}, targetR_{}, baseL_{}, baseR_{};
 
