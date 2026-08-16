@@ -1151,8 +1151,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("struct FacialData", eyes_h)
         self.assertIn("kFacialMoods", eyes_cc)
         self.assertIn("ApplyFacialData", eyes_cc)
-        self.assertIn("ApplySpring(curMouthOpen_", eyes_cc)
-        self.assertIn("ApplySpring(curBrowL_", eyes_cc)
+        self.assertIn("ApplySpring(face_cur_.mouthOpen", eyes_cc)
+        self.assertIn("ApplySpring(face_cur_.browTiltL", eyes_cc)
 
         # 程序化图层：不依赖 GIF/Emote 资源
         self.assertIn("BufFillEllipse", eyes_h)
