@@ -777,37 +777,33 @@ void Pipe::ParseStatusReport(const std::string& line) {
         }
     }
 
-    // MPos
-    size_t mpos = content.find("MPos:");
-    if (mpos != std::string::npos) {
-        float x = 0, y = 0, z = 0;
-        if (std::sscanf(content.c_str() + mpos, "MPos:%f,%f,%f", &x, &y, &z) == 3) {
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                mpos_x_ = x;
-                mpos_y_ = y;
-                mpos_z_ = z;
+    // MPos：只把完整有限三轴作为新位置证据。$10 可持久化为 WPos；网络/固件异常
+    // 也可能产生 NaN/Inf。两者都可推进通用状态序号，但不得推进位置序号。
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    if (ParseFiniteMPos(content, x, y, z)) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            mpos_x_ = x;
+            mpos_y_ = y;
+            mpos_z_ = z;
+        }
+        mpos_report_seq_.fetch_add(1);
+        if (auth_probe_stage_ == AuthProbeStage::WaitingAbortLiftIdle && gs == GrblState::Idle) {
+            // Z 抬笔行的 ok 只表示进入 planner；实机上紧接着发 $I 会在 Run 态
+            // 收到 error:8。等新状态确认 Idle 后再继续探活。
+            auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
+            if (!SendLine("$I")) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "abort 复位后探活发送失败");
             }
-            if (auth_probe_stage_ == AuthProbeStage::WaitingAbortLiftIdle &&
-                gs == GrblState::Idle) {
-                // Z 抬笔行的 ok 只表示进入 planner；实机上紧接着发 $I 会在 Run 态
-                // 收到 error:8。等新状态确认 Idle 后再继续探活。
-                auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
-                if (!SendLine("$I")) {
-                    auth_probe_stage_ = AuthProbeStage::Failed;
-                    ESP_LOGE(TAG, "abort 复位后探活发送失败");
-                }
-            } else if (auth_probe_stage_ == AuthProbeStage::WaitingPosition &&
-                       gs == GrblState::Idle) {
-                // 授权状态没有 Telnet 查询命令。先 M5 抬笔，再以机器坐标发送当前 X 的
-                // G1 零位移行：已授权回 ok，未授权由 Protocol.cpp 的行首 G0~G3
-                // 前置门回 error:110。G1 必须放在 G53 前；`G53 G1` 会绕过该前置门，
-                // GCode.cpp 内层静默跳过未授权运动后仍回 ok，导致误报已授权。
-                auth_probe_stage_ = AuthProbeStage::WaitingMotionReply;
-                if (!SendLine(BuildLicenseProbeLine(x))) {
-                    auth_probe_stage_ = AuthProbeStage::Failed;
-                    ESP_LOGE(TAG, "授权探测发送失败");
-                }
+        } else if (auth_probe_stage_ == AuthProbeStage::WaitingPosition && gs == GrblState::Idle) {
+            // 授权状态没有 Telnet 查询命令。先 M5 抬笔，再以机器坐标发送当前 X 的
+            // G1 零位移行：已授权回 ok，未授权由 Protocol.cpp 的行首 G0~G3
+            // 前置门回 error:110。
+            auth_probe_stage_ = AuthProbeStage::WaitingMotionReply;
+            if (!SendLine(BuildLicenseProbeLine(x))) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "授权探测发送失败");
             }
         }
     }

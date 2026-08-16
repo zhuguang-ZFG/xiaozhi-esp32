@@ -157,6 +157,9 @@ private:
     std::atomic<StreamQuiescence> stream_quiescence_{StreamQuiescence::Idle};
     // abort owner 已用 fresh Hold:0/Idle 证明机器停稳；流任务可丢弃旧应答并发布 Quiesced。
     std::atomic<bool> abort_hold_confirmed_{false};
+    // character-counting 收到 error 后，Grbl RX 内后续行仍会继续执行。流线程先 `!`
+    // 并退窗，Run 随后同步走受控 reset；reset 完成前不能发布 error 或释放 busy_。
+    std::atomic<bool> stream_error_stop_required_{false};
     // 重画：跳过下载/校验，直接复用 buffer_
     std::atomic<bool> repeat_mode_{false};
     // buffer_ 是否留存着可重画的 G-code（出图成功后不释放）

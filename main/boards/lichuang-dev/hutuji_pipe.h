@@ -148,6 +148,7 @@ public:
 
     GrblState GetGrblState() const { return grbl_state_.load(); }
     uint32_t GetStatusReportSequence() const { return status_report_seq_.load(); }
+    uint32_t GetMposReportSequence() const { return mpos_report_seq_.load(); }
     static const char* GrblStateName(GrblState s);
 
     void GetMachinePos(float& x, float& y, float& z) const {
@@ -301,6 +302,8 @@ private:
     std::string last_line_;
     std::string last_response_;
     int last_error_code_ = -1;
+    // 只有完整有限 MPos 成功提交才递增；通用 status 序号不能证明位置新鲜。
+    std::atomic<uint32_t> mpos_report_seq_{0};
     float mpos_x_ = 0, mpos_y_ = 0, mpos_z_ = 0;
     int alarm_code_ = 0;
 

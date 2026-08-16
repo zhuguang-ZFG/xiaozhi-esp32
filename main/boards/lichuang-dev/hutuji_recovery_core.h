@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -78,6 +79,28 @@ inline int ParseGrblErrorCode(const std::string& line) {
         }
     }
     return -1;
+}
+
+/** 只接受完整且有限的 MPos 三轴；WPos/缺轴/NaN/Inf 都不能成为完成证据。 */
+inline bool ParseFiniteMPos(const std::string& status, float& x, float& y, float& z) {
+    const size_t mpos = status.find("MPos:");
+    if (mpos == std::string::npos) {
+        return false;
+    }
+    float parsed_x = 0.0f, parsed_y = 0.0f, parsed_z = 0.0f;
+    int consumed = 0;
+    if (std::sscanf(status.c_str() + mpos, "MPos:%f,%f,%f%n", &parsed_x, &parsed_y, &parsed_z,
+                    &consumed) != 3 ||
+        consumed <= 0 ||
+        (mpos + static_cast<size_t>(consumed) < status.size() &&
+         status[mpos + static_cast<size_t>(consumed)] != '|') ||
+        !std::isfinite(parsed_x) || !std::isfinite(parsed_y) || !std::isfinite(parsed_z)) {
+        return false;
+    }
+    x = parsed_x;
+    y = parsed_y;
+    z = parsed_z;
+    return true;
 }
 
 /**

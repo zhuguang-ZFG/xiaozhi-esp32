@@ -57,12 +57,19 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 timeout=120,
             )
             self.assertEqual(build.returncode, 0, build.stderr or build.stdout)
+
+            env = os.environ.copy()
+            # Scoop/MinGW 的 g++.exe 可直接运行，但新编出的 exe 依赖同目录
+            # libstdc++/libgcc DLL；临时目录启动时 Windows 不会自动搜索编译器目录。
+            # 把该目录仅注入测试子进程 PATH，不污染全局环境或产品构建。
+            env["PATH"] = str(Path(compiler).parent) + os.pathsep + env.get("PATH", "")
             run = subprocess.run(
                 [str(output_path)],
                 cwd=temp,
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=env,
             )
             self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
@@ -717,6 +724,72 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 仅复核不够：命中后必须走与循环顶部同款的收敛（含 MarkQuiesced），
         # 否则 quiescence 仍是 Failed，受限 reset 照样被自家门拒。
         self.assertIn("quiesce_for_abort()", between)
+
+    def test_status_position_requires_finite_fresh_mpos(self):
+        """P1：NaN/Inf 与只含 WPos 的 fresh status 都不能成为丢 ok 的位置证据。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <cmath>
+
+            int main() {
+                float x = 0.0f, y = 0.0f, z = 0.0f;
+                assert(hutuji::ParseFiniteMPos("Idle|MPos:1.25,2.5,0", x, y, z));
+                assert(std::fabs(x - 1.25f) < 0.001f);
+                assert(!hutuji::ParseFiniteMPos("Idle|MPos:1.25,2.5,0garbage", x, y, z));
+                assert(!hutuji::ParseFiniteMPos("Idle|MPos:nan,2.5,0", x, y, z));
+                assert(!hutuji::ParseFiniteMPos("Idle|MPos:inf,2.5,0", x, y, z));
+                assert(!hutuji::ParseFiniteMPos("Idle|WPos:1.25,2.5,0", x, y, z));
+                assert(!hutuji::ParseFiniteMPos("Idle|MPos:1.25,2.5", x, y, z));
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_finite_mpos_test")
+
+        pipe_h = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.h").read_text(encoding="utf-8")
+        pipe_cc = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(encoding="utf-8")
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        self.assertIn("GetMposReportSequence", pipe_h)
+        self.assertIn("mpos_report_seq_.fetch_add(1)", pipe_cc)
+        fallback_start = job_cc.index("bool Job::ConfirmInFlightDoneByStatus")
+        fallback_end = job_cc.index("bool Job::WaitForIdle", fallback_start)
+        fallback = job_cc[fallback_start:fallback_end]
+        self.assertIn("GetMposReportSequence", fallback)
+        self.assertIn("mpos_seq", fallback)
+
+    def test_window_error_requests_immediate_hold_and_controlled_reset(self):
+        """P1：窗口 error 后 RX 后续行仍会执行；必须立即 hold 并在退窗后受控 reset。"""
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        stream_start = source.index("bool Job::StreamToGrbl()")
+        stream_body = source[stream_start:]
+        self.assertIn("fail_window_and_stop", stream_body)
+        self.assertGreaterEqual(stream_body.count("return fail_window_and_stop("), 2)
+        helper_start = stream_body.index("fail_window_and_stop")
+        helper = stream_body[helper_start : stream_body.index("};", helper_start) + 2]
+        self.assertIn("SendRealtime('!')", helper)
+        self.assertIn("DrainResponses()", helper)
+        self.assertIn("c_line.clear()", helper)
+        self.assertIn("window_guard.MarkQuiesced()", helper)
+        self.assertIn("stream_error_stop_required_.store(true", helper)
+
+        run_start = source.index("void Job::Run()")
+        run_end = source.index("bool Job::DownloadToPsram", run_start)
+        run_body = source[run_start:run_end]
+        self.assertIn("stream_error_stop_required_.exchange(false", run_body)
+        self.assertIn("PerformAbortReset(false", run_body)
+        reset_at = run_body.index("stream_error_stop_required_.exchange(false")
+        publish_at = run_body.index('SetState("error")', reset_at)
+        self.assertLess(reset_at, publish_at)
+
 
     def test_paper_change_resets_blocking_peer_by_raii(self):
         """R11-PIPE-02：换纸编排的 blocking 标记必须 RAII 复位，不留手工出口。

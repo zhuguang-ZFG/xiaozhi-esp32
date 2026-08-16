@@ -846,6 +846,21 @@ void Job::Run() {
             ESP_LOGW(TAG, "断连恢复完成，从 PSRAM 第 1 行重画（%d/%d）", disconnect_replays,
                      kDisconnectReplayMaxRetries);
         }
+        // character-counting 的 error 只丢坏行，RX/planner 中后续块仍可能继续运动。
+        // StreamToGrbl 已先发 `!` 并发布 Quiesced；在发布 error/busy=false 前同步
+        // 完成既有受控 reset 事务，保证软件终态与物理终态一致。
+        if (stream_error_stop_required_.exchange(false, std::memory_order_acq_rel)) {
+            const std::string stream_error = last_error_;
+            if (!PerformAbortReset(false)) {
+                last_error_ = stream_error + "；错误后受控停机失败，请断电重启";
+                failure_notified_ = true;
+                Notify(last_error_);
+            } else {
+                last_error_ = stream_error;
+                ResetAbortResetState();
+            }
+            ok = false;
+        }
         if (ok) {
             ok = ReturnHomeAfterDraw();
         }
@@ -1202,13 +1217,16 @@ bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t
         return false;
     }
 
-    // 必须是 `?` 之后新解析出来的报告，否则会沿用超时前的旧 Idle。
+    // 必须同时取得 `?` 之后的新状态与新有限 MPos；$10=WPos 或 NaN/Inf 只能推进
+    // status_seq，不能让旧机器坐标冒充本批完成证据。
     const uint32_t status_seq = pipe.GetStatusReportSequence();
+    const uint32_t mpos_seq = pipe.GetMposReportSequence();
     if (!pipe.SendRealtime('?')) {
         return false;
     }
     const TickType_t began = xTaskGetTickCount();
-    while (pipe.GetStatusReportSequence() == status_seq) {
+    while (pipe.GetStatusReportSequence() == status_seq ||
+           pipe.GetMposReportSequence() == mpos_seq) {
         if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(kOkFallbackIdleTimeoutMs)) {
             return false;
         }
@@ -1962,6 +1980,20 @@ bool Job::StreamToGrbl() {
             window_guard.MarkQuiesced();
         };
 
+        auto fail_window_and_stop = [&](const std::string& error) {
+            // Grbl 官方 character-counting reservation：坏行回 error 后，RX 内后续行
+            // 仍会继续解析执行。先实时 hold，再清软件窗口并发布 Quiesced；Run 退出
+            // StreamToGrbl 后同步走受控 reset 清 planner/RX，完成前不发布 error。
+            pipe.SendRealtime('!');
+            pipe.DrainResponses();
+            c_line.clear();
+            c_line_bytes_sum = 0;
+            last_error_ = error;
+            stream_error_stop_required_.store(true, std::memory_order_release);
+            window_guard.MarkQuiesced();
+            return false;
+        };
+
         // 分段等，便于响应 abort/ALARM/链路丢失
         WaitResult wr = WaitResult::Timeout;
         int err = -1;
@@ -2042,16 +2074,12 @@ bool Job::StreamToGrbl() {
                 Notify(buf);
             }
         } else if (wr == WaitResult::Failed) {
-            // error 同样对应并释放一条在途响应，但当前任务必须 fail closed，不能把
-            // 被拒的 Z5/XY 当成已完成继续到 M30/done。
-            last_error_ = "error:" + std::to_string(err);
-            return false;
+            // error 只丢坏行；character-counting 已灌入 RX 的后续行仍会执行。
+            return fail_window_and_stop("error:" + std::to_string(err));
         } else if (wr == WaitResult::Deferred) {
-            // §3 换纸阻塞期条：窗口化普通行不应收到 error:8（换纸期禁发 G0–G3，普通行不会撞
-            // error:8）。若意外收到，按 Failed 处理并记日志（不应发生）。
-            ESP_LOGW(TAG, "窗口化分支意外收到 error:8（err=%d），按失败处理", err);
-            last_error_ = "error:8（窗口化不应发生）";
-            return false;
+            // 窗口化普通行不应收到 error:8；一旦出现，后续在途同样先物理停机。
+            ESP_LOGW(TAG, "窗口化分支意外收到 error:8（err=%d），停止并受控 reset", err);
+            return fail_window_and_stop("error:8（窗口化不应发生）");
         } else {
             // Timeout：Grbl WebUI Telnet 输出无 TX 缓冲，`ok`（loopTask）与 `?` 状态报告
             // （clientCheckTask）同核同优先级无锁并发写同一 socket，偶发部分写被抢占会
