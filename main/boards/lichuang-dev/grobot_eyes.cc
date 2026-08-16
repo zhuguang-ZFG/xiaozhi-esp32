@@ -284,9 +284,23 @@ void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
     const int halfW = eyeR * 2 / 3;
     const int tiltL = (int)(face_cur_.browTiltL * 0.35f);
     const int tiltR = (int)(face_cur_.browTiltR * 0.35f);
+    const int browArch = 8;
     const lv_color_t brow = lv_color_mix(eye_color_, lv_color_white(), 45);
-    BufLine(cx - offset - halfW, yL - tiltL, cx - offset + halfW, yL + tiltL, brow, 2);
-    BufLine(cx + offset - halfW, yR + tiltR, cx + offset + halfW, yR - tiltR, brow, 2);
+    auto drawBrow = [&](int browCx, int browY, int tilt) {
+        int prevX = browCx - halfW;
+        int prevY = browY - tilt;
+        for (int i = 1; i <= 12; i++) {
+            const float nx = -1.0f + 2.0f * i / 12.0f;
+            const int x = browCx - halfW + 2 * halfW * i / 12;
+            const int slope = -tilt + 2 * tilt * i / 12;
+            const int y = browY + slope - (int)(browArch * (1.0f - nx * nx));
+            BufLine(prevX, prevY, x, y, brow, 2);
+            prevX = x;
+            prevY = y;
+        }
+    };
+    drawBrow(cx - offset, yL, tiltL);
+    drawBrow(cx + offset, yR, -tiltR);
 }
 
 void GrobotEyes::DrawNose(int cx, int cy, int eyeR) {
