@@ -520,6 +520,19 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
                  role, content);
     }
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    if (grobot_eyes_ != nullptr) {
+        // 全脸模式保留状态栏与情绪，不让聊天气泡/字幕覆盖嘴巴和下半脸。
+        DisplayLockGuard lock(this);
+        if (chat_message_label_ != nullptr) {
+            lv_label_set_text(chat_message_label_, "");
+        }
+        if (bottom_bar_ != nullptr) {
+            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+#endif
     DisplayLockGuard lock(this);
     if (content_ == nullptr) {
         if (setup_ui_called_) {
@@ -1075,6 +1088,19 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
                  role, content);
     }
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    if (grobot_eyes_ != nullptr) {
+        // 全脸模式保留状态栏与情绪，不让聊天气泡/字幕覆盖嘴巴和下半脸。
+        DisplayLockGuard lock(this);
+        if (chat_message_label_ != nullptr) {
+            lv_label_set_text(chat_message_label_, "");
+        }
+        if (bottom_bar_ != nullptr) {
+            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+#endif
     DisplayLockGuard lock(this);
     if (chat_message_label_ == nullptr) {
         if (setup_ui_called_) {
