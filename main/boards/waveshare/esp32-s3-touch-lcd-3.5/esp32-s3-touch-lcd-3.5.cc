@@ -218,23 +218,24 @@ private:
         
     }
 
-    void InitializeTouch()
-    {
+    void InitializeTouch() {
         esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
-            .x_max = DISPLAY_WIDTH,
-            .y_max = DISPLAY_HEIGHT,
+            .x_max = DISPLAY_HEIGHT,
+            .y_max = DISPLAY_WIDTH,
             .rst_gpio_num = GPIO_NUM_NC,
             .int_gpio_num = GPIO_NUM_NC,
-            .levels = {
-                .reset = 0,
-                .interrupt = 0,
-            },
-            .flags = {
-                .swap_xy = 1,
-                .mirror_x = 1,
-                .mirror_y = 1,
-            },
+            .levels =
+                {
+                    .reset = 0,
+                    .interrupt = 0,
+                },
+            .flags =
+                {
+                    .swap_xy = 1,
+                    .mirror_x = 1,
+                    .mirror_y = 1,
+                },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = {
@@ -242,17 +243,57 @@ private:
             .control_phase_bytes = 1,
             .dc_bit_offset = 0,
             .lcd_cmd_bits = 8,
-            .flags =
-            {
+            .flags = {
                 .disable_control_phase = 1,
-            }
-        };
+            }};
         tp_io_config.scl_speed_hz = 400 * 1000;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
         ESP_LOGI(TAG, "Initialize touch controller");
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp));
+        constexpr int kFt6x36ThresholdReg = 0x80;
+        constexpr int kFt6x36ActivePeriodReg = 0x88;
+        constexpr int kFt6x36ChipIdReg = 0xA3;
+        constexpr int kFt6x36VendorIdReg = 0xA8;
+        uint8_t threshold = 0;
+        constexpr uint8_t kTouchThreshold = 40;
+        uint8_t active_period = 0;
+        uint8_t chip_id = 0;
+        uint8_t vendor_id = 0;
+        const esp_err_t threshold_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ThresholdReg, &threshold, 1);
+        const esp_err_t period_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ActivePeriodReg, &active_period, 1);
+        const esp_err_t chip_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ChipIdReg, &chip_id, 1);
+        const esp_err_t vendor_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36VendorIdReg, &vendor_id, 1);
+        if (threshold_err == ESP_OK && period_err == ESP_OK && chip_err == ESP_OK &&
+            vendor_err == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "Touch registers: threshold=%u active_period=%u chip=0x%02X vendor=0x%02X",
+                     threshold, active_period, chip_id, vendor_id);
+        } else {
+            ESP_LOGW(TAG, "Touch register read failed: threshold=%s period=%s chip=%s vendor=%s",
+                     esp_err_to_name(threshold_err), esp_err_to_name(period_err),
+                     esp_err_to_name(chip_err), esp_err_to_name(vendor_err));
+        }
+        if (threshold_err == ESP_OK && threshold != kTouchThreshold) {
+            const uint8_t old_threshold = threshold;
+            const esp_err_t write_err =
+                esp_lcd_panel_io_tx_param(tp_io_handle, kFt6x36ThresholdReg, &kTouchThreshold, 1);
+            const esp_err_t verify_err =
+                write_err == ESP_OK
+                    ? esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ThresholdReg, &threshold, 1)
+                    : write_err;
+            if (verify_err == ESP_OK && threshold == kTouchThreshold) {
+                ESP_LOGI(TAG, "Touch threshold tuned: %u -> %u", old_threshold, threshold);
+            } else {
+                ESP_LOGW(TAG, "Touch threshold tune failed: write=%s verify=%s value=%u",
+                         esp_err_to_name(write_err), esp_err_to_name(verify_err), threshold);
+            }
+        }
         const lvgl_port_touch_cfg_t touch_cfg = {
-            .disp = lv_display_get_default(), 
+            .disp = lv_display_get_default(),
             .handle = tp,
         };
         lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);

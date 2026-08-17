@@ -891,6 +891,70 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("LV_EVENT_PRESSED", body)
         self.assertIn("timer->WakeUp();", body)
 
+    def test_waveshare_logs_live_touch_controller_registers(self):
+        """触摸调参必须先读取板上真实 threshold/rate/chip/vendor，不盲写官方示例值。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        start = board.index("void InitializeTouch()")
+        end = board.index("void InitializeLcdDisplay()", start)
+        body = board[start:end]
+        self.assertIn("kFt6x36ThresholdReg = 0x80", body)
+        self.assertIn("kFt6x36ActivePeriodReg = 0x88", body)
+        self.assertIn("kFt6x36ChipIdReg = 0xA3", body)
+        self.assertIn("kFt6x36VendorIdReg = 0xA8", body)
+        self.assertIn("esp_lcd_panel_io_rx_param", body)
+        self.assertIn(
+            "Touch registers: threshold=%u active_period=%u chip=0x%02X vendor=0x%02X",
+            body,
+        )
+
+    def test_waveshare_applies_experimental_touch_threshold_with_readback(self):
+        """实机默认 70；官方 60 仍漏触时实验调到 40，并回读验证。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        start = board.index("void InitializeTouch()")
+        end = board.index("void InitializeLcdDisplay()", start)
+        body = board[start:end]
+        self.assertIn("kTouchThreshold = 40", body)
+        self.assertIn("esp_lcd_panel_io_tx_param", body)
+        self.assertIn("Touch threshold tuned: %u -> %u", body)
+        self.assertIn("Touch threshold tune failed", body)
+        self.assertEqual(body.count("esp_lcd_panel_io_tx_param"), 1)
+        self.assertIn("kFt6x36ThresholdReg, &kTouchThreshold", body)
+
+    def test_waveshare_touch_diagnostics_are_not_left_in_production(self):
+        """逐触摸原始坐标和按下日志只用于实机定位，最终固件不得持续刷日志。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        start = board.index("void InitializeTouch()")
+        end = board.index("void InitializeLcdDisplay()", start)
+        body = board[start:end]
+        self.assertNotIn(".process_coordinates", body)
+        self.assertNotIn("Touch diagnostic:", body)
+        self.assertNotIn("lv_indev_get_point", body)
+        self.assertNotIn("lv_event_get_indev", body)
+
+    def test_waveshare_touch_bounds_match_raw_axes_before_swap(self):
+        """FT6X36 原始轴为 320x480；镜像先于 swap，配置边界必须按原始轴。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        start = board.index("void InitializeTouch()")
+        end = board.index("void InitializeLcdDisplay()", start)
+        body = board[start:end]
+        self.assertIn(".x_max = DISPLAY_HEIGHT", body)
+        self.assertIn(".y_max = DISPLAY_WIDTH", body)
+        self.assertIn(".swap_xy = 1", body)
+        self.assertNotIn("lv_indev_get_read_timer", body)
+        self.assertNotIn("lv_timer_set_period", body)
+
     def test_paper_change_resets_blocking_peer_by_raii(self):
         """R11-PIPE-02：换纸编排的 blocking 标记必须 RAII 复位，不留手工出口。
 
