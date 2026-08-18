@@ -5,6 +5,7 @@
 #include "application.h"
 #include "boards/lichuang-dev/hutuji_job.h"
 #include "boards/lichuang-dev/hutuji_pipe.h"
+#include "boards/lichuang-dev/hutuji_ble_diag.h"
 #include "boards/lichuang-dev/hutuji_recovery_core.h"
 #include "button.h"
 #include "config.h"
@@ -477,6 +478,9 @@ private:
 
         // hutuji 写字机 Telnet 哑管道（TCP 客户端 → Grbl_Esp32 Telnet:23）。
         hutuji::Pipe::GetInstance().Start();
+
+        // BLE-DIAG 阶段 A 只读诊断广播；默认关闭，未启用时是空实现。
+        hutuji::ble_diag::Start();
 
         display_->ConfigureMachineControls(
             [this]() { ScheduleMachineControl("pause", &hutuji::Job::RequestPause); },

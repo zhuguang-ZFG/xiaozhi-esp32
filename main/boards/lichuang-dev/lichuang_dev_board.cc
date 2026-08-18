@@ -5,6 +5,7 @@
 #include "display/emote_display.h"
 #include "display/lcd_display.h"
 #include "esp32_camera.h"
+#include "hutuji_ble_diag.h"
 #include "hutuji_job.h"
 #include "hutuji_pipe.h"
 #include "i2c_device.h"
@@ -305,6 +306,9 @@ private:
 
         // hutuji 写字机 Telnet 哑管道（方案 E：TCP 客户端 → Grbl_Esp32 Telnet:23）
         hutuji::Pipe::GetInstance().Start();
+
+        // BLE-DIAG 阶段 A 只读诊断广播；默认关闭，未启用时是空实现。
+        hutuji::ble_diag::Start();
 
         mcp_server.AddTool(
             "hutuji.status",

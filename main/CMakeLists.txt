@@ -892,6 +892,7 @@ if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
     list(APPEND SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pipe.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_job.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_ble_diag.cc
     )
 endif()
 if(HUTUJI_GROBOT_FACE AND NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
