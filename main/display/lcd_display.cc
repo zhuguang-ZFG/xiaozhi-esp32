@@ -411,6 +411,12 @@ void LcdDisplay::ShowProvisioningQr(const std::string& payload, const std::strin
     lv_image_set_src(provisioning_qr_code_, nullptr);
     provisioning_qr_image_ = std::move(image);
     lv_image_set_src(provisioning_qr_code_, provisioning_qr_image_->image_dsc());
+    if (machine_control_trigger_btn_ != nullptr) {
+        lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (machine_control_root_ != nullptr) {
+        lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_move_foreground(provisioning_qr_root_);
     lv_obj_remove_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
 }
@@ -421,8 +427,517 @@ void LcdDisplay::HideProvisioningQr() {
         return;
     }
     lv_obj_add_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
+    if (machine_control_trigger_btn_ != nullptr &&
+        (draw_preview_root_ == nullptr ||
+         lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
+        lv_obj_remove_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_image_set_src(provisioning_qr_code_, nullptr);
     provisioning_qr_image_.reset();
+}
+
+void LcdDisplay::EnsureDrawPreviewUi() {
+    if (draw_preview_root_ != nullptr) {
+        return;
+    }
+
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    // 480x320 横屏版面预算：根边距上下各 8、标题行约 32、按钮行 64、行距 6x2，
+    // 剩余约 196px 全部留给图片；宽方向两边各留 8，图片最宽 464。
+    // 所有可点目标高度 >= 56px（儿童手指命中面）。
+    draw_preview_root_ = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(draw_preview_root_, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_radius(draw_preview_root_, 0, 0);
+    lv_obj_set_style_border_width(draw_preview_root_, 0, 0);
+    lv_obj_set_style_bg_color(draw_preview_root_, theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(draw_preview_root_, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(draw_preview_root_, theme->spacing(4), 0);
+    lv_obj_set_flex_flow(draw_preview_root_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(draw_preview_root_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(draw_preview_root_, theme->spacing(3), 0);
+    lv_obj_clear_flag(draw_preview_root_, LV_OBJ_FLAG_SCROLLABLE);
+    // 与二维码层同款：整层可点击，吃掉落到情绪层/聊天层的误触。
+    lv_obj_add_flag(draw_preview_root_, LV_OBJ_FLAG_CLICKABLE);
+
+    // 标题即提示语，置顶单行打点截断：再长的文案也不挤压图片与按钮。
+    // 字体继承屏幕级主题字体（SetTheme 会随主题刷新屏幕字体），不持有裸指针。
+    draw_preview_hint_ = lv_label_create(draw_preview_root_);
+    lv_obj_set_width(draw_preview_hint_, LV_HOR_RES - theme->spacing(8));
+    lv_obj_set_style_text_color(draw_preview_hint_, theme->text_color(), 0);
+    lv_obj_set_style_text_align(draw_preview_hint_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(draw_preview_hint_, LV_LABEL_LONG_DOT);
+
+    draw_preview_image_ = lv_image_create(draw_preview_root_);
+
+    // 按钮行沉底：「开始画」是唯一主动作，占 2/3 宽；「取消」次动作占 1/3。
+    // 行高取屏高 20%（480x320 下 64px）且不低于 56px。
+    lv_obj_t* button_row = lv_obj_create(draw_preview_root_);
+    lv_obj_remove_style_all(button_row);
+    lv_obj_set_width(button_row, LV_HOR_RES - theme->spacing(8));
+    lv_obj_set_height(button_row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(button_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(button_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(button_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    const lv_coord_t button_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
+    const lv_coord_t row_width = LV_HOR_RES - theme->spacing(8);
+    const lv_coord_t confirm_width = (row_width - theme->spacing(4)) * 2 / 3;
+    const lv_coord_t cancel_width = row_width - theme->spacing(4) - confirm_width;
+
+    auto make_button = [&](const char* text, lv_color_t color, lv_coord_t width) {
+        lv_obj_t* btn = lv_button_create(button_row);
+        lv_obj_set_size(btn, width, button_height);
+        lv_obj_set_style_radius(btn, button_height / 4, 0);
+        lv_obj_set_style_bg_color(btn, color, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_t* label = lv_label_create(btn);
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_center(label);
+        return btn;
+    };
+
+    // 绿色大按钮=开始画，灰色小按钮=取消：不靠文字识读也能分辨主次。
+    draw_preview_confirm_btn_ = make_button(Lang::Strings::DRAW_PREVIEW_CONFIRM,
+                                            lv_color_hex(0x2E9E4F), confirm_width);
+    draw_preview_cancel_btn_ = make_button(Lang::Strings::DRAW_PREVIEW_CANCEL,
+                                           lv_color_hex(0x6B6B6B), cancel_width);
+
+    // 回调在 LVGL 任务里跑，只做转发：Job 侧建任务/发通知都不阻塞。
+    lv_obj_add_event_cb(
+        draw_preview_confirm_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            if (self->draw_preview_on_confirm_) {
+                self->draw_preview_on_confirm_();
+            }
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        draw_preview_cancel_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            if (self->draw_preview_on_cancel_) {
+                self->draw_preview_on_cancel_();
+            }
+        },
+        LV_EVENT_PRESSED, this);
+
+    lv_obj_add_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::string& hint,
+                                 std::function<void()> on_confirm,
+                                 std::function<void()> on_cancel) {
+    DisplayLockGuard lock(this);
+    if (image == nullptr) {
+        return;
+    }
+    EnsureDrawPreviewUi();
+    if (draw_preview_root_ == nullptr) {
+        return;
+    }
+
+    // 先摘旧 src 再换缓存：LVGL 仍持有旧 dsc 指针时释放会画到野内存。
+    lv_image_set_src(draw_preview_image_, nullptr);
+    draw_preview_cached_ = std::move(image);
+    auto* img_dsc = draw_preview_cached_->image_dsc();
+    lv_image_set_src(draw_preview_image_, img_dsc);
+
+    // 与 EnsureDrawPreviewUi 的版面预算一致：宽两边各留 8；高 = 屏高减去根边距 16、
+    // 标题行 32、按钮行（屏高 20% 且 >=56px）与两处行距 12，其余全部留给图片。
+    // 等比放大不超过原始像素。
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    const lv_coord_t button_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
+    const lv_coord_t max_width = LV_HOR_RES - theme->spacing(8);
+    const lv_coord_t max_height =
+        LV_VER_RES - theme->spacing(8) - 32 - button_height - theme->spacing(6);
+    if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {
+        const lv_coord_t zoom_w = (max_width * 256) / img_dsc->header.w;
+        const lv_coord_t zoom_h = (max_height * 256) / img_dsc->header.h;
+        lv_coord_t zoom = zoom_w < zoom_h ? zoom_w : zoom_h;
+        if (zoom > 256) {
+            zoom = 256;
+        }
+        lv_image_set_scale(draw_preview_image_, zoom);
+        lv_obj_set_size(draw_preview_image_, (img_dsc->header.w * zoom) / 256,
+                        (img_dsc->header.h * zoom) / 256);
+    }
+
+    lv_label_set_text(draw_preview_hint_, hint.c_str());
+    draw_preview_on_confirm_ = std::move(on_confirm);
+    draw_preview_on_cancel_ = std::move(on_cancel);
+    if (machine_control_trigger_btn_ != nullptr) {
+        lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (machine_control_root_ != nullptr) {
+        lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_move_foreground(draw_preview_root_);
+    lv_obj_remove_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN);
+    // 配网二维码优先级更高：配网中弹预览不得盖住二维码。
+    if (provisioning_qr_root_ != nullptr &&
+        !lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_move_foreground(provisioning_qr_root_);
+    }
+}
+
+void LcdDisplay::HideDrawPreview() {
+    DisplayLockGuard lock(this);
+    if (draw_preview_root_ == nullptr) {
+        return;
+    }
+    lv_obj_add_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_src(draw_preview_image_, nullptr);
+    draw_preview_cached_.reset();
+    // 回调置空必须与撤图同锁：否则按钮迟到点击会打到已失效的 Job 状态。
+    draw_preview_on_confirm_ = nullptr;
+    if (machine_control_trigger_btn_ != nullptr &&
+        (provisioning_qr_root_ == nullptr ||
+         lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN))) {
+        lv_obj_remove_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    draw_preview_on_cancel_ = nullptr;
+}
+
+void LcdDisplay::EnsureMachineControlUi() {
+    if (!machine_controls_configured_ || !setup_ui_called_ || machine_control_trigger_btn_ != nullptr) {
+        return;
+    }
+
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    // 480x320 横屏：主操作行取屏高 20%（64px），其余按钮行取 17%（54px），
+    // 一律按 56px 下限兜底，保证儿童手指命中面。
+    const lv_coord_t primary_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
+    const lv_coord_t button_height = LV_VER_RES * 17 / 100;
+    const lv_coord_t safe_button_height = button_height < 56 ? 56 : button_height;
+    // disabled 用实心灰底+实心白字：可辨靠的是填充色差异，不靠低对比文字。
+    const lv_color_t disabled_bg = lv_color_hex(0x8A8F94);
+    auto* screen = lv_screen_active();
+
+    // 控制入口：右边缘垂直居中的胶囊按钮，避开顶部状态图标、居中表情与底部字幕。
+    machine_control_trigger_btn_ = lv_button_create(screen);
+    lv_obj_set_size(machine_control_trigger_btn_, LV_HOR_RES * 24 / 100, primary_height);
+    lv_obj_align(machine_control_trigger_btn_, LV_ALIGN_RIGHT_MID, -theme->spacing(3), 0);
+    lv_obj_set_style_radius(machine_control_trigger_btn_, primary_height / 4, 0);
+    lv_obj_set_style_bg_color(machine_control_trigger_btn_, lv_color_hex(0x2374E1), 0);
+    lv_obj_set_style_bg_opa(machine_control_trigger_btn_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(machine_control_trigger_btn_, 0, 0);
+    lv_obj_t* trigger_label = lv_label_create(machine_control_trigger_btn_);
+    lv_label_set_text(trigger_label, Lang::Strings::MACHINE_CONTROL);
+    lv_obj_set_style_text_color(trigger_label, lv_color_white(), 0);
+    lv_obj_center(trigger_label);
+
+    // 抽屉：半透遮罩 + 居中面板；点遮罩空白处收起（保留原有语义）。
+    machine_control_root_ = lv_obj_create(screen);
+    lv_obj_set_size(machine_control_root_, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_radius(machine_control_root_, 0, 0);
+    lv_obj_set_style_border_width(machine_control_root_, 0, 0);
+    lv_obj_set_style_bg_color(machine_control_root_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(machine_control_root_, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(machine_control_root_, theme->spacing(3), 0);
+    lv_obj_clear_flag(machine_control_root_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_CLICKABLE);
+
+    // 面板 448 宽、内容高，居中；含手动调试区后内容超过 320 屏高，面板允许垂直滚动。
+    // 遮罩层保持不可滚动，点遮罩空白收起的语义不变。
+    const lv_coord_t panel_width = LV_HOR_RES - theme->spacing(16);
+    const lv_coord_t content_width = panel_width - theme->spacing(8);
+    const lv_coord_t half_width = (content_width - theme->spacing(4)) / 2;
+    lv_obj_t* panel = lv_obj_create(machine_control_root_);
+    lv_obj_set_width(panel, panel_width);
+    lv_obj_set_height(panel, LV_SIZE_CONTENT);
+    lv_obj_align(panel, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(panel, 20, 0);
+    lv_obj_set_style_border_width(panel, 0, 0);
+    lv_obj_set_style_bg_color(panel, theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(panel, theme->spacing(4), 0);
+    lv_obj_set_style_pad_row(panel, theme->spacing(4), 0);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    // 手动调试区使内容超过屏高：面板保留滚动（默认），遮罩不滚。
+
+    auto make_row = [&]() {
+        lv_obj_t* row = lv_obj_create(panel);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, content_width, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        return row;
+    };
+
+    // 字体继承屏幕级主题字体（SetTheme 随主题刷新），不持有裸指针。
+    auto make_button = [&](lv_obj_t* parent, const char* text, lv_color_t color,
+                           lv_coord_t width, lv_coord_t height) {
+        lv_obj_t* btn = lv_button_create(parent);
+        lv_obj_set_size(btn, width, height);
+        lv_obj_set_style_radius(btn, 16, 0);
+        lv_obj_set_style_bg_color(btn, color, 0);
+        lv_obj_set_style_bg_color(btn, disabled_bg, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_DISABLED);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_t* label = lv_label_create(btn);
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_center(label);
+        return btn;
+    };
+
+    // 标题行：抽屉名 + 当前机器状态 + 收起，一眼看清“我在哪、机器在干嘛”。
+    lv_obj_t* header = make_row();
+    lv_obj_t* title = lv_label_create(header);
+    lv_label_set_text(title, Lang::Strings::MACHINE_DRAWER_TITLE);
+    lv_obj_set_style_text_color(title, theme->text_color(), 0);
+    machine_state_label_ = lv_label_create(header);
+    lv_label_set_text(machine_state_label_, "");
+    machine_close_btn_ = make_button(header, Lang::Strings::MACHINE_CLOSE,
+                                     lv_color_hex(0x626262), LV_HOR_RES / 5, safe_button_height);
+
+    // 主操作行：暂停/继续同位二选一，Job 状态保证任一时刻只有一个可用；
+    // 可用者保持实心高亮，即当前唯一主动作。
+    lv_obj_t* primary_row = make_row();
+    machine_pause_btn_ = make_button(primary_row, Lang::Strings::MACHINE_PAUSE,
+                                     lv_color_hex(0xE59A20), half_width, primary_height);
+    machine_resume_btn_ = make_button(primary_row, Lang::Strings::MACHINE_RESUME,
+                                      lv_color_hex(0x2E9E4F), half_width, primary_height);
+
+    // 次级行：再画一张/试试笔，仅结束态可用。
+    lv_obj_t* secondary_row = make_row();
+    machine_repeat_btn_ = make_button(secondary_row, Lang::Strings::MACHINE_REPEAT,
+                                      lv_color_hex(0x2374E1), half_width, safe_button_height);
+    machine_pen_test_btn_ = make_button(secondary_row, Lang::Strings::MACHINE_PEN_TEST,
+                                        lv_color_hex(0x6D5BD0), half_width, safe_button_height);
+
+    // 停止：危险动作独占末行，红色实心作语义警示，不与主操作行争视觉重心。
+    machine_abort_btn_ = make_button(panel, Lang::Strings::MACHINE_STOP,
+                                     lv_color_hex(0xD93A3A), content_width, safe_button_height);
+
+    // ── 手动调试区（2026-08-18 用户决策全量开放；命令逐字对齐奎享实测序列）──
+    // 动作不经 drawer 收起：点动/抬落笔需要连续操作。可用性统一由
+    // ApplyMachineControlState 按 settled 态门控。
+    lv_obj_t* manual_label = lv_label_create(panel);
+    lv_label_set_text(manual_label, Lang::Strings::MACHINE_MANUAL_SECTION);
+    lv_obj_set_style_text_color(manual_label, theme->text_color(), 0);
+
+    const lv_coord_t third_width = (content_width - theme->spacing(8)) / 3;
+    auto make_manual = [&](lv_obj_t* parent, const char* text, lv_color_t color,
+                           lv_coord_t width, const char* action) {
+        lv_obj_t* btn = make_button(parent, text, color, width, safe_button_height);
+        lv_obj_set_user_data(btn, const_cast<char*>(action));
+        machine_manual_buttons_.push_back(btn);
+        return btn;
+    };
+
+    lv_obj_t* pen_row = make_row();
+    make_manual(pen_row, Lang::Strings::MACHINE_PEN_UP, lv_color_hex(0x2374E1), half_width,
+                "pen_up");
+    make_manual(pen_row, Lang::Strings::MACHINE_PEN_DOWN, lv_color_hex(0x2374E1), half_width,
+                "pen_down");
+
+    // 点动十字（对齐奎享面板）：Y+ 居上，X-/回原点/X+ 居中行，Y- 居下。
+    lv_obj_t* jog_up_row = make_row();
+    lv_obj_set_flex_align(jog_up_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    make_manual(jog_up_row, Lang::Strings::MACHINE_JOG_YP, lv_color_hex(0x626262), third_width,
+                "jog_y+");
+    lv_obj_t* jog_mid_row = make_row();
+    make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XM, lv_color_hex(0x626262), third_width,
+                "jog_x-");
+    make_manual(jog_mid_row, Lang::Strings::MACHINE_HOME, lv_color_hex(0x2E9E4F), third_width,
+                "home");
+    make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XP, lv_color_hex(0x626262), third_width,
+                "jog_x+");
+    lv_obj_t* jog_down_row = make_row();
+    lv_obj_set_flex_align(jog_down_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    make_manual(jog_down_row, Lang::Strings::MACHINE_JOG_YM, lv_color_hex(0x626262), third_width,
+                "jog_y-");
+
+    lv_obj_t* origin_row = make_row();
+    make_manual(origin_row, Lang::Strings::MACHINE_SET_ORIGIN, lv_color_hex(0xE59A20), half_width,
+                "set_origin");
+    make_manual(origin_row, Lang::Strings::MACHINE_UNLOCK, lv_color_hex(0x626262), half_width,
+                "unlock");
+
+    lv_obj_t* power_row = make_row();
+    make_manual(power_row, Lang::Strings::MACHINE_MOTOR_OFF, lv_color_hex(0x626262), half_width,
+                "motor_off");
+    make_manual(power_row, Lang::Strings::MACHINE_RESET, lv_color_hex(0xD93A3A), half_width,
+                "reset");
+
+    lv_obj_add_event_cb(
+        machine_control_trigger_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            ESP_LOGI(TAG, "machine controls opened");
+            self->ApplyMachineControlState();
+            lv_obj_move_foreground(self->machine_control_root_);
+            lv_obj_remove_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        machine_pause_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            if (self->machine_pause_) self->machine_pause_();
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        machine_resume_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            if (self->machine_resume_) self->machine_resume_();
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        machine_abort_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            if (self->machine_abort_) self->machine_abort_();
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        machine_repeat_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            if (self->machine_repeat_) self->machine_repeat_();
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        machine_pen_test_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            if (self->machine_pen_test_) self->machine_pen_test_();
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        machine_close_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        machine_control_root_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            if (lv_event_get_target(e) == self->machine_control_root_) {
+                lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            }
+        },
+        LV_EVENT_PRESSED, this);
+    for (lv_obj_t* btn : machine_manual_buttons_) {
+        lv_obj_add_event_cb(
+            btn,
+            [](lv_event_t* e) {
+                auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+                const char* action = static_cast<const char*>(lv_obj_get_user_data(
+                    static_cast<lv_obj_t*>(lv_event_get_current_target(e))));
+                if (self->machine_manual_ && action != nullptr) {
+                    self->machine_manual_(action);
+                }
+            },
+            LV_EVENT_PRESSED, this);
+    }
+
+
+    lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+    ApplyMachineControlState();
+}
+
+void LcdDisplay::ApplyMachineControlState() {
+    if (machine_pause_btn_ == nullptr) {
+        return;
+    }
+    const bool streaming = machine_state_ == "streaming";
+    const bool paused = machine_state_ == "paused";
+    const bool active = streaming || paused || machine_state_ == "previewing" ||
+                        machine_state_ == "awaiting_confirmation" ||
+                        machine_state_ == "downloading" || machine_state_ == "verifying" ||
+                        machine_state_ == "reconnecting" || machine_state_ == "paper_change" ||
+                        machine_state_ == "pen_test";
+    const bool settled = machine_state_ == "idle" || machine_state_ == "done" ||
+                         machine_state_ == "error" || machine_state_ == "aborted";
+    auto set_enabled = [](lv_obj_t* button, bool enabled) {
+        if (enabled) {
+            lv_obj_remove_state(button, LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(button, LV_STATE_DISABLED);
+        }
+    };
+    set_enabled(machine_pause_btn_, streaming);
+    set_enabled(machine_resume_btn_, paused);
+    set_enabled(machine_abort_btn_, active);
+    set_enabled(machine_repeat_btn_, settled);
+    set_enabled(machine_pen_test_btn_, settled);
+    // 手动调试按钮（含复位/设置原点等高危项）仅 settled 态可用；manual 态自身也灰。
+    for (lv_obj_t* btn : machine_manual_buttons_) {
+        set_enabled(btn, settled);
+    }
+
+    // 标题行状态灯：文案走 locale，颜色复用按钮语义色（进行中=琥珀、
+    // 完成=绿、出错=红、空闲/已停止=主题正文色），纯展示不改 Job 契约。
+    if (machine_state_label_ != nullptr) {
+        const char* state_text = Lang::Strings::MACHINE_STATE_BUSY;
+        lv_color_t state_color = lv_color_hex(0xE59A20);
+        if (streaming) {
+            state_text = Lang::Strings::MACHINE_STATE_STREAMING;
+        } else if (paused) {
+            state_text = Lang::Strings::MACHINE_STATE_PAUSED;
+        } else if (machine_state_ == "done") {
+            state_text = Lang::Strings::MACHINE_STATE_DONE;
+            state_color = lv_color_hex(0x2E9E4F);
+        } else if (machine_state_ == "manual") {
+            state_text = Lang::Strings::MACHINE_STATE_MANUAL;
+        } else if (machine_state_ == "error") {
+            state_text = Lang::Strings::MACHINE_STATE_ERROR;
+            state_color = lv_color_hex(0xD93A3A);
+        } else if (machine_state_ == "idle" || machine_state_ == "aborted") {
+            state_text = machine_state_ == "idle" ? Lang::Strings::MACHINE_STATE_IDLE
+                                                  : Lang::Strings::MACHINE_STATE_ABORTED;
+            state_color = static_cast<LvglTheme*>(current_theme_)->text_color();
+        }
+        lv_label_set_text(machine_state_label_, state_text);
+        lv_obj_set_style_text_color(machine_state_label_, state_color, 0);
+    }
+}
+
+void LcdDisplay::ConfigureMachineControls(std::function<void()> on_pause,
+                                          std::function<void()> on_resume,
+                                          std::function<void()> on_abort,
+                                          std::function<void()> on_repeat,
+                                          std::function<void()> on_pen_test,
+                                          std::function<void(const char* action)> on_manual) {
+    machine_pause_ = std::move(on_pause);
+    machine_resume_ = std::move(on_resume);
+    machine_abort_ = std::move(on_abort);
+    machine_repeat_ = std::move(on_repeat);
+    machine_pen_test_ = std::move(on_pen_test);
+    machine_manual_ = std::move(on_manual);
+    machine_controls_configured_ = true;
+    if (setup_ui_called_) {
+        DisplayLockGuard lock(this);
+        EnsureMachineControlUi();
+    }
+}
+
+void LcdDisplay::UpdateMachineControlState(const std::string& state) {
+    DisplayLockGuard lock(this);
+    machine_state_ = state;
+    ApplyMachineControlState();
 }
 
 LcdDisplay::~LcdDisplay() {
@@ -444,6 +959,34 @@ LcdDisplay::~LcdDisplay() {
         provisioning_qr_code_ = nullptr;
         provisioning_qr_hint_ = nullptr;
         provisioning_qr_image_.reset();
+    }
+    if (machine_control_root_ != nullptr) {
+        lv_obj_del(machine_control_root_);
+        machine_control_root_ = nullptr;
+        machine_pause_btn_ = nullptr;
+        machine_resume_btn_ = nullptr;
+        machine_abort_btn_ = nullptr;
+        machine_repeat_btn_ = nullptr;
+        machine_pen_test_btn_ = nullptr;
+        machine_close_btn_ = nullptr;
+        machine_state_label_ = nullptr;
+    }
+    if (machine_control_trigger_btn_ != nullptr) {
+        lv_obj_del(machine_control_trigger_btn_);
+        machine_control_trigger_btn_ = nullptr;
+    }
+
+    if (draw_preview_root_ != nullptr) {
+        lv_obj_del(draw_preview_root_);
+        draw_preview_root_ = nullptr;
+        draw_preview_image_ = nullptr;
+        draw_preview_hint_ = nullptr;
+        draw_preview_cached_.reset();
+    }
+    if (grobot_subtitle_bar_ != nullptr) {
+        lv_obj_del(grobot_subtitle_bar_);
+        grobot_subtitle_bar_ = nullptr;
+        grobot_subtitle_label_ = nullptr;
     }
 
     if (preview_image_ != nullptr) {
@@ -528,11 +1071,49 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
         grobot_eyes_ = std::move(eyes);
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        grobot_subtitle_bar_ = lv_obj_create(screen);
+        lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES, 40);
+        lv_obj_align(grobot_subtitle_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_radius(grobot_subtitle_bar_, 0, 0);
+        lv_obj_set_style_border_width(grobot_subtitle_bar_, 0, 0);
+        lv_obj_set_style_bg_color(grobot_subtitle_bar_, theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(grobot_subtitle_bar_, LV_OPA_80, 0);
+        lv_obj_set_style_pad_all(grobot_subtitle_bar_, 0, 0);
+        lv_obj_clear_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_SCROLLABLE);
+        grobot_subtitle_label_ = lv_label_create(grobot_subtitle_bar_);
+        lv_obj_set_width(grobot_subtitle_label_, LV_HOR_RES - 24);
+        lv_label_set_long_mode(grobot_subtitle_label_, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(grobot_subtitle_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(grobot_subtitle_label_, theme->text_color(), 0);
+        lv_label_set_text(grobot_subtitle_label_, "");
+        lv_obj_center(grobot_subtitle_label_);
+        lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
         ESP_LOGI(TAG, "GrobotEyes initialized: %dx%d", kFaceWidth, kFaceHeight);
     } else {
         ESP_LOGE(TAG, "Failed to initialize GrobotEyes; using emoji fallback");
     }
 #endif
+}
+
+void LcdDisplay::SetGrobotSubtitle(const char* content) {
+    if (grobot_subtitle_bar_ == nullptr || grobot_subtitle_label_ == nullptr) {
+        return;
+    }
+    const bool has_content = content != nullptr && content[0] != '\0';
+    lv_label_set_text(grobot_subtitle_label_, has_content ? content : "");
+    const bool overlay_visible =
+        (provisioning_qr_root_ != nullptr &&
+         !lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN)) ||
+        (draw_preview_root_ != nullptr &&
+         !lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN)) ||
+        (machine_control_root_ != nullptr &&
+         !lv_obj_has_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN));
+    if (has_content && !hide_subtitle_ && !overlay_visible) {
+        lv_obj_move_foreground(grobot_subtitle_bar_);
+        lv_obj_remove_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
@@ -675,6 +1256,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
 
     InitializeEmotionUi(screen, lvgl_theme, large_icon_font);
+    EnsureMachineControlUi();
     if (provisioning_qr_root_ != nullptr) {
         lv_obj_move_foreground(provisioning_qr_root_);
     }
@@ -691,14 +1273,8 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     }
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     if (grobot_eyes_ != nullptr) {
-        // 全脸模式保留状态栏与情绪，不让聊天气泡/字幕覆盖嘴巴和下半脸。
         DisplayLockGuard lock(this);
-        if (chat_message_label_ != nullptr) {
-            lv_label_set_text(chat_message_label_, "");
-        }
-        if (bottom_bar_ != nullptr) {
-            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        }
+        SetGrobotSubtitle(content);
         return;
     }
 #endif
@@ -991,6 +1567,7 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
+    SetGrobotSubtitle("");
     if (content_ == nullptr) {
         return;
     }
@@ -1195,6 +1772,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+    EnsureMachineControlUi();
     if (provisioning_qr_root_ != nullptr) {
         lv_obj_move_foreground(provisioning_qr_root_);
     }
@@ -1243,14 +1821,8 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     }
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     if (grobot_eyes_ != nullptr) {
-        // 全脸模式保留状态栏与情绪，不让聊天气泡/字幕覆盖嘴巴和下半脸。
         DisplayLockGuard lock(this);
-        if (chat_message_label_ != nullptr) {
-            lv_label_set_text(chat_message_label_, "");
-        }
-        if (bottom_bar_ != nullptr) {
-            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        }
+        SetGrobotSubtitle(content);
         return;
     }
 #endif
@@ -1285,6 +1857,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
 
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
+    SetGrobotSubtitle("");
     // In non-wechat mode, just clear the chat message label and hide the bar
     if (chat_message_label_ != nullptr) {
         lv_label_set_text(chat_message_label_, "");
@@ -1542,6 +2115,13 @@ void LcdDisplay::SetTheme(Theme* theme) {
         lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
     }
 #endif
+    if (grobot_subtitle_bar_ != nullptr) {
+        lv_obj_set_style_bg_color(grobot_subtitle_bar_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(grobot_subtitle_bar_, LV_OPA_80, 0);
+    }
+    if (grobot_subtitle_label_ != nullptr) {
+        lv_obj_set_style_text_color(grobot_subtitle_label_, lvgl_theme->text_color(), 0);
+    }
 
     // Update low battery popup
     lv_obj_set_style_bg_color(low_battery_popup_, lvgl_theme->low_battery_color(), 0);
@@ -1565,6 +2145,17 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
             if (text != nullptr && text[0] != '\0') {
                 lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
             }
+        }
+    }
+    if (grobot_subtitle_bar_ != nullptr) {
+        if (hide) {
+            lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            const char* current = grobot_subtitle_label_ != nullptr
+                                      ? lv_label_get_text(grobot_subtitle_label_)
+                                      : nullptr;
+            const std::string text = current != nullptr ? current : "";
+            SetGrobotSubtitle(text.c_str());
         }
     }
 }

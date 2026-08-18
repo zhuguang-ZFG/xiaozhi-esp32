@@ -4,7 +4,7 @@
 
 ## hutuji 写字机变体
 
-本 fork 将该板作为写字机的 S3 小智板使用，保留原有 ST7796、FT5x06、ES8311、OV5640 与 AXP2101 初始化，并复用 `boards/lichuang-dev/` 的 Telnet 哑管道和任务编排：
+本 fork 将该板作为写字机的 S3 小派板使用，保留原有 ST7796、FT5x06、ES8311、OV5640 与 AXP2101 初始化，并复用 `boards/lichuang-dev/` 的 Telnet 哑管道和任务编排：
 
 - `hutuji.status`
 - `hutuji.draw`
@@ -39,9 +39,10 @@ idf.py -B build-waveshare-35 build
 
 ## 已验证边界
 
-- ESP-IDF v6.0.1 构建通过；host 回归 58/58。
+- ESP-IDF v6.0.1 构建通过；host 回归 60/60。
 - COM14 实机启动确认 8MB PSRAM、LCD、触摸、音频、OV5640、Grobot `460x300`、Wi-Fi、Grbl Telnet 与授权探测。
-- FT6X36 实机寄存器为 threshold `70`、active period `12`、chip `0x64`、vendor `0x11`；启动时把 threshold 调到 `40` 并回读确认。实机原始坐标覆盖 `320x480`，触摸配置改为在 `swap_xy` 前按原始轴镜像，避免 `y>320` 时无符号下溢到屏外。五点触摸均被控制器检出；10 次轻短点按形成 9 次独立 LVGL `PRESSED`。10ms 轮询实验仅 7/10，无收益，已撤销并保留默认轮询。
-- 儿童友好 UI 已由用户目视接受；触摸退出省电已实机确认。触摸调优改善仍需用户按最终无诊断固件确认手感。
-- 45 秒启动日志无 panic/assert/OOM，最低 SRAM `49551B`。
-- 尚未完成最终二维码触摸负向点击、完整 5 分钟无外部触摸长测、云端 device-call 与真实出图/换纸验证。
+- FT6X36 实机寄存器为 threshold `70`、active period `12`、chip `0x64`、vendor `0x11`；启动时把 threshold 调到 `40` 并回读确认。官方 demo 的 display `(swap=1, mirror_x=1, mirror_y=1)` 配 touch `(1,0,1)`；本仓 display 为 `(1,0,0)`，故触摸改为与其配对的 `(1,1,0)`。旧绝对照搬 `(1,0,1)` 的版本实机按钮未命中；新矩阵已烧入，但尚缺一次真实点击证据。
+- 屏幕控制抽屉只开放暂停、继续、停止、重画、试笔；二维码与出图预览显示时隐藏入口，不提供回原点、复位、点动或原始 G-code。所有动作改为 `LV_EVENT_PRESSED`，不依赖 release→click。
+- Grobot 使用独立 40px 单行字幕层，不依赖 WeChat `bottom_bar_`；用户已目视确认字幕恢复。省电改为 180 秒后降至 35%，自动关机保持禁用。
+- 换纸机械、时序、运动、传感器与错误码全部由 Grbl `user_m30()/paper_auto_change()` 实现；S3 页尾只发唯一 `M30` 并等待最终 `ok/error`，测试禁止任何纸路电机命令进入 S3 页尾事务。独立 `G1 X0Y0` 只实现画完回左下角，Grbl 的 `M30` 不归位。
+- 当前源码镜像 ELF `5ea8b3dd…0621f`、bin `9e1d1092…d859` 已构建；板上最近一次全量烧写为同一行为代码但不含最后的职责注释。预览确认、控制抽屉和绘图中语音并发仍待最终 HIL，不宣称实机通过。

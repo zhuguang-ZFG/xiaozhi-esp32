@@ -9,6 +9,10 @@
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
+#include "assets/lang_config.h"
+
+#include <cJSON.h>
+#include <cstring>
 
 #include <esp_log.h>
 #include "i2c_device.h"
@@ -19,6 +23,7 @@
 #include <esp_lcd_panel_ops.h>
 
 #include <esp_timer.h>
+#include <esp_wifi.h>
 #include <wifi_manager.h>
 #include "esp_io_expander_tca9554.h"
 
@@ -33,10 +38,41 @@
 #define TAG "waveshare_lcd_3_5"
 
 class Pmic : public Axp2101 {
+    uint8_t boot_poweroff_status_ = 0;
+    uint8_t boot_status1_ = 0;
+    uint8_t boot_status2_ = 0;
+    uint8_t boot_input_current_limit_ = 0;
+    uint8_t boot_irq_status1_ = 0;
+    uint8_t boot_irq_status2_ = 0;
+    uint8_t boot_irq_status3_ = 0;
+
     public:
         Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
-            WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
-            WriteReg(0x27, 0x10);  // hold 4s to power off
+            // 0x21 和 IRQ 状态会跨 PMIC 关机锁存；必须在任何电源配置写入前取证。
+            boot_poweroff_status_ = ReadReg(0x21);
+            boot_status1_ = ReadReg(0x00);
+            boot_status2_ = ReadReg(0x01);
+            boot_input_current_limit_ = ReadReg(0x16);
+            boot_irq_status1_ = ReadReg(0x48);
+            boot_irq_status2_ = ReadReg(0x49);
+            boot_irq_status3_ = ReadReg(0x4A);
+            LogBootStatus();
+            // AXP2101 0x10 bit2 对应 disablePwronShutPMIC()；0x22 bit1
+            // 对应 disableLongPressShutdown()。0x22 bit2 是过温关机保护，必须保留。
+            const uint8_t common_config = ReadReg(0x10);
+            WriteReg(0x10, common_config & ~0x04);
+            const uint8_t poweroff_enable = ReadReg(0x22);
+            WriteReg(0x22, (poweroff_enable | 0x04) & ~0x02);
+            // DCDC1 供 ESP32-S3、LCD、触摸和相机。bit2=Always PWM 改善语音播报与
+            // Wi-Fi/Telnet 并发时的负载阶跃响应；bits1:0=11 把 UVP 防抖从默认
+            // 60us 提到 240us（数据手册 0x81），吸收 NS4150B 功放阶跃造成的瞬态
+            // 下陷；UVP 阈值与过温保护全部保留，持续欠压仍会断电。
+            const uint8_t dc_force_pwm = ReadReg(0x81);
+            WriteReg(0x81, dc_force_pwm | 0x07);
+            const uint8_t configured_dc_mode = ReadReg(0x81);
+            ESP_LOGW(TAG, "pmic dcdc1 mode=%s reg81=0x%02x",
+                     (configured_dc_mode & 0x04) != 0 ? "always-pwm" : "auto",
+                     configured_dc_mode);
     
             // Disable All DCs but DC1
             WriteReg(0x80, 0x01);
@@ -61,6 +97,13 @@ class Pmic : public Axp2101 {
             WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
             WriteReg(0x62, 0x08); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
             WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
+        }
+
+        void LogBootStatus() const {
+            ESP_LOGW(TAG,
+                     "pmic boot status off=0x%02x status=0x%02x/0x%02x ilim=0x%02x irq=0x%02x/0x%02x/0x%02x",
+                     boot_poweroff_status_, boot_status1_, boot_status2_, boot_input_current_limit_,
+                     boot_irq_status1_, boot_irq_status2_, boot_irq_status3_);
         }
     };
 
@@ -112,19 +155,31 @@ private:
     PowerSaveTimer* power_save_timer_;
     EspVideo* camera_;
 
+    void ReplayPmicBootStatusAfterUsbReady() {
+        Pmic* pmic = pmic_;
+        BaseType_t created = xTaskCreate(
+            [](void* arg) {
+                auto* pmic = static_cast<Pmic*>(arg);
+                vTaskDelay(pdMS_TO_TICKS(15000));
+                pmic->LogBootStatus();
+                vTaskDelete(nullptr);
+            },
+            "pmic_boot_log", 2048, pmic, 1, nullptr);
+        if (created != pdTRUE) {
+            ESP_LOGE(TAG, "failed to create delayed PMIC boot log task");
+        }
+    }
+
     void InitializePowerSaveTimer() {
-        // 写字机需长期保持 Wi-Fi/Telnet 待命；保留低亮度省电，禁用五分钟自动断电。
-        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
+        // 写字机需长期保持 Wi-Fi/Telnet 待命；三分钟后只降到仍能辨识的亮度，禁用自动断电。
+        power_save_timer_ = new PowerSaveTimer(-1, 180, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(20);
+            GetBacklight()->SetBrightness(35);
         });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
-        });
-        power_save_timer_->OnShutdownRequest([this]() {
-            pmic_->PowerOff();
         });
         power_save_timer_->SetEnabled(true);
     }
@@ -234,7 +289,7 @@ private:
                 {
                     .swap_xy = 1,
                     .mirror_x = 1,
-                    .mirror_y = 1,
+                    .mirror_y = 0,
                 },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
@@ -304,6 +359,7 @@ private:
                     auto* timer = static_cast<PowerSaveTimer*>(lv_event_get_user_data(event));
                     timer->WakeUp();
                 },
+
                 LV_EVENT_PRESSED, power_save_timer_);
         }
         ESP_LOGI(TAG, "Touch panel initialized successfully");
@@ -363,6 +419,52 @@ private:
     }
 
     // 初始化工具
+    using MachineControlRequest = std::string (hutuji::Job::*)();
+
+    static std::string MachineControlFeedback(const std::string& result) {
+        cJSON* root = cJSON_Parse(result.c_str());
+        if (root == nullptr) {
+            return Lang::Strings::MACHINE_ACTION_FAILED;
+        }
+        std::string message = Lang::Strings::MACHINE_ACTION_SENT;
+        if (cJSON_IsString(root)) {
+            const char* value = cJSON_GetStringValue(root);
+            if (value != nullptr) {
+                if (strcmp(value, "ok") == 0) {
+                    message = Lang::Strings::MACHINE_ACTION_SENT;
+                } else if (strcmp(value, "started") == 0 ||
+                           strcmp(value, "started_redownload") == 0) {
+                    message = Lang::Strings::MACHINE_ACTION_STARTED;
+                } else {
+                    message = value;
+                }
+            }
+        } else if (cJSON_IsObject(root)) {
+            const cJSON* error = cJSON_GetObjectItemCaseSensitive(root, "error");
+            if (cJSON_IsString(error) && error->valuestring != nullptr) {
+                message = error->valuestring;
+            }
+        }
+        cJSON_Delete(root);
+        return message;
+    }
+
+    void ScheduleMachineControl(const char* action, MachineControlRequest request) {
+        ESP_LOGI(TAG, "ui machine action=%s", action);
+        Application::GetInstance().Schedule([this, request]() {
+            const std::string result = (hutuji::Job::GetInstance().*request)();
+            display_->ShowNotification(MachineControlFeedback(result));
+        });
+    }
+    void ScheduleManualControl(const char* action) {
+        ESP_LOGI(TAG, "ui machine action=%s", action);
+        const std::string act = action;
+        Application::GetInstance().Schedule([this, act]() {
+            const std::string result = hutuji::Job::GetInstance().RequestManualControl(act);
+            display_->ShowNotification(MachineControlFeedback(result));
+        });
+    }
+
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
@@ -376,21 +478,42 @@ private:
         // hutuji 写字机 Telnet 哑管道（TCP 客户端 → Grbl_Esp32 Telnet:23）。
         hutuji::Pipe::GetInstance().Start();
 
+        display_->ConfigureMachineControls(
+            [this]() { ScheduleMachineControl("pause", &hutuji::Job::RequestPause); },
+            [this]() { ScheduleMachineControl("resume", &hutuji::Job::RequestResume); },
+            [this]() { ScheduleMachineControl("abort", &hutuji::Job::RequestAbort); },
+            [this]() { ScheduleMachineControl("repeat", &hutuji::Job::RequestRepeat); },
+            [this]() { ScheduleMachineControl("pen_test", &hutuji::Job::RequestPenTest); },
+            [this](const char* action) { ScheduleManualControl(action); });
+
         mcp_server.AddTool("hutuji.status",
-            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、任务状态。",
+            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、任务状态。"
+            "state 含 previewing 预览加载中、awaiting_confirmation 等用户确认。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().StatusJson();
             });
 
         mcp_server.AddTool("hutuji.draw",
-            "执行出纸：url 必须是云端 hutuji_draw 返回的 G-code 下载地址。",
-            PropertyList({Property("url", kPropertyTypeString)}),
+            "先出预览：url 是云端 hutuji_draw 返回的 G-code 地址，preview_url 是同一次返回的 PNG "
+            "预览地址。只把预览显示到屏幕上，不启动任何机械动作；屏幕会出现「开始画」「取消」"
+            "按钮，用户确认后才调 hutuji.confirm。",
+            PropertyList({Property("url", kPropertyTypeString),
+                          Property("preview_url", kPropertyTypeString)}),
             [](const PropertyList& properties) -> ReturnValue {
                 const std::string& url = properties["url"].value<std::string>();
-                return hutuji::Job::GetInstance().StartDraw(url);
+                const std::string& preview_url = properties["preview_url"].value<std::string>();
+                return hutuji::Job::GetInstance().StartDraw(url, preview_url);
             });
 
-        mcp_server.AddTool("hutuji.abort", "中止当前绘图转发。", PropertyList(),
+        mcp_server.AddTool("hutuji.confirm",
+            "用户看过屏幕预览后确认出图：说「开始画/可以/就这个」时用。"
+            "仅在 state 为 awaiting_confirmation 时有效；等价于用户点屏幕「开始画」按钮。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestConfirm();
+            });
+
+        mcp_server.AddTool("hutuji.abort", "中止当前绘图转发，或取消尚未确认的预览。",
+            PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().RequestAbort();
             });
@@ -414,6 +537,16 @@ private:
             [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().RequestPenTest();
             });
+
+    }
+    // 同室部署写字机：10dBm(40=0.25dBm 单位) 足够覆盖，显著降低 Wi-Fi 峰值电流，
+    // 与 Always PWM、UVP 240us 防抖共同缓解无电池 VSYS 的瞬态下陷。
+    void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        const esp_err_t tx_err = esp_wifi_set_max_tx_power(40);
+        if (tx_err != ESP_OK) {
+            ESP_LOGW(TAG, "set max tx power failed: %s", esp_err_to_name(tx_err));
+        }
     }
 
     void SetNetworkEventCallback(NetworkEventCallback callback) override {
@@ -451,8 +584,16 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeCamera();
+        // 无电池缓冲（PMIC status1 无电池位）时，NS4150B 功放是 VSYS 最大瞬态负载；
+        // 音量直接线性放大播报峰值电流。启动时把音量钳到 50，用户仍可语音再调。
+        auto* codec = GetAudioCodec();
+        if (codec->output_volume() > 50) {
+            codec->SetOutputVolume(50);
+        }
         InitializeTools();
         GetBacklight()->RestoreBrightness();
+        // USB CDC 枚举较晚，15 秒后复述同一份启动锁存值，不重新读寄存器。
+        ReplayPmicBootStatusAfterUsbReady();
     }
 
     virtual AudioCodec* GetAudioCodec() override {

@@ -243,9 +243,10 @@ inline bool IsDecimalPort(const std::string& text) {
 
 /**
  * 校验 hutuji.draw 的 capability URL。生产域只允许 HTTPS；HTTP 仅留给 RFC1918
- * 联调主机。authority 禁 userinfo/IPv6/畸形端口，路径固定为服务端的 `/files/`。
+ * 联调主机。authority 禁 userinfo/IPv6/畸形端口，路径固定为服务端的 `/files/`，
+ * 且路径（query 前）必须以 expected_suffix 结尾，防 PNG/G-code 参数互换。
  */
-inline bool IsValidDrawUrl(const std::string& url) {
+inline bool IsValidDrawCapabilityUrl(const std::string& url, const std::string& expected_suffix) {
     constexpr const char* kHttps = "https://";
     constexpr const char* kHttp = "http://";
     for (unsigned char c : url) {
@@ -268,6 +269,12 @@ inline bool IsValidDrawUrl(const std::string& url) {
     const size_t slash = url.find('/', authority_begin);
     if (slash == std::string::npos || slash == authority_begin ||
         url.compare(slash, 7, "/files/") != 0 || url.find('#', slash) != std::string::npos) {
+        return false;
+    }
+    const size_t query = url.find('?', slash);
+    const size_t path_end = query == std::string::npos ? url.size() : query;
+    if (expected_suffix.empty() || path_end < expected_suffix.size() ||
+        url.compare(path_end - expected_suffix.size(), expected_suffix.size(), expected_suffix) != 0) {
         return false;
     }
     const std::string authority = url.substr(authority_begin, slash - authority_begin);
@@ -305,6 +312,10 @@ inline bool IsValidDrawUrl(const std::string& url) {
     }
     return octets[0] == 10u || (octets[0] == 172u && octets[1] >= 16u && octets[1] <= 31u) ||
            (octets[0] == 192u && octets[1] == 168u);
+}
+
+inline bool IsValidDrawUrl(const std::string& url) {
+    return IsValidDrawCapabilityUrl(url, ".gcode");
 }
 
 /**

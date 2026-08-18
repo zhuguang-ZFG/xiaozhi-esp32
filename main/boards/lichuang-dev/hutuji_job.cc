@@ -2,10 +2,14 @@
 
 #include "hutuji_pipe.h"
 
+#include "assets/lang_config.h"
 #include "application.h"
 #include "board.h"
+#include "audio_codec.h"
 #include "display.h"
 #include "http.h"
+#include "lvgl_display.h"
+#include "lvgl_image.h"
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -17,6 +21,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <memory>
 
 #include <deque>
 #include <string>
@@ -27,6 +33,7 @@ namespace hutuji {
 
 namespace {
 constexpr size_t kMaxGcodeBytes = 512 * 1024;
+constexpr size_t kMaxPreviewBytes = 512 * 1024;
 constexpr uint32_t kOkTimeoutMs = 60000;
 constexpr uint32_t kPaperOkTimeoutMs = 90000;
 constexpr uint32_t kMotionOkTimeoutMs = 30000;
@@ -83,8 +90,16 @@ void Job::SetStreamingOrPaused() {
 }
 
 void Job::SetState(const char* state) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    state_ = state;
+    std::string state_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state_ = state;
+        state_snapshot = state_;
+    }
+    if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
+        display->UpdateMachineControlState(state_snapshot);
+    }
+    ESP_LOGI(TAG, "job state=%s", state_snapshot.c_str());
 }
 
 void Job::Notify(const std::string& message) {
@@ -212,13 +227,10 @@ static bool LooksLikePlannerSyncLine(const std::string& line) {
     return false;
 }
 
-std::string Job::StartDraw(const std::string& url) {
-    if (url.empty()) {
-        return "{\"error\":\"url 不能为空\"}";
-    }
-    if (!IsValidDrawUrl(url)) {
-        return "{\"error\":\"url 必须是 https://hutuji.donglicao.com/files/... 或联调主机的 "
-               "/files/... 地址\"}";
+std::string Job::StartDraw(const std::string& url, const std::string& preview_url) {
+    if (!IsValidDrawCapabilityUrl(url, ".gcode") ||
+        !IsValidDrawCapabilityUrl(preview_url, ".png")) {
+        return "{\"error\":\"url/preview_url 必须是同站能力地址且扩展名正确\"}";
     }
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
@@ -231,30 +243,44 @@ std::string Job::StartDraw(const std::string& url) {
     stream_quiescence_.store(StreamQuiescence::Idle, std::memory_order_release);
     abort_hold_confirmed_.store(false);
     abort_requested_.store(false);
+    awaiting_confirmation_.store(false);
     paused_.store(false);
     paper_active_.store(false);
-    auto& pipe = Pipe::GetInstance();
-    if (!pipe.IsConnected()) {
-        busy_.store(false);
-        return "{\"error\":\"写字机 Telnet 未连接\"}";
-    }
-    if (!pipe.IsReady()) {
-        busy_.store(false);
-        return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
-    }
-    // 新任务：留存的旧 G-code 作废（Run 里 DownloadToPsram 会 ReleaseBuffer）
     repeat_mode_.store(false);
     buffer_replayable_.store(false);
     url_ = url;
+    preview_url_ = preview_url;
     last_error_.clear();
-    SetState("downloading");
-
-    BaseType_t ok = xTaskCreate(TaskEntry, "hutuji_draw", 8192, this, 5, nullptr);
+    SetState("previewing");
+    BaseType_t ok = xTaskCreate(PreviewTaskEntry, "hutuji_preview", 6144, this, 4, nullptr);
     if (ok != pdTRUE) {
         busy_.store(false);
         SetState("idle");
+        return "{\"error\":\"无法创建预览任务\"}";
+    }
+    return JsonString("previewing");
+}
+
+std::string Job::RequestConfirm() {
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    if (!busy_.load() || !awaiting_confirmation_.load()) {
+        return "{\"error\":\"当前没有待确认的预览\"}";
+    }
+    auto& pipe = Pipe::GetInstance();
+    if (!pipe.IsConnected() || !pipe.IsReady()) {
+        return "{\"error\":\"写字机未连接或未就绪\"}";
+    }
+    awaiting_confirmation_.store(false);
+    SetState("downloading");
+    // 灌流可持续数分钟，优先级必须低于 AFE 与编解码，避免挤占语音处理。
+    BaseType_t ok = xTaskCreate(TaskEntry, "hutuji_draw", 8192, this, 1, nullptr);
+    if (ok != pdTRUE) {
+        // 回滚必须保留屏上预览：否则用户看到空屏却仍处于待确认。
+        awaiting_confirmation_.store(true);
+        SetState("awaiting_confirmation");
         return "{\"error\":\"无法创建出图任务\"}";
     }
+    ClearPreview();
     return JsonString("started");
 }
 
@@ -262,13 +288,18 @@ std::string Job::RequestAbort() {
     bool pen_test_active = false;
     bool paper_active = false;
     {
-        // busy/试笔/换纸与 abort 在同一提交锁下取快照，避免试笔启停窗口误走 0x18。
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (!busy_.load()) {
             return JsonString("ok");
         }
+        if (awaiting_confirmation_.exchange(false)) {
+            ClearPreview();
+            abort_requested_.store(false);
+            busy_.store(false, std::memory_order_release);
+            SetState("aborted");
+            return JsonString("预览已取消");
+        }
         abort_requested_.store(true);
-        // 纪元与 abort 状态同锁发布；快照早于本提交的候选行经 DecideStreamSend 必然拒发。
         stream_control_epoch_.store(
             NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
             std::memory_order_release);
@@ -282,6 +313,11 @@ std::string Job::RequestAbort() {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         state = state_;
+    }
+    // 预览下载中取消：机械从未动过，绝不能发 `!`/0x18 打扰 Grbl。
+    // 预览任务自己轮询 abort_requested_ 后撤图并释放 busy_。
+    if (state == "previewing") {
+        return JsonString("预览取消中");
     }
     if (state == "downloading" || state == "verifying") {
         return JsonString("ok");
@@ -584,7 +620,8 @@ std::string Job::RequestRepeat() {
     last_error_.clear();
     SetState(replay ? "streaming" : "downloading");
 
-    BaseType_t ok = xTaskCreate(TaskEntry, "hutuji_draw", 8192, this, 5, nullptr);
+    // 重画也可能持续数分钟，必须与确认出图使用相同的音频让行优先级。
+    BaseType_t ok = xTaskCreate(TaskEntry, "hutuji_draw", 8192, this, 1, nullptr);
     if (ok != pdTRUE) {
         busy_.store(false);
         repeat_mode_.store(false);
@@ -687,6 +724,146 @@ std::string Job::RequestPenTest() {
     return JsonString("started");
 }
 
+std::string Job::RequestManualControl(const std::string& action) {
+    // 动作集合即奎享面板的 S3 化映射（2026-08-18 用户实测串口序列后决策全量开放）。
+    static const char* const kActions[] = {
+        "pen_up", "pen_down", "jog_x+", "jog_x-", "jog_y+", "jog_y-",
+        "home", "set_origin", "unlock", "motor_off", "reset"};
+    bool known = false;
+    for (const char* candidate : kActions) {
+        if (action == candidate) {
+            known = true;
+            break;
+        }
+    }
+    if (!known) {
+        return "{\"error\":\"未知的手动控制动作\"}";
+    }
+    auto& pipe = Pipe::GetInstance();
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (busy_.exchange(true)) {
+            return JsonString("写字机正忙，请稍候再试");
+        }
+        std::string state;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            state = state_;
+        }
+        // 手动控制仅 settled 态可用：任务进行中一切手动动作都会与在途流冲突。
+        if (state != "idle" && state != "done" && state != "error" && state != "aborted") {
+            busy_.store(false);
+            return "{\"error\":\"当前任务状态不允许手动控制\"}";
+        }
+        if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
+            busy_.store(false);
+            return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
+        }
+        abort_requested_.store(false);
+        pending_manual_action_ = action;
+        SetState("manual");
+    }
+    BaseType_t created = xTaskCreate(ManualTaskEntry, "hutuji_manual", 4096, this, 4, nullptr);
+    if (created != pdTRUE) {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        busy_.store(false);
+        SetState("idle");
+        return "{\"error\":\"无法创建手动控制任务\"}";
+    }
+    return JsonString("started");
+}
+
+void Job::ManualTaskEntry(void* arg) {
+    auto* self = static_cast<Job*>(arg);
+    self->ManualTask();
+    vTaskDelete(nullptr);
+}
+
+void Job::ManualTask() {
+    auto& pipe = Pipe::GetInstance();
+    const std::string action = pending_manual_action_;
+    bool ok = true;
+    std::string failed_step;
+
+    // 逐行模式应答：SendLine 发前已清残留，WaitResponse 等本行 ok/error。
+    auto send_ok = [&](const char* line, const char* what) -> bool {
+        if (!pipe.SendLine(line)) {
+            failed_step = what;
+            return false;
+        }
+        int error_code = -1;
+        const WaitResult wr = pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &error_code);
+        if (wr != WaitResult::Ok) {
+            failed_step = what;
+            if (error_code >= 0) {
+                failed_step += " (error:" + std::to_string(error_code) + ")";
+            }
+            return false;
+        }
+        return true;
+    };
+
+    if (action == "pen_up") {
+        ok = send_ok("G1G90 Z0.0F10000", "抬笔") && WaitForIdle(false, kPenOriginIdleTimeoutMs);
+    } else if (action == "pen_down") {
+        // 对齐奎享实测落笔序列：先 G92 Z0 声明当前位，再 Z5 落笔。
+        ok = send_ok("G92 Z0", "落笔校准") && send_ok("G1G90 Z5.0F10000", "落笔") &&
+             WaitForIdle(false, kPenOriginIdleTimeoutMs);
+    } else if (action == "jog_x+" || action == "jog_x-" || action == "jog_y+" ||
+               action == "jog_y-") {
+        const float dx = action == "jog_x+" ? 1.0f : (action == "jog_x-" ? -1.0f : 0.0f);
+        const float dy = action == "jog_y+" ? 1.0f : (action == "jog_y-" ? -1.0f : 0.0f);
+        // 机器无限位开关，MPos 边界检查是点动的唯一防线（限幅与云端 §5 同源）。
+        float mx = 0, my = 0, mz = 0;
+        pipe.GetMachinePos(mx, my, mz);
+        if (mx + dx < 0.0f || mx + dx > 190.0f || my + dy < 0.0f || my + dy > 277.0f) {
+            ok = false;
+            failed_step = "点动越界";
+        } else {
+            // 逐字对齐奎享实测 `$J=G21G91X1.0Y0.0Z0.0F8000.0`（1mm 固定步进）。
+            char line[48];
+            snprintf(line, sizeof(line), "$J=G21G91X%.1fY%.1fZ0.0F8000.0", dx, dy);
+            ok = send_ok(line, "点动") && WaitForIdle(false, kPenOriginIdleTimeoutMs);
+        }
+    } else if (action == "home") {
+        // G1 落 (0,0) 不触发换纸（页尾归位同款语义）；homing 指令与 G0 一律禁止——
+        // 无限位时 homing 全速撞死点，G0 X0Y0 会触发自动换纸。
+        ok = send_ok("G1G90 X0Y0F8000", "回原点") && WaitForIdle(false, kHomeIdleTimeoutMs);
+    } else if (action == "set_origin") {
+        // 逐字对齐奎享实测 `G92 X0.0 Y0.0 Z0`：把当前笔位声明为工作原点。
+        ok = send_ok("G92 X0.0 Y0.0 Z0", "设置原点");
+    } else if (action == "unlock") {
+        ok = send_ok("$X", "解除警报");
+    } else if (action == "motor_off") {
+        ok = send_ok("$SLP", "关闭电机");
+    } else if (action == "reset") {
+        const uint32_t banner_before = pipe.GetResetBannerSequence();
+        if (!pipe.SendRealtime(0x18)) {
+            ok = false;
+            failed_step = "复位";
+        } else {
+            const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(10000);
+            while (xTaskGetTickCount() < deadline) {
+                if (pipe.GetResetBannerSequence() != banner_before) {
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (pipe.GetResetBannerSequence() == banner_before) {
+                ok = false;
+                failed_step = "复位后未收到新启动横幅";
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        SetState("idle");
+        busy_.store(false);
+    }
+    Notify(ok ? "手动控制完成" : "手动控制失败: " + failed_step);
+}
+
 std::string Job::StatusJson() const {
     auto& pipe = Pipe::GetInstance();
     // 发 ? 触发后台更新，不在 MCP 回调里 sleep 等待；直接返回当前缓存状态。
@@ -733,6 +910,160 @@ std::string Job::StatusJson() const {
     std::string json = str ? str : "{}";
     cJSON_free(str);
     return json;
+}
+
+void Job::PreviewTaskEntry(void* arg) {
+    static_cast<Job*>(arg)->Preview();
+    vTaskDelete(nullptr);
+}
+
+void Job::Preview() {
+    if (!DownloadAndShowPreview(preview_url_)) {
+        // 预览取消也走这条路（下载中收到 abort）：区分处置，避免误报错误。
+        if (abort_requested_.load()) {
+            ClearPreview();
+            SetState("aborted");
+            Notify("预览已取消");
+        } else {
+            ClearPreview();
+            SetState("error");
+            Notify("预览图加载失败，请重新生成后再试");
+        }
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        abort_requested_.store(false);
+        busy_.store(false, std::memory_order_release);
+        return;
+    }
+    // 图已在屏上，但期间可能已被取消：此时必须撤图并让出 busy_，不能停在待确认。
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (abort_requested_.load()) {
+            ClearPreview();
+            SetState("aborted");
+            abort_requested_.store(false);
+            busy_.store(false, std::memory_order_release);
+            return;
+        }
+        awaiting_confirmation_.store(true);
+        SetState("awaiting_confirmation");
+    }
+    Notify("预览已出来啦，喜欢就说「开始画」，不喜欢就说「取消」");
+}
+
+void Job::ClearPreview() {
+    if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
+        display->HideDrawPreview();
+    }
+}
+
+void Job::WaitForAudioOutputIdle() {
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec == nullptr || !codec->output_enabled()) {
+        return;
+    }
+    // 功放 + Wi-Fi 下载是无电池 VSYS 的最大组合负载；等播报结束再开始下载。
+    // 上限 30s 防止异常状态死等；abort 立即放行，由下载循环的 abort 检查收敛。
+    ESP_LOGI(TAG, "等待播报结束再下载（功放/WiFi 错峰）");
+    for (int i = 0; i < 300 && codec->output_enabled(); ++i) {
+        if (abort_requested_.load()) {
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+bool Job::DownloadAndShowPreview(const std::string& url) {
+    auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay());
+    if (display == nullptr) {
+        ESP_LOGW(TAG, "无 LVGL 显示，跳过预览");
+        return false;
+    }
+    WaitForAudioOutputIdle();
+    auto network = Board::GetInstance().GetNetwork();
+    if (!network) {
+        return false;
+    }
+    auto http = network->CreateHttp(3);
+    if (!http) {
+        return false;
+    }
+    http->SetTimeout(60000);
+    if (!http->Open("GET", url)) {
+        return false;
+    }
+    if (http->GetStatusCode() != 200) {
+        ESP_LOGW(TAG, "预览 HTTP status %d", http->GetStatusCode());
+        http->Close();
+        return false;
+    }
+    const size_t content_length = http->GetBodyLength();
+    if (content_length == 0 || content_length > kMaxPreviewBytes) {
+        ESP_LOGW(TAG, "预览长度非法 %u", (unsigned)content_length);
+        http->Close();
+        return false;
+    }
+    std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
+    if (crc_hdr.empty()) {
+        crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
+    }
+    uint32_t expected_crc = 0;
+    if (!ParseCrc32Header(crc_hdr, expected_crc)) {
+        ESP_LOGW(TAG, "预览缺少或非法 X-Hutuji-CRC32");
+        http->Close();
+        return false;
+    }
+    // 与 G-code 同策：只用 PSRAM，不回落内部堆，避免饿死 WiFi/音频。
+    auto* data = static_cast<uint8_t*>(
+        heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (data == nullptr) {
+        http->Close();
+        return false;
+    }
+    size_t total = 0;
+    bool aborted = false;
+    while (total < content_length) {
+        if (abort_requested_.load()) {
+            aborted = true;
+            break;
+        }
+        int n = http->Read(reinterpret_cast<char*>(data + total), content_length - total);
+        if (n < 0) {
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+    http->Close();
+    if (aborted || total != content_length ||
+        !Crc32Matches(expected_crc, Crc32Ieee(data, total))) {
+        heap_caps_free(data);
+        return false;
+    }
+    // LvglAllocatedImage 构造成功即接管 data 的所有权（析构里 heap_caps_free）；
+    // 只有构造抛出（PNG 头非法）时才由本函数释放，否则就是 double free。
+    std::unique_ptr<LvglAllocatedImage> image;
+    try {
+        image = std::make_unique<LvglAllocatedImage>(data, total);
+    } catch (const std::exception& exc) {
+        ESP_LOGW(TAG, "预览 PNG 解码失败: %s", exc.what());
+        heap_caps_free(data);
+        return false;
+    }
+    // 触屏按钮是主路径（绘图/嘈杂环境下语音最不可靠），语音确认仍并行有效。
+    // 回调在 LVGL 任务里跑：只能投递到 Application 事件循环，不能在这里建任务或发网络。
+    display->ShowDrawPreview(
+        std::move(image), Lang::Strings::DRAW_PREVIEW_HINT,
+        []() {
+            ESP_LOGI(TAG, "ui preview action=confirm");
+            Application::GetInstance().Schedule([]() { Job::GetInstance().RequestConfirm(); });
+        },
+        []() {
+            ESP_LOGI(TAG, "ui preview action=cancel");
+            Application::GetInstance().Schedule([]() { Job::GetInstance().RequestAbort(); });
+        });
+    return true;
 }
 
 void Job::TaskEntry(void* arg) {
@@ -963,6 +1294,7 @@ void Job::Run() {
 }
 
 bool Job::DownloadToPsram(const std::string& url) {
+    WaitForAudioOutputIdle();
     ReleaseBuffer();
     auto network = Board::GetInstance().GetNetwork();
     if (!network) {
@@ -1514,6 +1846,9 @@ bool Job::ReturnHomeAfterDraw() {
 
 bool Job::ChangePaperAfterDraw() {
     auto& pipe = Pipe::GetInstance();
+    // 职责边界：换纸机械、时序、运动、传感器与错误判定全部由 Grbl 的
+    // user_m30()/paper_auto_change() 实现。S3 这里只发唯一页结束命令 M30，
+    // 等待其最终 ok/error，并在阻塞期间保护 Telnet 会话；不得加入纸路控制步骤。
 
     // R11-PIPE-02：blocking 标记走 RAII，与换纸行分支的 BlockingGuard 同款。M30 等待
     // 循环的 link-lost / ALARM 两个早退覆盖不到手工复位（此前只靠 Run() 收尾兜底，

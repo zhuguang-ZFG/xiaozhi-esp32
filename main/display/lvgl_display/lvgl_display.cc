@@ -302,6 +302,14 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
 
 void LvglDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {}
 
+void LvglDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::string& hint,
+                                  std::function<void()> on_confirm,
+                                  std::function<void()> on_cancel) {}
+
+void LvglDisplay::HideDrawPreview() {}
+
+void LvglDisplay::UpdateMachineControlState(const std::string& state) {}
+
 void LvglDisplay::SetPowerSaveMode(bool on) {
     if (on) {
         SetChatMessage("system", "");

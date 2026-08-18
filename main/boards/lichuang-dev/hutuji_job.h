@@ -20,8 +20,11 @@ class Job {
 public:
     static Job& GetInstance();
 
-    /** 启动独立任务。忙时返回「写字机正忙，请稍候再试」。 */
-    std::string StartDraw(const std::string& url);
+    /** 下载并显示预览；不会启动机械运动，须随后 RequestConfirm。 */
+    std::string StartDraw(const std::string& url, const std::string& preview_url);
+
+    /** 用户看过预览后确认：此处才创建真正的出图任务。 */
+    std::string RequestConfirm();
 
     /** 分状态 abort（protocol §4.1）。 */
     std::string RequestAbort();
@@ -41,6 +44,13 @@ public:
     /** 笔测试：弹簧回位校准 Z0 → Z5 触纸 → Z0 抬笔。 */
     std::string RequestPenTest();
 
+    /**
+     * 触屏手动调试统一入口（2026-08-18 用户决策全量开放，命令逐字对齐奎享实测）。
+     * action ∈ pen_up/pen_down/jog_x±/jog_y±/home/set_origin/unlock/motor_off/reset。
+     * 仅 settled 态（idle/done/error/aborted）可用；独立任务执行，不阻塞调用方。
+     */
+    std::string RequestManualControl(const std::string& action);
+
     /** status JSON：connected/ready/authorized/state/last_line */
     std::string StatusJson() const;
 
@@ -50,7 +60,11 @@ private:
     Job() = default;
 
     static void TaskEntry(void* arg);
+    static void PreviewTaskEntry(void* arg);
+    void Preview();
     void Run();
+    static void ManualTaskEntry(void* arg);
+    void ManualTask();
 
     /**
      * S2：一行在 buffer_ 里的位置（剥注释/首尾空白之后的内容 span）。
@@ -67,11 +81,15 @@ private:
     };
 
     bool DownloadToPsram(const std::string& url);
+    bool DownloadAndShowPreview(const std::string& url);
+    void ClearPreview();
     bool VerifyCrc();
     bool StreamToGrbl();
     /** 等待弹簧自然回位后，以受控旁路命令把当前抬笔位声明为 Z0。 */
     bool PreparePenOrigin();
     bool WaitForIdle(bool honor_abort, uint32_t timeout_ms);
+    /** 播报期间 PA 与 HTTPS 下载并发会拉垮无电池 VSYS；下载前等音频输出空闲。 */
+    void WaitForAudioOutputIdle();
     /**
      * 等 ok 超时后的兜底判定：Grbl WebUI Telnet 输出无 TX 缓冲，`ok` 与 `?` 状态
      * 报告在同核并发写同一 socket，被抢占的部分写会静默吃掉一个 `ok`（不产生
@@ -127,7 +145,10 @@ private:
         return std::string_view(reinterpret_cast<const char*>(buffer_) + s.offset, s.len);
     }
 
+    /** 手动控制动作载荷：RequestManualControl 写入、ManualTask 消费（busy_ 保护）。 */
+    std::string pending_manual_action_;
     std::string url_;
+    std::string preview_url_;
     uint8_t* buffer_ = nullptr;
     size_t buffer_len_ = 0;
     uint32_t expect_crc_ = 0;
@@ -139,6 +160,7 @@ private:
     std::string last_error_;
 
     std::atomic<bool> busy_{false};
+    std::atomic<bool> awaiting_confirmation_{false};
     std::atomic<bool> abort_requested_{false};
     std::atomic<bool> paper_active_{false};
     std::atomic<bool> paused_{false};

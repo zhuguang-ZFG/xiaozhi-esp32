@@ -8,6 +8,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <atomic>
 #include <memory>
+#include <vector>
 
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
 class GrobotEyes;
@@ -35,6 +36,8 @@ protected:
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
+    lv_obj_t* grobot_subtitle_bar_ = nullptr;
+    lv_obj_t* grobot_subtitle_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
@@ -42,12 +45,42 @@ protected:
     lv_obj_t* provisioning_qr_code_ = nullptr;
     lv_obj_t* provisioning_qr_hint_ = nullptr;
     std::unique_ptr<LvglImage> provisioning_qr_image_;
+    lv_obj_t* draw_preview_root_ = nullptr;
+    lv_obj_t* draw_preview_image_ = nullptr;
+    lv_obj_t* draw_preview_hint_ = nullptr;
+    lv_obj_t* draw_preview_confirm_btn_ = nullptr;
+    lv_obj_t* draw_preview_cancel_btn_ = nullptr;
+    std::unique_ptr<LvglImage> draw_preview_cached_;
+    std::function<void()> draw_preview_on_confirm_;
+    std::function<void()> draw_preview_on_cancel_;
+    lv_obj_t* machine_control_trigger_btn_ = nullptr;
+    lv_obj_t* machine_control_root_ = nullptr;
+    lv_obj_t* machine_pause_btn_ = nullptr;
+    lv_obj_t* machine_resume_btn_ = nullptr;
+    lv_obj_t* machine_abort_btn_ = nullptr;
+    lv_obj_t* machine_repeat_btn_ = nullptr;
+    lv_obj_t* machine_pen_test_btn_ = nullptr;
+    lv_obj_t* machine_close_btn_ = nullptr;
+    lv_obj_t* machine_state_label_ = nullptr;
+    std::function<void()> machine_pause_;
+    std::function<void()> machine_resume_;
+    std::function<void()> machine_abort_;
+    std::function<void()> machine_repeat_;
+    std::function<void()> machine_pen_test_;
+    std::function<void(const char* action)> machine_manual_;
+    std::vector<lv_obj_t*> machine_manual_buttons_;
+    std::string machine_state_{"idle"};
+    bool machine_controls_configured_ = false;
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     std::unique_ptr<GrobotEyes> grobot_eyes_;
 #endif
 
     void InitializeLcdThemes();
     void EnsureProvisioningQrUi();
+    void EnsureDrawPreviewUi();
+    void EnsureMachineControlUi();
+    void ApplyMachineControlState();
+    void SetGrobotSubtitle(const char* content);
     void InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme, const lv_font_t* large_icon_font);
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
@@ -63,6 +96,17 @@ public:
     virtual void SetStatus(const char* status) override;
     virtual void ShowProvisioningQr(const std::string& payload, const std::string& hint) override;
     virtual void HideProvisioningQr() override;
+    virtual void ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::string& hint,
+                                 std::function<void()> on_confirm,
+                                 std::function<void()> on_cancel) override;
+    virtual void HideDrawPreview() override;
+    void ConfigureMachineControls(std::function<void()> on_pause,
+                                  std::function<void()> on_resume,
+                                  std::function<void()> on_abort,
+                                  std::function<void()> on_repeat,
+                                  std::function<void()> on_pen_test,
+                                  std::function<void(const char* action)> on_manual);
+    virtual void UpdateMachineControlState(const std::string& state) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;

@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -221,6 +222,97 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             """
         )
         self._compile_and_run(compiler, source, stem="hutuji_draw_url_contract_test")
+
+    def test_preview_url_requires_png_and_draw_url_requires_gcode(self):
+        """预览与机械文件必须同走能力 URL 边界，但扩展名不可互换。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+            #include <cassert>
+            int main() {
+                using hutuji::IsValidDrawCapabilityUrl;
+                const char* base = "https://hutuji.donglicao.com/files/draw_20260817_120000_abcdefghijklmnopqrstuv";
+                assert(IsValidDrawCapabilityUrl(std::string(base) + ".gcode", ".gcode"));
+                assert(IsValidDrawCapabilityUrl(std::string(base) + ".png", ".png"));
+                assert(!IsValidDrawCapabilityUrl(std::string(base) + ".png", ".gcode"));
+                assert(!IsValidDrawCapabilityUrl(std::string(base) + ".gcode", ".png"));
+                assert(!IsValidDrawCapabilityUrl("https://evil.example/files/draw_x.png", ".png"));
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_preview_url_contract_test")
+
+    def test_draw_tool_requires_preview_then_explicit_confirmation(self):
+        """hutuji.draw 只发布预览；用户确认必须走独立 hutuji.confirm。"""
+        board = (ROOT / "main/boards/lichuang-dev/lichuang_dev_board.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('Property("preview_url", kPropertyTypeString)', board)
+        self.assertIn('mcp_server.AddTool("hutuji.confirm"', board)
+        self.assertIn("RequestConfirm()", board)
+        self.assertIn("StartDraw(url, preview_url)", board)
+
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        start = job.index("std::string Job::StartDraw")
+        confirm = job.index("std::string Job::RequestConfirm", start)
+        start_body = job[start:confirm]
+        confirm_body = job[confirm : job.index("std::string Job::RequestAbort", confirm)]
+        self.assertIn('SetState("previewing")', start_body)
+        self.assertNotIn('xTaskCreate(TaskEntry, "hutuji_draw"', start_body)
+        self.assertIn('SetState("awaiting_confirmation")', job)
+        self.assertIn('xTaskCreate(TaskEntry, "hutuji_draw"', confirm_body)
+
+
+    def test_final_hil_emits_stable_ui_and_job_markers(self):
+        """一次最终验收必须能从串口区分 UI 动作、Job 状态与语音状态。"""
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        board = (
+            ROOT / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        app_state = (ROOT / "main/device_state_machine.cc").read_text(encoding="utf-8")
+
+        self.assertIn('"job state=%s"', job)
+        self.assertIn('"ui preview action=confirm"', job)
+        self.assertIn('"ui preview action=cancel"', job)
+        self.assertIn('"ui machine action=%s"', board)
+        for action in ("pause", "resume", "abort", "repeat", "pen_test"):
+            self.assertIn(f'ScheduleMachineControl("{action}"', board)
+        self.assertIn('"State: %s -> %s"', app_state)
+
+    def test_long_draw_task_cannot_preempt_audio_processing(self):
+        """长灌流必须让位给 AFE/编解码；abort 与 Telnet 泵仍保留快路径。"""
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        pipe = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(encoding="utf-8")
+        afe = (ROOT / "main/audio/engines/afe_audio_engine.cc").read_text(encoding="utf-8")
+        audio = (ROOT / "main/audio/audio_service.cc").read_text(encoding="utf-8")
+
+        draw_priorities = [
+            int(value)
+            for value in re.findall(
+                r'xTaskCreate\(TaskEntry,\s*"hutuji_draw",\s*8192,\s*this,\s*(\d+),',
+                job,
+            )
+        ]
+        self.assertEqual(len(draw_priorities), 2, "确认出图与重画必须共用调度约束")
+        afe_priority = int(re.search(r'"audio_afe",\s*4096,\s*this,\s*(\d+),', afe).group(1))
+        opus_priority = int(
+            re.search(r'"opus_codec",\s*2048\s*\*\s*12,\s*this,\s*(\d+),', audio).group(1)
+        )
+        abort_priority = int(
+            re.search(r'"hutuji_abort",\s*4096,\s*nullptr,\s*(\d+),', job).group(1)
+        )
+        pipe_priority = int(
+            re.search(r'"hutuji_tcp",\s*4096,\s*this,\s*(\d+),', pipe).group(1)
+        )
+
+        self.assertTrue(all(priority < afe_priority for priority in draw_priorities))
+        self.assertTrue(all(priority < opus_priority for priority in draw_priorities))
+        self.assertTrue(all(abort_priority > priority for priority in draw_priorities))
+        self.assertTrue(all(pipe_priority > priority for priority in draw_priorities))
 
     def test_response_queue_covers_maximum_window_line_count(self):
         """最短合法非空行也不得把应答队列灌穿并丢失 error。"""
@@ -610,6 +702,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         commands = re.findall(r'pipe\.SendLine\("([^"]+)"\)', body)
         self.assertEqual(commands, ["M30"])
+        for forbidden in ("ESP911", "ESP912", "ESP913", "M701", "M704", "M711",
+                          "M712", "M713", "M721"):
+            self.assertNotIn(forbidden, body)
+        self.assertIn("user_m30()/paper_auto_change()", body)
 
     def test_return_home_is_g1_and_only_on_normal_page_end(self):
         """页尾归位（2026-08-14 用户决策）必须是 G1 且只在正常页尾路径。
@@ -830,14 +926,100 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("constexpr int kFaceHeight = 300", lcd_cc)
         self.assertIn("void LcdDisplay::InitializeEmotionUi", lcd_cc)
         self.assertEqual(lcd_cc.count("InitializeEmotionUi(screen, lvgl_theme, large_icon_font)"), 2)
-    def test_waveshare_writer_keeps_power_on_after_idle(self):
-        """写字机需保持联网待命：可降亮度，但不得五分钟后由 AXP2101 断电。"""
+    def test_waveshare_writer_has_no_automatic_or_long_press_poweroff(self):
+        """固定供电写字机禁用 PWRON 关机，且不得误关 AXP2101 过温保护。"""
         board = (
             ROOT
             / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
         ).read_text(encoding="utf-8")
-        self.assertIn("PowerSaveTimer(-1, 60, -1)", board)
-        self.assertIn("pmic_->PowerOff()", board)
+        self.assertIn("PowerSaveTimer(-1, 180, -1)", board)
+        self.assertIn("SetBrightness(35)", board)
+        self.assertIn("common_config & ~0x04", board)
+        self.assertIn("(poweroff_enable | 0x04) & ~0x02", board)
+        self.assertNotIn("WriteReg(0x22, common_config & ~0x04)", board)
+        self.assertNotIn("WriteReg(0x22, 0b110)", board)
+        self.assertNotIn("WriteReg(0x27, 0x10)", board)
+        self.assertNotIn("OnShutdownRequest", board)
+        self.assertNotIn("pmic_->PowerOff()", board)
+    def test_waveshare_keeps_dcdc1_uvp_and_uses_force_pwm(self):
+        """固定供电写字机改善 DCDC1 负载阶跃，但保留欠压保护和 1.5A 输入限流。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        constructor = board[board.index("Pmic(i2c_master_bus_handle_t"):board.index("// Disable All DCs")]
+        self.assertIn("const uint8_t dc_force_pwm = ReadReg(0x81);", constructor)
+        self.assertIn("WriteReg(0x81, dc_force_pwm | 0x07);", constructor)
+        self.assertIn("pmic dcdc1 mode=%s reg81=0x%02x", constructor)
+        self.assertIn("(configured_dc_mode & 0x04) != 0", constructor)
+        self.assertNotIn("WriteReg(0x15", constructor)
+        self.assertNotIn("WriteReg(0x16", constructor)
+        self.assertNotIn("WriteReg(0x23", constructor)
+        self.assertNotIn("WriteReg(0x24", constructor)
+    def test_waveshare_logs_latched_pmic_poweroff_cause_before_reconfiguration(self):
+        """上电后必须先记录 AXP2101 锁存原因，再修改关机源；否则故障证据会被初始化覆盖。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        constructor = board[board.index("Pmic(i2c_master_bus_handle_t"):board.index("// Disable All DCs")]
+        self.assertIn("boot_poweroff_status_ = ReadReg(0x21);", constructor)
+        self.assertIn("boot_status1_ = ReadReg(0x00);", constructor)
+        self.assertIn("boot_status2_ = ReadReg(0x01);", constructor)
+        self.assertIn("boot_input_current_limit_ = ReadReg(0x16);", constructor)
+        self.assertIn("boot_irq_status1_ = ReadReg(0x48);", constructor)
+        self.assertIn("boot_irq_status2_ = ReadReg(0x49);", constructor)
+        self.assertIn("boot_irq_status3_ = ReadReg(0x4A);", constructor)
+        self.assertIn("LogBootStatus();", constructor)
+        self.assertIn("void LogBootStatus() const", board)
+        self.assertIn("pmic boot status", board)
+        self.assertLess(constructor.index("ReadReg(0x21)"), constructor.index("WriteReg(0x10"))
+        self.assertLess(constructor.index("ReadReg(0x21)"), constructor.index("WriteReg(0x22"))
+        replay = board[board.index("void ReplayPmicBootStatusAfterUsbReady()"):
+                       board.index("void InitializePowerSaveTimer()")]
+        self.assertIn("pdMS_TO_TICKS(15000)", replay)
+        self.assertIn("pmic->LogBootStatus();", replay)
+        self.assertIn("vTaskDelete(nullptr);", replay)
+        self.assertNotIn("ReadReg(", replay)
+        self.assertNotIn("WriteReg(", replay)
+        self.assertIn("ReplayPmicBootStatusAfterUsbReady();", board)
+    def test_waveshare_clamps_output_volume_for_unbuffered_vsys(self):
+        """无电池缓冲时功放是 VSYS 最大瞬态负载；启动时把音量钳到 50。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn("output_volume() > 50", board)
+        self.assertIn("SetOutputVolume(50)", board)
+    def test_waveshare_limits_wifi_tx_power_for_unbuffered_vsys(self):
+        """同室部署的写字机把 Wi-Fi 发射功率降到 10dBm，削减射频峰值电流。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn("void StartNetwork() override", board)
+        self.assertIn("WifiBoard::StartNetwork();", board)
+        self.assertIn("esp_wifi_set_max_tx_power(40)", board)
+    def test_hutuji_downloads_wait_for_audio_output_idle(self):
+        """播报+HTTPS 下载并发是 VSYS 最大组合负载；下载前必须等音频输出空闲。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        job_h = (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(encoding="utf-8")
+        self.assertIn("void WaitForAudioOutputIdle();", job_h)
+        wait_fn = job_cc[job_cc.index("void Job::WaitForAudioOutputIdle()"):
+                         job_cc.index("bool Job::DownloadToPsram")]
+        self.assertIn("output_enabled()", wait_fn)
+        self.assertIn("pdMS_TO_TICKS(100)", wait_fn)
+        self.assertIn("abort_requested_", wait_fn)
+        preview_fn = job_cc[job_cc.index("bool Job::DownloadAndShowPreview"):
+                            job_cc.index("void Job::Run(")]
+        self.assertIn("WaitForAudioOutputIdle();", preview_fn)
+        self.assertLess(preview_fn.index("WaitForAudioOutputIdle();"),
+                        preview_fn.index("CreateHttp"))
+        gcode_fn = job_cc[job_cc.index("bool Job::DownloadToPsram"):
+                          job_cc.index("bool Job::VerifyCrc")]
+        self.assertIn("WaitForAudioOutputIdle();", gcode_fn)
+        self.assertLess(gcode_fn.index("WaitForAudioOutputIdle();"),
+                        gcode_fn.index("CreateHttp"))
     def test_waveshare_boot_button_wakes_power_save(self):
         """省电后按 BOOT 必须先恢复背光和正常电源状态，再切换聊天。"""
         board = (
@@ -940,8 +1122,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertNotIn("lv_indev_get_point", body)
         self.assertNotIn("lv_event_get_indev", body)
 
-    def test_waveshare_touch_bounds_match_raw_axes_before_swap(self):
-        """FT6X36 原始轴为 320x480；镜像先于 swap，配置边界必须按原始轴。"""
+    def test_waveshare_touch_mapping_pairs_with_current_display_matrix(self):
+        """官方 demo 的 display(1,1,1) 配 touch(1,0,1)：swap 相同、触摸 X
+        与显示 X 反向、Y 同向。本仓 display 是 (1,0,0)，故 touch 必须是 (1,1,0)。"""
         board = (
             ROOT
             / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
@@ -952,6 +1135,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn(".x_max = DISPLAY_HEIGHT", body)
         self.assertIn(".y_max = DISPLAY_WIDTH", body)
         self.assertIn(".swap_xy = 1", body)
+        self.assertIn(".mirror_x = 1", body)
+        self.assertIn(".mirror_y = 0", body)
         self.assertNotIn("lv_indev_get_read_timer", body)
         self.assertNotIn("lv_timer_set_period", body)
 
@@ -1141,7 +1326,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
         ).read_text(encoding="utf-8")
         self.assertNotIn('JsonString("busy")', source)
-        self.assertEqual(source.count('JsonString("写字机正忙，请稍候再试")'), 3)
+        # 4 处：StartDraw / RequestRepeat / RequestPenTest / RequestManualControl。
+        self.assertEqual(source.count('JsonString("写字机正忙，请稍候再试")'), 4)
         self.assertIn('Notify("出图完成，可以说「再来一次」直接重画")', source)
         self.assertIn('Notify("开始重画")', source)
 
@@ -1300,25 +1486,35 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertNotIn("emote::EmoteDisplay", lcd_cc)
 
 
-    def test_grobot_full_face_suppresses_chat_overlay(self):
-        """全脸模式不显示聊天正文：字幕栏会覆盖嘴巴/下半脸，必须在统一入口
-        清空并保持隐藏；状态栏与 SetStatus 不受影响。"""
+    def test_grobot_full_face_shows_compact_response_subtitle(self):
+        """全脸必须用独立单行字幕层显示语音/工具反馈，不依赖某个消息样式
+        是否创建 bottom_bar_，也不恢复会覆盖嘴巴的大型聊天气泡。"""
+        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
         lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
-        bodies = []
-        cursor = 0
-        while True:
-            start = lcd_cc.find("void LcdDisplay::SetChatMessage", cursor)
-            if start < 0:
-                break
-            end = lcd_cc.find("void LcdDisplay::ClearChatMessages", start)
-            self.assertGreaterEqual(end, 0)
-            bodies.append(lcd_cc[start:end])
-            cursor = end
+        self.assertIn("grobot_subtitle_bar_", lcd_h)
+        self.assertIn("grobot_subtitle_label_", lcd_h)
+        self.assertIn("void SetGrobotSubtitle", lcd_h)
+
+        init_start = lcd_cc.index("void LcdDisplay::InitializeEmotionUi")
+        init_end = lcd_cc.index("void LcdDisplay::SetupUI", init_start)
+        init_body = lcd_cc[init_start:init_end]
+        self.assertIn("grobot_subtitle_bar_ = lv_obj_create(screen)", init_body)
+        self.assertIn("grobot_subtitle_label_ = lv_label_create(grobot_subtitle_bar_)", init_body)
+        self.assertIn("LV_LABEL_LONG_DOT", init_body)
+        self.assertIn("lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES, 40)", init_body)
+        self.assertIn("LV_OPA_80", init_body)
+
+        helper_start = lcd_cc.index("void LcdDisplay::SetGrobotSubtitle")
+        helper_end = lcd_cc.index("void LcdDisplay::SetChatMessage", helper_start)
+        helper = lcd_cc[helper_start:helper_end]
+        self.assertIn("lv_obj_remove_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN)", helper)
+        self.assertIn("lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN)", helper)
+
+        bodies = lcd_cc.split("void LcdDisplay::SetChatMessage")[1:]
         self.assertGreaterEqual(len(bodies), 2)
-        for body in bodies:
+        for body in bodies[:2]:
             self.assertIn("if (grobot_eyes_ != nullptr)", body)
-            self.assertIn("lv_label_set_text(chat_message_label_, \"\")", body)
-            self.assertIn("lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN)", body)
+            self.assertIn("SetGrobotSubtitle(content)", body)
             self.assertIn("return;", body)
     def test_grobot_face_background_keeps_features_clear(self):
         """全脸背景保留弱扫描线但不画穿脸中线；清空聊天时 Grobot 不复活 AI logo。"""
@@ -1532,6 +1728,280 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("static_assert(std::size(kFacialMoods) == std::size(kNames))", eyes_cc)
         self.assertIn("static_assert(std::size(kMoodColors) == std::size(kNames))", eyes_cc)
         self.assertIn("kMoodCount = std::size(kNames)", eyes_cc)
+
+    def test_production_board_registers_preview_confirm_tools(self):
+        """产品板是 Waveshare：预览/确认必须在这块板上注册，否则真机走不到确认门。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn('Property("preview_url", kPropertyTypeString)', board)
+        self.assertIn('mcp_server.AddTool("hutuji.confirm"', board)
+        self.assertIn("StartDraw(url, preview_url)", board)
+        self.assertIn("RequestConfirm()", board)
+        # 单参 StartDraw 会编译失败，但更要防「只注册 draw 不注册 confirm」：
+        # 那样预览停在 awaiting_confirmation，语音无法确认，只能点屏幕。
+        self.assertEqual(board.count('mcp_server.AddTool("hutuji.confirm"'), 1)
+
+    def test_draw_preview_overlay_has_touch_confirm_and_cancel_buttons(self):
+        """预览层必须自带「开始画」「取消」按钮：语音确认可能听不清，
+        触摸是唯一确定入口。按钮命中高度须有 56px 下限（儿童手指），
+        回调不得在 LVGL 事件里直接跑网络/Telnet 动作。"""
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        ui_start = lcd_cc.index("void LcdDisplay::EnsureDrawPreviewUi")
+        ui_end = lcd_cc.index("void LcdDisplay::ShowDrawPreview", ui_start)
+        ui_body = lcd_cc[ui_start:ui_end]
+        self.assertIn("lv_button_create(button_row)", ui_body)
+        self.assertNotIn("LV_EVENT_CLICKED", ui_body)
+        self.assertGreaterEqual(ui_body.count("LV_EVENT_PRESSED"), 2)
+        self.assertIn("draw_preview_confirm_btn_ = make_button", ui_body)
+        self.assertIn("draw_preview_cancel_btn_ = make_button", ui_body)
+        self.assertIn("Lang::Strings::DRAW_PREVIEW_CONFIRM", ui_body)
+        self.assertIn("Lang::Strings::DRAW_PREVIEW_CANCEL", ui_body)
+        # 命中高度下限 56px：3.5" 320x480 上更小的按钮儿童点不准。
+        self.assertIn("< 56 ? 56 :", ui_body)
+        self.assertIn("lv_obj_set_size(btn, width, button_height)", ui_body)
+        # 「开始画」是唯一主动作：确认键必须比取消键宽（2/3 vs 1/3）。
+        self.assertIn("confirm_width = (row_width - theme->spacing(4)) * 2 / 3", ui_body)
+        self.assertIn("lv_color_hex(0x2E9E4F), confirm_width)", ui_body)
+        self.assertIn("lv_color_hex(0x6B6B6B), cancel_width)", ui_body)
+        # 提示语置顶单行截断，再长也不挤压图片与按钮。
+        self.assertIn("LV_LABEL_LONG_DOT", ui_body)
+        # 主题字体会被 SetTextFont 替换释放：预览层不得持有主题字体裸指针。
+        self.assertNotIn("lv_obj_set_style_text_font", ui_body)
+        # 预览层建好即隐藏，不得一创建就盖住脸/聊天。
+        self.assertIn("lv_obj_add_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN)", ui_body)
+
+        hide_start = lcd_cc.index("void LcdDisplay::HideDrawPreview")
+        hide_body = lcd_cc[hide_start : lcd_cc.index("LcdDisplay::~LcdDisplay", hide_start)]
+        # 撤图必须同时清空回调：否则迟到点击会打到已失效的 Job 状态。
+        self.assertIn("draw_preview_on_confirm_ = nullptr", hide_body)
+        self.assertIn("draw_preview_on_cancel_ = nullptr", hide_body)
+
+        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
+        self.assertIn("std::function<void()> draw_preview_on_confirm_", lcd_h)
+
+        self.assertIn("std::function<void()> draw_preview_on_cancel_", lcd_h)
+
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        preview_start = job.index("bool Job::DownloadAndShowPreview")
+        preview_end = job.index("bool Job::VerifyCrc", preview_start)
+        preview_body = job[preview_start:preview_end]
+        self.assertIn("ShowDrawPreview", preview_body)
+        # 按钮回调只能 Schedule 到主循环，不得在 LVGL 事件里直接发 Telnet。
+        self.assertIn("Application::GetInstance().Schedule", preview_body)
+        self.assertIn("RequestConfirm()", preview_body)
+        self.assertIn("RequestAbort()", preview_body)
+
+    def test_draw_preview_strings_exist_in_both_locales(self):
+        """预览提示与按钮文案走 locale：硬编码中文会让 en-US 镜像编译不出。"""
+        for locale in ("zh-CN", "en-US"):
+            data = json.loads(
+                (ROOT / f"main/assets/locales/{locale}/language.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            strings = data["strings"]
+            for key in ("DRAW_PREVIEW_HINT", "DRAW_PREVIEW_CONFIRM", "DRAW_PREVIEW_CANCEL"):
+                self.assertIn(key, strings, f"{locale} missing {key}")
+                self.assertTrue(strings[key].strip(), f"{locale} {key} empty")
+
+    def test_waveshare_machine_control_drawer_is_safe_and_touchable(self):
+        """屏幕控制复用 Job API；禁危险归位/点动，LVGL 回调只调度主循环。"""
+        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        board = (
+            ROOT / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+
+        self.assertIn("ConfigureMachineControls", lcd_h)
+        self.assertIn("UpdateMachineControlState", lcd_h)
+        self.assertIn("EnsureMachineControlUi", lcd_h)
+        ui_start = lcd_cc.index("void LcdDisplay::EnsureMachineControlUi")
+        ui_end = lcd_cc.index("void LcdDisplay::ConfigureMachineControls", ui_start)
+        ui_body = lcd_cc[ui_start:ui_end]
+        for member in (
+            "machine_pause_btn_",
+            "machine_resume_btn_",
+            "machine_abort_btn_",
+            "machine_repeat_btn_",
+            "machine_pen_test_btn_",
+        ):
+            self.assertIn(member, ui_body)
+        self.assertIn("button_height < 56 ? 56 : button_height", ui_body)
+        # 控制入口挂在右边缘垂直居中：不挡顶部状态图标、居中表情与底部字幕。
+        self.assertIn("LV_ALIGN_RIGHT_MID", ui_body)
+        # 抽屉必须有标题与当前状态，且状态由 ApplyMachineControlState 驱动。
+        self.assertIn("Lang::Strings::MACHINE_DRAWER_TITLE", ui_body)
+        self.assertIn("machine_state_label_", ui_body)
+        self.assertIn("machine_state_label_", lcd_h)
+        # disabled 用填充色差异（灰底）表达，不靠低对比文字。
+        self.assertIn("LV_STATE_DISABLED", ui_body)
+        self.assertIn("machine controls opened", ui_body)
+        self.assertNotIn("LV_EVENT_CLICKED", ui_body)
+        self.assertGreaterEqual(ui_body.count("LV_EVENT_PRESSED"), 8)
+        self.assertIn("LV_OBJ_FLAG_HIDDEN", ui_body)
+        self.assertIn("lv_screen_active()", ui_body)
+        self.assertGreaterEqual(lcd_cc.count("lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN)"), 2)
+
+        self.assertIn("display_->ConfigureMachineControls", board)
+        for request in (
+            "RequestPause()",
+            "RequestResume()",
+            "RequestAbort()",
+            "RequestRepeat()",
+            "RequestPenTest()",
+        ):
+            self.assertIn(request, board)
+        self.assertIn("void ScheduleMachineControl", board)
+        self.assertIn("Application::GetInstance().Schedule", board)
+        self.assertGreaterEqual(board.count('ScheduleMachineControl("'), 5)
+        self.assertIn("UpdateMachineControlState", job)
+        self.assertNotIn("lv_obj_set_style_text_font", ui_body)
+        self.assertNotIn('SendLine("$H")', board)
+        self.assertNotIn('SendLine("G90G0 X0Y0")', board)
+        self.assertIn("Lang::Strings::MACHINE_ACTION_FAILED", board)
+        self.assertIn("Lang::Strings::MACHINE_ACTION_SENT", board)
+        self.assertIn("Lang::Strings::MACHINE_ACTION_STARTED", board)
+
+    def test_machine_control_strings_exist_in_both_locales(self):
+        keys = (
+            "MACHINE_CONTROL",
+            "MACHINE_PAUSE",
+            "MACHINE_RESUME",
+            "MACHINE_STOP",
+            "MACHINE_REPEAT",
+            "MACHINE_PEN_TEST",
+            "MACHINE_CLOSE",
+            "MACHINE_DRAWER_TITLE",
+            "MACHINE_STATE_IDLE",
+            "MACHINE_STATE_BUSY",
+            "MACHINE_STATE_STREAMING",
+            "MACHINE_STATE_PAUSED",
+            "MACHINE_STATE_DONE",
+            "MACHINE_STATE_ERROR",
+            "MACHINE_STATE_ABORTED",
+            "MACHINE_ACTION_FAILED",
+            "MACHINE_ACTION_SENT",
+            "MACHINE_ACTION_STARTED",
+            "MACHINE_MANUAL_SECTION",
+            "MACHINE_PEN_UP",
+            "MACHINE_PEN_DOWN",
+            "MACHINE_JOG_XP",
+            "MACHINE_JOG_XM",
+            "MACHINE_JOG_YP",
+            "MACHINE_JOG_YM",
+            "MACHINE_HOME",
+            "MACHINE_SET_ORIGIN",
+            "MACHINE_UNLOCK",
+            "MACHINE_MOTOR_OFF",
+            "MACHINE_RESET",
+            "MACHINE_STATE_MANUAL",
+        )
+        for locale in ("zh-CN", "en-US"):
+            strings = json.loads(
+                (ROOT / f"main/assets/locales/{locale}/language.json").read_text(
+                    encoding="utf-8"
+                )
+            )["strings"]
+            for key in keys:
+                self.assertIn(key, strings, f"{locale} missing {key}")
+                self.assertTrue(strings[key].strip(), f"{locale} {key} empty")
+
+    def test_manual_control_entry_is_gated_and_kx_aligned(self):
+        """手动调试动作经 Job 统一入口：settled 态门控、独立任务执行、
+        命令字面量逐字对齐奎享实测序列（2026-08-18 用户串口取证）。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        job_h = (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(encoding="utf-8")
+        self.assertIn("std::string RequestManualControl(const std::string& action);", job_h)
+        self.assertIn("static void ManualTaskEntry(void* arg);", job_h)
+        self.assertIn("void ManualTask();", job_h)
+
+        entry = job_cc[job_cc.index("std::string Job::RequestManualControl"):
+                       job_cc.index("void Job::ManualTaskEntry")]
+        # 白名单：11 个动作，未知 action 直接拒绝。
+        for action in ("pen_up", "pen_down", "jog_x+", "jog_x-", "jog_y+", "jog_y-",
+                       "home", "set_origin", "unlock", "motor_off", "reset"):
+            self.assertIn(f'"{action}"', entry)
+        # 门控：仅 settled 态可用；busy 抢占失败即拒。
+        self.assertIn('"idle"', entry)
+        self.assertIn('"done"', entry)
+        self.assertIn('"error"', entry)
+        self.assertIn('"aborted"', entry)
+        self.assertIn("busy_.exchange(true)", entry)
+        self.assertIn("xTaskCreate(ManualTaskEntry", entry)
+
+        task = job_cc[job_cc.index("void Job::ManualTask()"):job_cc.index("std::string Job::StatusJson")]
+        # 落笔对齐奎享：先 G92 Z0 声明，再 Z5 落笔；抬笔 Z0。
+        self.assertLess(task.index('"G92 Z0"'), task.index('"G1G90 Z5.0F10000"'))
+        self.assertIn('"G1G90 Z0.0F10000"', task)
+        # 点动逐字对齐奎享 `$J=G21G91X1.0Y0.0Z0.0F8000.0` 格式，四方向参数化。
+        self.assertIn('"$J=G21G91X', task)
+        self.assertIn("GetMachinePos", task)
+        self.assertIn("190", task)
+        self.assertIn("277", task)
+        # 回原点和设原点：G1 归位（不触发换纸），G92 三轴声明对齐奎享。
+        self.assertIn('"G1G90 X0Y0F8000"', task)
+        self.assertIn('"G92 X0.0 Y0.0 Z0"', task)
+        self.assertNotIn('"$H"', task)
+        self.assertNotIn('SendLine("G90G0 X0Y0")', task)
+        self.assertIn('"$X"', task)
+        self.assertIn('"$SLP"', task)
+        self.assertIn("SendRealtime(0x18)", task)
+        self.assertIn("GetResetBannerSequence()", task)
+        # 收尾：释放 busy 并回 idle，结果走通知。
+        self.assertIn('SetState("idle")', task)
+        self.assertIn("busy_.store(false)", task)
+        # 手动控制全程禁止触碰纸路机械命令（换纸职责边界不变）。
+        for forbidden in ("M30", "ESP911", "ESP912", "ESP913", "M701", "M711"):
+            self.assertNotIn(forbidden, task)
+
+    def test_manual_control_wired_through_board_and_ui(self):
+        """board 统一转发 action 字符串；UI 抽屉手动区按钮仅 settled 态可用。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        # Pipe::Start 缺失会让一切机器控制静默失效（2026-08-18 实测回归：编辑误吞）。
+        self.assertIn("hutuji::Pipe::GetInstance().Start();", board)
+        self.assertIn("RequestManualControl", board)
+        self.assertIn("ScheduleManualControl", board)
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
+        self.assertIn("std::function<void(const char* action)> on_manual", lcd_h)
+        self.assertIn("machine_manual_", lcd_h)
+        ui_body = lcd_cc[lcd_cc.index("void LcdDisplay::EnsureMachineControlUi()"):
+                         lcd_cc.index("void LcdDisplay::ApplyMachineControlState()")]
+        for label in ("MACHINE_PEN_UP", "MACHINE_PEN_DOWN", "MACHINE_HOME",
+                      "MACHINE_SET_ORIGIN", "MACHINE_UNLOCK", "MACHINE_MOTOR_OFF",
+                      "MACHINE_RESET", "MACHINE_MANUAL_SECTION"):
+            self.assertIn(label, ui_body)
+        self.assertIn("MACHINE_JOG", ui_body)
+        state_body = lcd_cc[lcd_cc.index("void LcdDisplay::ApplyMachineControlState()"):
+                            lcd_cc.index("void LcdDisplay::ConfigureMachineControls")]
+        self.assertIn("machine_manual_buttons_", state_body)
+        self.assertIn("settled", state_body)
+
+
+    def test_visible_assistant_name_is_xiaopai_without_faking_wake_model(self):
+        """用户面统一小派；声学模型未替换前，待机文案不得伪称“你好小派”。"""
+        zh = json.loads(
+            (ROOT / "main/assets/locales/zh-CN/language.json").read_text(encoding="utf-8")
+        )["strings"]
+        standby = zh["STANDBY"]
+        self.assertNotIn("小智", standby)
+        self.assertNotIn("你好小派", standby)
+
+        sdkconfig = (ROOT / "sdkconfig").read_text(encoding="utf-8")
+        self.assertIn("CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y", sdkconfig)
+        self.assertIn("# CONFIG_USE_CUSTOM_WAKE_WORD is not set", sdkconfig)
+
+        matrix = (
+            ROOT / "main/boards/waveshare/esp32-s3-rgb-matrix/rgb_matrix_display.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn('lv_label_set_text(message_label_, "hi 小派")', matrix)
+        self.assertNotIn('lv_label_set_text(message_label_, "hi 小智")', matrix)
 
 if __name__ == "__main__":
     unittest.main()

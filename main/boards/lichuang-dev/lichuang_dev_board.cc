@@ -15,10 +15,16 @@
 // 调试用：需要本地工程回归时，在编译参数里同时定义：
 //   HUTUJI_AUTO_TEST_DRAW
 //   HUTUJI_AUTO_TEST_DRAW_URL="http://<host>/files/<token>.gcode"
+//   HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL="http://<host>/files/<token>.png"
+// 两个 URL 都取自同一次云端 hutuji_draw 返回，脚手架走的是与产品一致的
+// 预览→确认两段路径（不绕过确认门），否则 §8.5 取证不能代表产品行为。
 // 默认关闭；禁止把一次性 URL 或真实凭据写进源码。
 // #define HUTUJI_AUTO_TEST_DRAW
 #ifndef HUTUJI_AUTO_TEST_DRAW_URL
 #define HUTUJI_AUTO_TEST_DRAW_URL ""
+#endif
+#ifndef HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL
+#define HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL ""
 #endif
 
 // bringup §8.5（换纸中调 abort）取证镜像专用：
@@ -305,27 +311,42 @@ private:
             "查询本机与写字机的 Telnet 管道：是否已连接、Grbl "
             "是否就绪、是否授权、任务状态、最近应答行。"
             "用户问「写字机连上了吗/能不能动」时用；云端生成服务请用 hutuji_status。"
-            "state 字段含义：idle 空闲、downloading 下载中、verifying 校验中、streaming 绘图中、"
+            "state 字段含义：idle 空闲、previewing 预览加载中、awaiting_confirmation 等用户确认、"
+            "downloading 下载中、verifying 校验中、streaming 绘图中、"
             "paused 已暂停、paper_change 换纸中、reconnecting 断线恢复中、done 完成、"
             "error 出错、aborted 已取消。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().StatusJson();
             });
 
-        mcp_server.AddTool("hutuji.draw",
-                           "执行出纸：参数 url 必须是云端 hutuji_draw 返回的 G-code 下载地址。"
-                           "设备全量下载、CRC 校验、授权门通过后逐行经 Telnet "
-                           "转发。进行中再调会返回「写字机正忙」提示。"
-                           "用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
-                           PropertyList({Property("url", kPropertyTypeString)}),
-                           [](const PropertyList& properties) -> ReturnValue {
-                               const std::string& url = properties["url"].value<std::string>();
-                               return hutuji::Job::GetInstance().StartDraw(url);
+        mcp_server.AddTool(
+            "hutuji.draw",
+            "先出预览：参数 url 是云端 hutuji_draw 返回的 G-code 地址，preview_url 是同一次返回的 "
+            "PNG 预览地址。本工具只把预览显示到设备屏幕上，不会启动任何机械动作。"
+            "屏幕会出现「开始画」「取消」两个按钮，用户也可以直接说开始画或取消；"
+            "用户确认后才调 hutuji.confirm 真正出图。"
+            "用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
+            PropertyList({Property("url", kPropertyTypeString),
+                          Property("preview_url", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string& url = properties["url"].value<std::string>();
+                const std::string& preview_url = properties["preview_url"].value<std::string>();
+                return hutuji::Job::GetInstance().StartDraw(url, preview_url);
+            });
+
+        mcp_server.AddTool("hutuji.confirm",
+                           "用户看过屏幕预览后确认出图：说「开始画/可以/就这个/好看」时用。"
+                           "只在 hutuji.status 的 state 为 awaiting_confirmation 时有效；"
+                           "没有待确认预览时会返回错误，不要凭空调用。"
+                           "用户点屏幕上的「开始画」按钮与本工具等效。",
+                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                               return hutuji::Job::GetInstance().RequestConfirm();
                            });
 
         mcp_server.AddTool("hutuji.abort",
-                           "中止当前绘图转发。用户说停下/取消时用。"
-                           "若正在换纸，可能无法立刻停，完成后才会停——须如实告诉用户。",
+                           "中止当前绘图转发，或取消尚未确认的预览。用户说停下/取消/不要这个时用。"
+                           "取消预览不会碰写字机；已在绘图时若正在换纸，可能无法立刻停，"
+                           "完成后才会停——须如实告诉用户。",
                            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
                                return hutuji::Job::GetInstance().RequestAbort();
                            });
@@ -374,16 +395,36 @@ private:
                 vTaskDelay(pdMS_TO_TICKS(3000));
                 if (pipe.IsConnected() && pipe.IsReady()) {
                     const char* url = HUTUJI_AUTO_TEST_DRAW_URL;
-                    if (url[0] == '\0') {
-                        ESP_LOGE(
-                            "AutoTest",
-                            "已启用 HUTUJI_AUTO_TEST_DRAW，但未定义 HUTUJI_AUTO_TEST_DRAW_URL");
+                    const char* preview_url = HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL;
+                    if (url[0] == '\0' || preview_url[0] == '\0') {
+                        ESP_LOGE("AutoTest",
+                                 "已启用 HUTUJI_AUTO_TEST_DRAW，但未同时定义 "
+                                 "HUTUJI_AUTO_TEST_DRAW_URL 与 HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL");
                         vTaskDelete(nullptr);
                         return;
                     }
-                    ESP_LOGW("AutoTest", "触发自动测试绘图");
-                    auto result = hutuji::Job::GetInstance().StartDraw(url);
+                    auto& job = hutuji::Job::GetInstance();
+                    ESP_LOGW("AutoTest", "触发自动测试绘图（预览段）");
+                    auto result = job.StartDraw(url, preview_url);
                     ESP_LOGW("AutoTest", "StartDraw 返回: %s", result.c_str());
+                    // 脚手架不绕过确认门：等预览下载到 awaiting_confirmation 后再自动确认，
+                    // 与用户点屏幕「开始画」走同一入口。预览失败则 state 不会是待确认，
+                    // 此处超时退出，不强行开跑。
+                    bool confirmed = false;
+                    for (int i = 0; i < 120; ++i) {
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        if (job.StatusJson().find("\"awaiting_confirmation\"") == std::string::npos) {
+                            continue;
+                        }
+                        auto confirm_result = job.RequestConfirm();
+                        ESP_LOGW("AutoTest", "RequestConfirm 返回: %s", confirm_result.c_str());
+                        confirmed = true;
+                        break;
+                    }
+                    if (!confirmed) {
+                        ESP_LOGE("AutoTest", "预览未进入 awaiting_confirmation，放弃自动确认；status: %s",
+                                 job.StatusJson().c_str());
+                    }
                 }
                 vTaskDelete(nullptr);
             },
