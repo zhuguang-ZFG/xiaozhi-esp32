@@ -321,6 +321,18 @@ class HutujiBleDiagCoreTest(unittest.TestCase):
         self.assertIn("snapshot timer arm failed", adapter)
         self.assertIn("rotation timer arm failed", adapter)
 
+    def test_advertising_interval_is_shorter_than_snapshot_refresh(self):
+        adapter = (
+            ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"
+        ).read_text(encoding="utf-8")
+
+        def constant(name):
+            prefix = f"constexpr uint32_t {name} = "
+            line = next(line for line in adapter.splitlines() if line.startswith(prefix))
+            return int(line.removeprefix(prefix).removesuffix(";"))
+
+        self.assertLess(constant("kAdvIntervalMs"), constant("kSnapshotIntervalMs"))
+
     def test_snapshot_refresh_restarts_legacy_advertising(self):
         adapter = (
             ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"

@@ -37,8 +37,9 @@ constexpr const char* kNvsKeyEnabled = "enabled";
 constexpr uint32_t kSnapshotIntervalMs = 1000;
 // NRPA 轮换周期。不广播稳定身份，未绑定客户端不得跨轮换关联同一设备（§1.4.7）。
 constexpr uint32_t kAddressRotationMs = 15 * 60 * 1000;
-// 只读诊断面无需快速发现；1285ms 兼顾可见性与功耗/共存（§1.4.6 门槛）。
-constexpr uint32_t kAdvIntervalMs = 1285;
+// 需短于 1s 快照刷新周期，否则停播更新可能发生在首个广告事件之前，导致空中不可见。
+// 500ms 让每个快照窗口至少容纳一次发送；真实功耗/共存仍以 §1.4.6 HIL 为准。
+constexpr uint32_t kAdvIntervalMs = 500;
 
 struct State {
     ble_npl_callout snapshot_timer;
