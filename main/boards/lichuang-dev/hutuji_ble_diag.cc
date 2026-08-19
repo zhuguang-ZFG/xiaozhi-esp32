@@ -19,9 +19,9 @@
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
 
+#include <wifi_manager.h>
 #include "hutuji_ble_diag_core.h"
 #include "hutuji_pipe.h"
-#include <wifi_manager.h>
 
 #define TAG "hutuji_ble_diag"
 
@@ -41,9 +41,18 @@ constexpr uint32_t kAddressRotationMs = 15 * 60 * 1000;
 // 500ms 让每个快照窗口至少容纳一次发送；真实功耗/共存仍以 §1.4.6 HIL 为准。
 constexpr uint32_t kAdvIntervalMs = 500;
 
+enum class RestartKind : uint8_t {
+    kNone,
+    kSnapshot,
+    kAddressRotation,
+};
+
 struct State {
     ble_npl_callout snapshot_timer;
     ble_npl_callout rotation_timer;
+    ble_npl_event advertising_restart_event;
+    ble_npl_eventq* eventq = nullptr;
+    RestartKind restart_kind = RestartKind::kNone;
     uint16_t snapshot_seq = 0;
     // 上次实际采样 WiFi/Telnet 的单调时刻；publish 时据此算 age 并判 stale，
     // 不能假设定时器一定按时触发（被饿死时必须诚实报 stale）。
@@ -51,6 +60,7 @@ struct State {
     bool sampled = false;
     bool advertising = false;
     bool timers_ready = false;
+    bool restart_event_ready = false;
     bool disabled = false;
 };
 
@@ -86,8 +96,8 @@ PhaseAPayload BuildPayload() {
         age_ms = static_cast<uint32_t>((now_us - g_state.sampled_at_us) / 1000);
     }
     // 首次发布没有前序采样可比，只以时钟有效性判断。
-    const bool stale = g_state.sampled ? IsSnapshotStale(clock_valid, age_ms)
-                                       : IsSnapshotStale(clock_valid, 0);
+    const bool stale =
+        g_state.sampled ? IsSnapshotStale(clock_valid, age_ms) : IsSnapshotStale(clock_valid, 0);
 
     g_state.sampled = true;
     g_state.sampled_at_us = now_us;
@@ -103,8 +113,8 @@ PhaseAPayload BuildPayload() {
 void Shutdown(const char* reason);
 
 bool ArmSnapshotTimer() {
-    const int rc = ble_npl_callout_reset(
-        &g_state.snapshot_timer, ble_npl_time_ms_to_ticks32(kSnapshotIntervalMs));
+    const int rc = ble_npl_callout_reset(&g_state.snapshot_timer,
+                                         ble_npl_time_ms_to_ticks32(kSnapshotIntervalMs));
     if (rc != 0) {
         ESP_LOGE(TAG, "snapshot timer arm failed rc=%d", rc);
         Shutdown("snapshot_timer_arm_failed");
@@ -114,8 +124,8 @@ bool ArmSnapshotTimer() {
 }
 
 bool ArmRotationTimer() {
-    const int rc = ble_npl_callout_reset(
-        &g_state.rotation_timer, ble_npl_time_ms_to_ticks32(kAddressRotationMs));
+    const int rc = ble_npl_callout_reset(&g_state.rotation_timer,
+                                         ble_npl_time_ms_to_ticks32(kAddressRotationMs));
     if (rc != 0) {
         ESP_LOGE(TAG, "rotation timer arm failed rc=%d", rc);
         Shutdown("rotation_timer_arm_failed");
@@ -156,72 +166,99 @@ int StartAdvertising() {
                              nullptr);
 }
 
-int RefreshAdvertising() {
-    // Legacy LE Set Advertising Data 在广播运行时会被 controller 以
-    // Command Disallowed 拒绝；必须先停播，写完整新快照，再按原参数重启。
+void OnAdvertisingRestart(ble_npl_event* event);
+
+int QueueAdvertisingRestart(RestartKind kind) {
+    // 定时器事件可能同时到达；同一 event 只允许排队一次，地址轮换优先于普通刷新。
+    if (g_state.eventq != nullptr && g_state.restart_event_ready &&
+        ble_npl_event_is_queued(&g_state.advertising_restart_event)) {
+        if (kind == RestartKind::kAddressRotation) {
+            g_state.restart_kind = kind;
+        }
+        return 0;
+    }
     int rc = ble_gap_adv_stop();
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         return rc;
     }
     g_state.advertising = false;
-    rc = PublishSnapshot();
+    g_state.restart_kind = kind;
+    if (g_state.eventq == nullptr || !g_state.restart_event_ready) {
+        return BLE_HS_EUNKNOWN;
+    }
+    ble_npl_eventq_put(g_state.eventq, &g_state.advertising_restart_event);
+    return 0;
+}
+
+void OnAdvertisingRestart(ble_npl_event* /*event*/) {
+    if (g_state.disabled) {
+        return;
+    }
+    const RestartKind kind = g_state.restart_kind;
+    g_state.restart_kind = RestartKind::kNone;
+    if (kind == RestartKind::kNone) {
+        return;
+    }
+    if (kind == RestartKind::kAddressRotation) {
+        const int rc = ApplyFreshNrpa();
+        if (rc != 0) {
+            ESP_LOGE(TAG, "nrpa rotation failed rc=%d", rc);
+            Shutdown("address_rotation_failed");
+            return;
+        }
+    }
+    int rc = PublishSnapshot();
     if (rc != 0) {
-        return rc;
+        ESP_LOGE(TAG, "adv data after stop failed rc=%d", rc);
+        Shutdown("advertising_data_refresh_failed");
+        return;
     }
     rc = StartAdvertising();
-    if (rc == 0) {
-        g_state.advertising = true;
+    if (rc != 0) {
+        ESP_LOGE(TAG, "adv restart failed rc=%d", rc);
+        Shutdown("advertising_restart_failed");
+        return;
     }
-    return rc;
+    g_state.advertising = true;
+    if (!ArmSnapshotTimer()) {
+        return;
+    }
+    if (kind == RestartKind::kAddressRotation) {
+        ESP_LOGI(TAG, "ble_surface=advertising_only address rotated");
+        if (!ArmRotationTimer()) {
+            return;
+        }
+    }
+}
+
+int RefreshAdvertising() {
+    // NimBLE 明确要求：在 host task 内 stop 后，后续广播操作必须排到独立 event。
+    // set_data 也放到该边界之后，避免 controller 仍处理 stop 时收到下一条 HCI 命令。
+    return QueueAdvertisingRestart(RestartKind::kSnapshot);
 }
 
 void OnSnapshotTimer(ble_npl_event* /*event*/) {
-    if (!g_state.advertising) {
+    if (!g_state.advertising || g_state.disabled) {
         return;
     }
     const int rc = RefreshAdvertising();
     if (rc != 0) {
         ESP_LOGE(TAG, "adv data refresh failed rc=%d", rc);
         Shutdown("snapshot_publish_failed");
-        return;
     }
-    ArmSnapshotTimer();
 }
 
 void OnRotationTimer(ble_npl_event* /*event*/) {
-    if (!g_state.advertising) {
+    if (g_state.disabled) {
         return;
     }
-    // 轮换必须先停广播：地址只能在广播未激活时更换。
-    int rc = ble_gap_adv_stop();
-    if (rc != 0 && rc != BLE_HS_EALREADY) {
+    // 若快照刷新已停播并排队，本次请求会把同一 pending event 升级为地址轮换；
+    // 不能重排 15 分钟后再做，否则恰逢刷新时会漏掉整次隐私轮换。
+    const int rc = QueueAdvertisingRestart(RestartKind::kAddressRotation);
+    if (rc != 0) {
         ESP_LOGE(TAG, "adv stop for rotation failed rc=%d", rc);
         Shutdown("address_rotation_stop_failed");
-        return;
     }
-    g_state.advertising = false;
-
-    rc = ApplyFreshNrpa();
-    if (rc != 0) {
-        ESP_LOGE(TAG, "nrpa rotation failed rc=%d", rc);
-        Shutdown("address_rotation_failed");
-        return;
-    }
-    rc = PublishSnapshot();
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv data after rotation failed rc=%d", rc);
-        Shutdown("address_rotation_publish_failed");
-        return;
-    }
-    rc = StartAdvertising();
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv restart after rotation failed rc=%d", rc);
-        Shutdown("address_rotation_restart_failed");
-        return;
-    }
-    g_state.advertising = true;
-    ESP_LOGI(TAG, "ble_surface=advertising_only address rotated");
-    ArmRotationTimer();
 }
 
 /**
@@ -232,13 +269,24 @@ void OnRotationTimer(ble_npl_event* /*event*/) {
  * 必须在主机任务之外执行，否则自锁）。
  */
 void Shutdown(const char* reason) {
+    if (g_state.disabled) {
+        return;
+    }
     g_state.disabled = true;
     if (g_state.timers_ready) {
         ble_npl_callout_stop(&g_state.snapshot_timer);
         ble_npl_callout_stop(&g_state.rotation_timer);
     }
+    if (g_state.restart_event_ready && g_state.eventq != nullptr &&
+        ble_npl_event_is_queued(&g_state.advertising_restart_event)) {
+        ble_npl_eventq_remove(g_state.eventq, &g_state.advertising_restart_event);
+    }
+    g_state.restart_kind = RestartKind::kNone;
     if (g_state.advertising) {
-        ble_gap_adv_stop();
+        const int rc = ble_gap_adv_stop();
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGE(TAG, "adv stop during shutdown failed rc=%d", rc);
+        }
         g_state.advertising = false;
     }
     ESP_LOGE(TAG, "ble diagnostics disabled reason=%s", reason);
@@ -263,14 +311,21 @@ void OnHostSync() {
         return;
     }
 
-    ble_npl_eventq* eventq = nimble_port_get_dflt_eventq();
-    rc = ble_npl_callout_init(&g_state.snapshot_timer, eventq, OnSnapshotTimer, nullptr);
+    g_state.eventq = nimble_port_get_dflt_eventq();
+    if (g_state.eventq == nullptr) {
+        ESP_LOGE(TAG, "nimble event queue unavailable");
+        Shutdown("event_queue_unavailable");
+        return;
+    }
+    ble_npl_event_init(&g_state.advertising_restart_event, OnAdvertisingRestart, nullptr);
+    g_state.restart_event_ready = true;
+    rc = ble_npl_callout_init(&g_state.snapshot_timer, g_state.eventq, OnSnapshotTimer, nullptr);
     if (rc != 0) {
         ESP_LOGE(TAG, "snapshot callout init failed rc=%d", rc);
         Shutdown("snapshot_callout_init_failed");
         return;
     }
-    rc = ble_npl_callout_init(&g_state.rotation_timer, eventq, OnRotationTimer, nullptr);
+    rc = ble_npl_callout_init(&g_state.rotation_timer, g_state.eventq, OnRotationTimer, nullptr);
     if (rc != 0) {
         ESP_LOGE(TAG, "rotation callout init failed rc=%d", rc);
         ble_npl_callout_deinit(&g_state.snapshot_timer);

@@ -320,6 +320,12 @@ class HutujiBleDiagCoreTest(unittest.TestCase):
         self.assertIn("rotation callout init failed", adapter)
         self.assertIn("snapshot timer arm failed", adapter)
         self.assertIn("rotation timer arm failed", adapter)
+        shutdown = adapter.split("void Shutdown(const char* reason) {", 1)[1].split(
+            "void OnHostReset", 1
+        )[0]
+        self.assertLess(shutdown.index("if (g_state.disabled)"), shutdown.index("g_state.disabled = true;"))
+        self.assertIn("ble_npl_eventq_remove", shutdown)
+
 
     def test_advertising_interval_is_shorter_than_snapshot_refresh(self):
         adapter = (
@@ -333,19 +339,91 @@ class HutujiBleDiagCoreTest(unittest.TestCase):
 
         self.assertLess(constant("kAdvIntervalMs"), constant("kSnapshotIntervalMs"))
 
-    def test_snapshot_refresh_restarts_legacy_advertising(self):
+    def test_snapshot_refresh_restarts_legacy_advertising_asynchronously(self):
         adapter = (
             ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"
         ).read_text(encoding="utf-8")
+        queue_restart = adapter.split("int QueueAdvertisingRestart", 1)[1].split(
+            "void OnAdvertisingRestart(ble_npl_event* /*event*/) {", 1
+        )[0]
         refresh = adapter.split("int RefreshAdvertising()", 1)[1].split(
             "void OnSnapshotTimer", 1
         )[0]
-        stop = refresh.index("ble_gap_adv_stop()")
-        publish = refresh.index("PublishSnapshot()")
-        start = refresh.index("StartAdvertising()")
-        self.assertLess(stop, publish)
-        self.assertLess(publish, start)
+        restart = adapter.split(
+            "void OnAdvertisingRestart(ble_npl_event* /*event*/) {", 1
+        )[1].split("int RefreshAdvertising()", 1)[0]
+        self.assertLess(queue_restart.index("ble_gap_adv_stop()"), queue_restart.index("ble_npl_eventq_put"))
+        self.assertIn("QueueAdvertisingRestart(RestartKind::kSnapshot)", refresh)
+        self.assertNotIn("PublishSnapshot()", queue_restart)
+        self.assertNotIn("StartAdvertising()", queue_restart)
+        self.assertLess(restart.index("PublishSnapshot()"), restart.index("StartAdvertising()"))
+        self.assertIn("ArmSnapshotTimer()", restart)
 
+    def test_address_rotation_uses_the_same_async_restart_boundary(self):
+        adapter = (
+            ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"
+        ).read_text(encoding="utf-8")
+        rotation = adapter.split("void OnRotationTimer", 1)[1].split(
+            "void Shutdown", 1
+        )[0]
+        self.assertIn("QueueAdvertisingRestart(RestartKind::kAddressRotation)", rotation)
+        self.assertNotIn("ApplyFreshNrpa()", rotation)
+        self.assertNotIn("PublishSnapshot()", rotation)
+        self.assertNotIn("StartAdvertising()", rotation)
+
+
+    def test_restart_callback_ignores_stale_event_kind(self):
+        adapter = (
+            ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"
+        ).read_text(encoding="utf-8")
+        restart = adapter.split(
+            "void OnAdvertisingRestart(ble_npl_event* /*event*/) {", 1
+        )[1].split("void OnSnapshotTimer", 1)[0]
+        self.assertIn("if (kind == RestartKind::kNone)", restart)
+        stale_guard = restart.split("if (kind == RestartKind::kNone)", 1)[1].split(
+            "if (kind == RestartKind::kAddressRotation)", 1
+        )[0]
+        self.assertIn("return;", stale_guard)
+
+    def test_pending_restart_coalesces_with_rotation_priority(self):
+        adapter = (
+            ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"
+        ).read_text(encoding="utf-8")
+        queue_restart = adapter.split("int QueueAdvertisingRestart", 1)[1].split(
+            "void OnAdvertisingRestart(ble_npl_event* /*event*/) {", 1
+        )[0]
+        queued = queue_restart.split("ble_npl_event_is_queued", 1)[1].split(
+            "int rc = ble_gap_adv_stop()", 1
+        )[0]
+        self.assertIn("kind == RestartKind::kAddressRotation", queued)
+        self.assertIn("g_state.restart_kind = kind", queued)
+        self.assertIn("return 0;", queued)
+
+    def test_rotation_timer_promotes_pending_restart_instead_of_deferring(self):
+        adapter = (
+            ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"
+        ).read_text(encoding="utf-8")
+        rotation = adapter.split("void OnRotationTimer", 1)[1].split(
+            "void Shutdown", 1
+        )[0]
+        self.assertNotIn("if (!g_state.advertising)", rotation)
+        self.assertIn(
+            "QueueAdvertisingRestart(RestartKind::kAddressRotation)", rotation
+        )
+        self.assertNotIn("ArmRotationTimer();", rotation)
+
+    def test_restart_callback_aborts_after_snapshot_timer_failure(self):
+        adapter = (
+            ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"
+        ).read_text(encoding="utf-8")
+        restart = adapter.split(
+            "void OnAdvertisingRestart(ble_npl_event* /*event*/) {", 1
+        )[1].split("void OnSnapshotTimer", 1)[0]
+        timer_guard = restart.split("ArmSnapshotTimer()", 1)[1].split(
+            "if (kind == RestartKind::kAddressRotation)", 1
+        )[0]
+        self.assertIn("if (!ArmSnapshotTimer())", restart)
+        self.assertIn("return;", timer_guard)
     def test_board_integration_is_default_off_and_has_no_gatt_surface(self):
         adapter = (
             ROOT / "main/boards/lichuang-dev/hutuji_ble_diag.cc"
