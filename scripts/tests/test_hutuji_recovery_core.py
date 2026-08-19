@@ -1482,6 +1482,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("constexpr int kFaceWidth = 460", lcd_cc)
         self.assertIn("constexpr int kFaceHeight = 300", lcd_cc)
         self.assertNotIn("CONFIG_USE_EMOTE_MESSAGE_STYLE", lcd_cc)
+        self.assertIn("grobot_stage_ = lv_obj_create(screen)", lcd_cc)
+        self.assertIn("lv_obj_set_style_radius(grobot_stage_, 32, 0)", lcd_cc)
+        self.assertIn("theme->surface_color()", lcd_cc)
         self.assertNotIn("otto_emoji_gif", eyes_cc)
         self.assertNotIn("emote::EmoteDisplay", lcd_cc)
 
@@ -1501,7 +1504,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("grobot_subtitle_bar_ = lv_obj_create(screen)", init_body)
         self.assertIn("grobot_subtitle_label_ = lv_label_create(grobot_subtitle_bar_)", init_body)
         self.assertIn("LV_LABEL_LONG_DOT", init_body)
-        self.assertIn("lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES, 40)", init_body)
+        self.assertIn("lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES * 72 / 100, 40)", init_body)
         self.assertIn("LV_OPA_80", init_body)
 
         helper_start = lcd_cc.index("void LcdDisplay::SetGrobotSubtitle")
@@ -1754,8 +1757,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("lv_button_create(button_row)", ui_body)
         self.assertNotIn("LV_EVENT_CLICKED", ui_body)
         self.assertGreaterEqual(ui_body.count("LV_EVENT_PRESSED"), 2)
-        self.assertIn("draw_preview_confirm_btn_ = make_button", ui_body)
-        self.assertIn("draw_preview_cancel_btn_ = make_button", ui_body)
+        self.assertRegex(ui_body, r"draw_preview_confirm_btn_\s*=\s*\n?\s*make_button")
+        self.assertRegex(ui_body, r"draw_preview_cancel_btn_\s*=\s*\n?\s*make_button")
         self.assertIn("Lang::Strings::DRAW_PREVIEW_CONFIRM", ui_body)
         self.assertIn("Lang::Strings::DRAW_PREVIEW_CANCEL", ui_body)
         # 命中高度下限 56px：3.5" 320x480 上更小的按钮儿童点不准。
@@ -1763,8 +1766,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("lv_obj_set_size(btn, width, button_height)", ui_body)
         # 「开始画」是唯一主动作：确认键必须比取消键宽（2/3 vs 1/3）。
         self.assertIn("confirm_width = (row_width - theme->spacing(4)) * 2 / 3", ui_body)
-        self.assertIn("lv_color_hex(0x2E9E4F), confirm_width)", ui_body)
-        self.assertIn("lv_color_hex(0x6B6B6B), cancel_width)", ui_body)
+        self.assertIn("theme->accent_color()", ui_body)
+        self.assertIn("theme->assistant_bubble_color()", ui_body)
         # 提示语置顶单行截断，再长也不挤压图片与按钮。
         self.assertIn("LV_LABEL_LONG_DOT", ui_body)
         # 主题字体会被 SetTextFont 替换释放：预览层不得持有主题字体裸指针。
@@ -1844,6 +1847,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("LV_OBJ_FLAG_HIDDEN", ui_body)
         self.assertIn("lv_screen_active()", ui_body)
         self.assertGreaterEqual(lcd_cc.count("lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN)"), 2)
+        self.assertIn("machine_manual_section_", ui_body)
+        self.assertIn("machine_manual_toggle_btn_", ui_body)
+        self.assertIn("SetMachineManualSectionVisible(false)", ui_body)
+        self.assertIn("SetMachineManualSectionVisible(", ui_body)
+        self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", ui_body)
+        self.assertIn("Lang::Strings::MACHINE_MANUAL_COLLAPSE", ui_body)
 
         self.assertIn("display_->ConfigureMachineControls", board)
         for request in (
@@ -1886,6 +1895,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             "MACHINE_ACTION_SENT",
             "MACHINE_ACTION_STARTED",
             "MACHINE_MANUAL_SECTION",
+            "MACHINE_MANUAL_EXPAND",
+            "MACHINE_MANUAL_COLLAPSE",
             "MACHINE_PEN_UP",
             "MACHINE_PEN_DOWN",
             "MACHINE_JOG_XP",

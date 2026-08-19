@@ -77,6 +77,8 @@
         "MACHINE_ACTION_SENT": "Sent",
         "MACHINE_ACTION_STARTED": "Started",
         "MACHINE_MANUAL_SECTION": "Manual Control",
+        "MACHINE_MANUAL_EXPAND": "Advanced Tools",
+        "MACHINE_MANUAL_COLLAPSE": "Hide Tools",
         "MACHINE_PEN_UP": "Pen Up",
         "MACHINE_PEN_DOWN": "Pen Down",
         "MACHINE_JOG_XP": "X+",

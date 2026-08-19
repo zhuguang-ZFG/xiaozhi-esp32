@@ -1,3 +1,11 @@
+/*
+ * IMPECCABLE DIRECTION CONTRACT — hutuji-touchscreen-redesign
+ * THESIS: Grobot is the creative companion; the machine never becomes a dense console.
+ * OWN-WORLD: warm dark desk, soft paper cards, cyan attention, rounded controls.
+ * FIRST VIEWPORT: full-screen Grobot, one quiet status pill, one control entry.
+ * SIGNATURE: preview becomes a sheet of paper; debug tools unfold only on demand.
+ * CONSTRAINTS: preserve callbacks, state gates, locale keys, and 56 px touch targets.
+ */
 #include "lcd_display.h"
 #include "assets/lang_config.h"
 #include "gif/lvgl_gif.h"
@@ -98,33 +106,47 @@ void LcdDisplay::InitializeLcdThemes() {
     auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_material_symbols_30_4);
     auto emoji_font = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
 
-    // light theme
+    // light theme：暖纸底 + 墨青文字，供主题切换/资产包覆写使用。
     auto light_theme = new LvglTheme("light");
-    light_theme->set_background_color(lv_color_hex(0xF5F5F7));
-    light_theme->set_text_color(lv_color_hex(0x1D1D1F));
-    light_theme->set_chat_background_color(lv_color_hex(0xEBEBED));
-    light_theme->set_user_bubble_color(lv_color_hex(0x007AFF));
-    light_theme->set_assistant_bubble_color(lv_color_hex(0xE5E5EA));
-    light_theme->set_system_bubble_color(lv_color_hex(0xF5F5F7));
-    light_theme->set_system_text_color(lv_color_hex(0x636366));
-    light_theme->set_border_color(lv_color_hex(0xD1D1D6));
-    light_theme->set_low_battery_color(lv_color_hex(0xFF3B30));
+    light_theme->set_background_color(lv_color_hex(0xF4F1EA));
+    light_theme->set_text_color(lv_color_hex(0x1E252B));
+    light_theme->set_chat_background_color(lv_color_hex(0xEDE8DE));
+    light_theme->set_user_bubble_color(lv_color_hex(0xD8F3F0));
+    light_theme->set_assistant_bubble_color(lv_color_hex(0xFFFDF8));
+    light_theme->set_system_bubble_color(lv_color_hex(0xF4F1EA));
+    light_theme->set_system_text_color(lv_color_hex(0x667078));
+    light_theme->set_border_color(lv_color_hex(0xD8D1C4));
+    light_theme->set_low_battery_color(lv_color_hex(0xC64F52));
+    light_theme->set_surface_color(lv_color_hex(0xFFFDF8));
+    light_theme->set_muted_text_color(lv_color_hex(0x667078));
+    light_theme->set_accent_color(lv_color_hex(0x0F8F8A));
+    light_theme->set_accent_text_color(lv_color_hex(0xFFFFFF));
+    light_theme->set_success_color(lv_color_hex(0x2F8F68));
+    light_theme->set_warning_color(lv_color_hex(0xC8862A));
+    light_theme->set_danger_color(lv_color_hex(0xC64F52));
     light_theme->set_text_font(text_font);
     light_theme->set_icon_font(icon_font);
     light_theme->set_large_icon_font(large_icon_font);
     light_theme->set_emoji_font(emoji_font);
 
-    // dark theme
+    // dark theme：低饱和墨蓝底，青蓝只做注意力，不用霓虹铺满屏幕。
     auto dark_theme = new LvglTheme("dark");
-    dark_theme->set_background_color(lv_color_hex(0x1A1A2E));
-    dark_theme->set_text_color(lv_color_hex(0xE0E0E0));
-    dark_theme->set_chat_background_color(lv_color_hex(0x16213E));
-    dark_theme->set_user_bubble_color(lv_color_hex(0x0F3460));
-    dark_theme->set_assistant_bubble_color(lv_color_hex(0x252A34));
-    dark_theme->set_system_bubble_color(lv_color_hex(0x1A1A2E));
-    dark_theme->set_system_text_color(lv_color_hex(0x8E8E93));
-    dark_theme->set_border_color(lv_color_hex(0x3A3A5C));
-    dark_theme->set_low_battery_color(lv_color_hex(0xE94560));
+    dark_theme->set_background_color(lv_color_hex(0x10161C));
+    dark_theme->set_text_color(lv_color_hex(0xF2F0E8));
+    dark_theme->set_chat_background_color(lv_color_hex(0x141C22));
+    dark_theme->set_user_bubble_color(lv_color_hex(0x1B7773));
+    dark_theme->set_assistant_bubble_color(lv_color_hex(0x1E2930));
+    dark_theme->set_system_bubble_color(lv_color_hex(0x172026));
+    dark_theme->set_system_text_color(lv_color_hex(0xA7B1B8));
+    dark_theme->set_border_color(lv_color_hex(0x34434A));
+    dark_theme->set_low_battery_color(lv_color_hex(0xD95D62));
+    dark_theme->set_surface_color(lv_color_hex(0x1A242B));
+    dark_theme->set_muted_text_color(lv_color_hex(0xA7B1B8));
+    dark_theme->set_accent_color(lv_color_hex(0x32D6CB));
+    dark_theme->set_accent_text_color(lv_color_hex(0x071316));
+    dark_theme->set_success_color(lv_color_hex(0x5ECB9A));
+    dark_theme->set_warning_color(lv_color_hex(0xE4B15D));
+    dark_theme->set_danger_color(lv_color_hex(0xE06A70));
     dark_theme->set_text_font(text_font);
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
@@ -442,39 +464,64 @@ void LcdDisplay::EnsureDrawPreviewUi() {
     }
 
     auto* theme = static_cast<LvglTheme*>(current_theme_);
-    // 480x320 横屏版面预算：根边距上下各 8、标题行约 32、按钮行 64、行距 6x2，
-    // 剩余约 196px 全部留给图片；宽方向两边各留 8，图片最宽 464。
+    // 预览是一张纸：外圈暗场只负责压暗 Grobot，卡片内部留暖白纸面和两行操作区。
+    // 480x320 预算：卡片 464x304，内边距 10，标题约 28，按钮 64，剩余约 190 给图片。
     // 所有可点目标高度 >= 56px（儿童手指命中面）。
     draw_preview_root_ = lv_obj_create(lv_screen_active());
     lv_obj_set_size(draw_preview_root_, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_style_radius(draw_preview_root_, 0, 0);
     lv_obj_set_style_border_width(draw_preview_root_, 0, 0);
-    lv_obj_set_style_bg_color(draw_preview_root_, theme->background_color(), 0);
-    lv_obj_set_style_bg_opa(draw_preview_root_, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(draw_preview_root_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(draw_preview_root_, LV_OPA_60, 0);
     lv_obj_set_style_pad_all(draw_preview_root_, theme->spacing(4), 0);
     lv_obj_set_flex_flow(draw_preview_root_, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(draw_preview_root_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(draw_preview_root_, theme->spacing(3), 0);
     lv_obj_clear_flag(draw_preview_root_, LV_OBJ_FLAG_SCROLLABLE);
     // 与二维码层同款：整层可点击，吃掉落到情绪层/聊天层的误触。
     lv_obj_add_flag(draw_preview_root_, LV_OBJ_FLAG_CLICKABLE);
 
+    draw_preview_card_ = lv_obj_create(draw_preview_root_);
+    const lv_coord_t card_width = LV_HOR_RES - theme->spacing(8);
+    const lv_coord_t card_height = LV_VER_RES - theme->spacing(8);
+    const lv_coord_t content_width = card_width - theme->spacing(10);
+    lv_obj_set_size(draw_preview_card_, card_width, card_height);
+    lv_obj_set_style_radius(draw_preview_card_, 24, 0);
+    lv_obj_set_style_bg_color(draw_preview_card_, theme->surface_color(), 0);
+    lv_obj_set_style_bg_opa(draw_preview_card_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(draw_preview_card_, 1, 0);
+    lv_obj_set_style_border_color(draw_preview_card_, theme->border_color(), 0);
+    lv_obj_set_style_shadow_width(draw_preview_card_, 24, 0);
+    lv_obj_set_style_shadow_color(draw_preview_card_, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(draw_preview_card_, LV_OPA_30, 0);
+    lv_obj_set_style_pad_all(draw_preview_card_, theme->spacing(5), 0);
+    lv_obj_set_style_pad_row(draw_preview_card_, theme->spacing(3), 0);
+    lv_obj_set_flex_flow(draw_preview_card_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(draw_preview_card_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(draw_preview_card_, LV_OBJ_FLAG_SCROLLABLE);
+
     // 标题即提示语，置顶单行打点截断：再长的文案也不挤压图片与按钮。
     // 字体继承屏幕级主题字体（SetTheme 会随主题刷新屏幕字体），不持有裸指针。
-    draw_preview_hint_ = lv_label_create(draw_preview_root_);
-    lv_obj_set_width(draw_preview_hint_, LV_HOR_RES - theme->spacing(8));
+    draw_preview_hint_ = lv_label_create(draw_preview_card_);
+    lv_obj_set_width(draw_preview_hint_, content_width);
     lv_obj_set_style_text_color(draw_preview_hint_, theme->text_color(), 0);
     lv_obj_set_style_text_align(draw_preview_hint_, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(draw_preview_hint_, LV_LABEL_LONG_DOT);
 
-    draw_preview_image_ = lv_image_create(draw_preview_root_);
+    draw_preview_image_ = lv_image_create(draw_preview_card_);
+    lv_obj_set_style_bg_color(draw_preview_image_, lv_color_hex(0xF6F1E6), 0);
+    lv_obj_set_style_bg_opa(draw_preview_image_, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(draw_preview_image_, 16, 0);
+    lv_obj_set_style_border_width(draw_preview_image_, 1, 0);
+    lv_obj_set_style_border_color(draw_preview_image_, lv_color_hex(0xD8D1C4), 0);
+    lv_obj_set_style_pad_all(draw_preview_image_, theme->spacing(2), 0);
 
     // 按钮行沉底：「开始画」是唯一主动作，占 2/3 宽；「取消」次动作占 1/3。
     // 行高取屏高 20%（480x320 下 64px）且不低于 56px。
-    lv_obj_t* button_row = lv_obj_create(draw_preview_root_);
+    lv_obj_t* button_row = lv_obj_create(draw_preview_card_);
     lv_obj_remove_style_all(button_row);
-    lv_obj_set_width(button_row, LV_HOR_RES - theme->spacing(8));
+    lv_obj_set_width(button_row, content_width);
     lv_obj_set_height(button_row, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(button_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(button_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
@@ -482,29 +529,32 @@ void LcdDisplay::EnsureDrawPreviewUi() {
     lv_obj_clear_flag(button_row, LV_OBJ_FLAG_SCROLLABLE);
 
     const lv_coord_t button_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
-    const lv_coord_t row_width = LV_HOR_RES - theme->spacing(8);
+    const lv_coord_t row_width = content_width;
     const lv_coord_t confirm_width = (row_width - theme->spacing(4)) * 2 / 3;
     const lv_coord_t cancel_width = row_width - theme->spacing(4) - confirm_width;
 
-    auto make_button = [&](const char* text, lv_color_t color, lv_coord_t width) {
+    auto make_button = [&](const char* text, lv_color_t color, lv_color_t text_color,
+                           lv_coord_t width) {
         lv_obj_t* btn = lv_button_create(button_row);
         lv_obj_set_size(btn, width, button_height);
-        lv_obj_set_style_radius(btn, button_height / 4, 0);
+        lv_obj_set_style_radius(btn, 18, 0);
         lv_obj_set_style_bg_color(btn, color, 0);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_t* label = lv_label_create(btn);
         lv_label_set_text(label, text);
-        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_set_style_text_color(label, text_color, 0);
         lv_obj_center(label);
         return btn;
     };
 
-    // 绿色大按钮=开始画，灰色小按钮=取消：不靠文字识读也能分辨主次。
-    draw_preview_confirm_btn_ = make_button(Lang::Strings::DRAW_PREVIEW_CONFIRM,
-                                            lv_color_hex(0x2E9E4F), confirm_width);
-    draw_preview_cancel_btn_ = make_button(Lang::Strings::DRAW_PREVIEW_CANCEL,
-                                           lv_color_hex(0x6B6B6B), cancel_width);
+    // 青色大按钮=开始画，灰色小按钮=取消：不靠文字识读也能分辨主次。
+    draw_preview_confirm_btn_ =
+        make_button(Lang::Strings::DRAW_PREVIEW_CONFIRM, theme->accent_color(),
+                    theme->accent_text_color(), confirm_width);
+    draw_preview_cancel_btn_ =
+        make_button(Lang::Strings::DRAW_PREVIEW_CANCEL, theme->assistant_bubble_color(),
+                    theme->text_color(), cancel_width);
 
     // 回调在 LVGL 任务里跑，只做转发：Job 侧建任务/发通知都不阻塞。
     lv_obj_add_event_cb(
@@ -547,14 +597,14 @@ void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::st
     auto* img_dsc = draw_preview_cached_->image_dsc();
     lv_image_set_src(draw_preview_image_, img_dsc);
 
-    // 与 EnsureDrawPreviewUi 的版面预算一致：宽两边各留 8；高 = 屏高减去根边距 16、
-    // 标题行 32、按钮行（屏高 20% 且 >=56px）与两处行距 12，其余全部留给图片。
+    // 与 EnsureDrawPreviewUi 的卡片预算一致：内容宽 = 卡片宽 - 两侧内边距 20；
+    // 高 = 卡片高 - 上下内边距 20、标题约 28、按钮行与两处行距，其余全部留给图片。
     // 等比放大不超过原始像素。
     auto* theme = static_cast<LvglTheme*>(current_theme_);
     const lv_coord_t button_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
-    const lv_coord_t max_width = LV_HOR_RES - theme->spacing(8);
+    const lv_coord_t max_width = LV_HOR_RES - theme->spacing(18);
     const lv_coord_t max_height =
-        LV_VER_RES - theme->spacing(8) - 32 - button_height - theme->spacing(6);
+        LV_VER_RES - theme->spacing(18) - 28 - button_height - theme->spacing(6);
     if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {
         const lv_coord_t zoom_w = (max_width * 256) / img_dsc->header.w;
         const lv_coord_t zoom_h = (max_height * 256) / img_dsc->header.h;
@@ -604,7 +654,8 @@ void LcdDisplay::HideDrawPreview() {
 }
 
 void LcdDisplay::EnsureMachineControlUi() {
-    if (!machine_controls_configured_ || !setup_ui_called_ || machine_control_trigger_btn_ != nullptr) {
+    if (!machine_controls_configured_ || !setup_ui_called_ ||
+        machine_control_trigger_btn_ != nullptr) {
         return;
     }
 
@@ -614,56 +665,65 @@ void LcdDisplay::EnsureMachineControlUi() {
     const lv_coord_t primary_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
     const lv_coord_t button_height = LV_VER_RES * 17 / 100;
     const lv_coord_t safe_button_height = button_height < 56 ? 56 : button_height;
-    // disabled 用实心灰底+实心白字：可辨靠的是填充色差异，不靠低对比文字。
-    const lv_color_t disabled_bg = lv_color_hex(0x8A8F94);
+    // disabled 用实心灰底+实心浅字：可辨靠的是填充色差异，不靠低对比文字。
+    const lv_color_t disabled_bg = lv_color_hex(0x536069);
+    const lv_color_t disabled_text = lv_color_hex(0xD8DEE2);
     auto* screen = lv_screen_active();
 
-    // 控制入口：右边缘垂直居中的胶囊按钮，避开顶部状态图标、居中表情与底部字幕。
+    // 控制入口：主屏只留这一个右侧胶囊，青蓝品牌色承担唯一视觉锚点。
     machine_control_trigger_btn_ = lv_button_create(screen);
     lv_obj_set_size(machine_control_trigger_btn_, LV_HOR_RES * 24 / 100, primary_height);
     lv_obj_align(machine_control_trigger_btn_, LV_ALIGN_RIGHT_MID, -theme->spacing(3), 0);
-    lv_obj_set_style_radius(machine_control_trigger_btn_, primary_height / 4, 0);
-    lv_obj_set_style_bg_color(machine_control_trigger_btn_, lv_color_hex(0x2374E1), 0);
+    lv_obj_set_style_radius(machine_control_trigger_btn_, 24, 0);
+    lv_obj_set_style_bg_color(machine_control_trigger_btn_, theme->accent_color(), 0);
     lv_obj_set_style_bg_opa(machine_control_trigger_btn_, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(machine_control_trigger_btn_, 0, 0);
+    lv_obj_set_style_border_width(machine_control_trigger_btn_, 1, 0);
+    lv_obj_set_style_border_color(machine_control_trigger_btn_, theme->border_color(), 0);
+    lv_obj_set_style_shadow_width(machine_control_trigger_btn_, 18, 0);
+    lv_obj_set_style_shadow_color(machine_control_trigger_btn_, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(machine_control_trigger_btn_, LV_OPA_30, 0);
     lv_obj_t* trigger_label = lv_label_create(machine_control_trigger_btn_);
     lv_label_set_text(trigger_label, Lang::Strings::MACHINE_CONTROL);
-    lv_obj_set_style_text_color(trigger_label, lv_color_white(), 0);
+    lv_obj_set_style_text_color(trigger_label, theme->accent_text_color(), 0);
     lv_obj_center(trigger_label);
 
-    // 抽屉：半透遮罩 + 居中面板；点遮罩空白处收起（保留原有语义）。
+    // 抽屉：暗场压底 + 居中纸感面板；点遮罩空白处收起（保留原有语义）。
     machine_control_root_ = lv_obj_create(screen);
     lv_obj_set_size(machine_control_root_, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_style_radius(machine_control_root_, 0, 0);
     lv_obj_set_style_border_width(machine_control_root_, 0, 0);
     lv_obj_set_style_bg_color(machine_control_root_, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(machine_control_root_, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(machine_control_root_, theme->spacing(3), 0);
+    lv_obj_set_style_bg_opa(machine_control_root_, LV_OPA_60, 0);
+    lv_obj_set_style_pad_all(machine_control_root_, theme->spacing(4), 0);
     lv_obj_clear_flag(machine_control_root_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_CLICKABLE);
 
-    // 面板 448 宽、内容高，居中；含手动调试区后内容超过 320 屏高，面板允许垂直滚动。
-    // 遮罩层保持不可滚动，点遮罩空白收起的语义不变。
+    // 面板 448 宽、内容高、最高贴屏内边；展开调试后允许面板内部垂直滚动。
     const lv_coord_t panel_width = LV_HOR_RES - theme->spacing(16);
     const lv_coord_t content_width = panel_width - theme->spacing(8);
     const lv_coord_t half_width = (content_width - theme->spacing(4)) / 2;
     lv_obj_t* panel = lv_obj_create(machine_control_root_);
     lv_obj_set_width(panel, panel_width);
     lv_obj_set_height(panel, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_height(panel, LV_VER_RES - theme->spacing(4), 0);
     lv_obj_align(panel, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(panel, 20, 0);
-    lv_obj_set_style_border_width(panel, 0, 0);
-    lv_obj_set_style_bg_color(panel, theme->background_color(), 0);
+    lv_obj_set_style_radius(panel, 24, 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_border_color(panel, theme->border_color(), 0);
+    lv_obj_set_style_bg_color(panel, theme->surface_color(), 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(panel, 24, 0);
+    lv_obj_set_style_shadow_color(panel, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(panel, LV_OPA_30, 0);
     lv_obj_set_style_pad_all(panel, theme->spacing(4), 0);
     lv_obj_set_style_pad_row(panel, theme->spacing(4), 0);
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    // 手动调试区使内容超过屏高：面板保留滚动（默认），遮罩不滚。
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(panel, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
 
-    auto make_row = [&]() {
-        lv_obj_t* row = lv_obj_create(panel);
+    auto make_row = [&](lv_obj_t* parent) {
+        lv_obj_t* row = lv_obj_create(parent);
         lv_obj_remove_style_all(row);
         lv_obj_set_size(row, content_width, LV_SIZE_CONTENT);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -675,10 +735,11 @@ void LcdDisplay::EnsureMachineControlUi() {
 
     // 字体继承屏幕级主题字体（SetTheme 随主题刷新），不持有裸指针。
     auto make_button = [&](lv_obj_t* parent, const char* text, lv_color_t color,
-                           lv_coord_t width, lv_coord_t height) {
+                           lv_color_t text_color, lv_coord_t width, lv_coord_t height,
+                           lv_obj_t** label_out = nullptr) {
         lv_obj_t* btn = lv_button_create(parent);
         lv_obj_set_size(btn, width, height);
-        lv_obj_set_style_radius(btn, 16, 0);
+        lv_obj_set_style_radius(btn, 18, 0);
         lv_obj_set_style_bg_color(btn, color, 0);
         lv_obj_set_style_bg_color(btn, disabled_bg, LV_STATE_DISABLED);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
@@ -686,101 +747,141 @@ void LcdDisplay::EnsureMachineControlUi() {
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_t* label = lv_label_create(btn);
         lv_label_set_text(label, text);
-        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_set_style_text_color(label, text_color, 0);
+        lv_obj_set_style_text_color(label, disabled_text, LV_STATE_DISABLED);
         lv_obj_center(label);
+        if (label_out != nullptr) {
+            *label_out = label;
+        }
         return btn;
     };
 
     // 标题行：抽屉名 + 当前机器状态 + 收起，一眼看清“我在哪、机器在干嘛”。
-    lv_obj_t* header = make_row();
+    lv_obj_t* header = make_row(panel);
     lv_obj_t* title = lv_label_create(header);
     lv_label_set_text(title, Lang::Strings::MACHINE_DRAWER_TITLE);
     lv_obj_set_style_text_color(title, theme->text_color(), 0);
     machine_state_label_ = lv_label_create(header);
     lv_label_set_text(machine_state_label_, "");
-    machine_close_btn_ = make_button(header, Lang::Strings::MACHINE_CLOSE,
-                                     lv_color_hex(0x626262), LV_HOR_RES / 5, safe_button_height);
+    lv_obj_set_style_bg_color(machine_state_label_, theme->assistant_bubble_color(), 0);
+    lv_obj_set_style_bg_opa(machine_state_label_, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(machine_state_label_, 12, 0);
+    lv_obj_set_style_pad_left(machine_state_label_, theme->spacing(3), 0);
+    lv_obj_set_style_pad_right(machine_state_label_, theme->spacing(3), 0);
+    lv_obj_set_style_pad_top(machine_state_label_, theme->spacing(1), 0);
+    lv_obj_set_style_pad_bottom(machine_state_label_, theme->spacing(1), 0);
+    machine_close_btn_ =
+        make_button(header, Lang::Strings::MACHINE_CLOSE, theme->assistant_bubble_color(),
+                    theme->text_color(), LV_HOR_RES / 5, safe_button_height);
 
     // 主操作行：暂停/继续同位二选一，Job 状态保证任一时刻只有一个可用；
     // 可用者保持实心高亮，即当前唯一主动作。
-    lv_obj_t* primary_row = make_row();
-    machine_pause_btn_ = make_button(primary_row, Lang::Strings::MACHINE_PAUSE,
-                                     lv_color_hex(0xE59A20), half_width, primary_height);
-    machine_resume_btn_ = make_button(primary_row, Lang::Strings::MACHINE_RESUME,
-                                      lv_color_hex(0x2E9E4F), half_width, primary_height);
+    lv_obj_t* primary_row = make_row(panel);
+    machine_pause_btn_ =
+        make_button(primary_row, Lang::Strings::MACHINE_PAUSE, theme->warning_color(),
+                    lv_color_hex(0x14110A), half_width, primary_height);
+    machine_resume_btn_ =
+        make_button(primary_row, Lang::Strings::MACHINE_RESUME, theme->success_color(),
+                    lv_color_hex(0x071510), half_width, primary_height);
 
     // 次级行：再画一张/试试笔，仅结束态可用。
-    lv_obj_t* secondary_row = make_row();
-    machine_repeat_btn_ = make_button(secondary_row, Lang::Strings::MACHINE_REPEAT,
-                                      lv_color_hex(0x2374E1), half_width, safe_button_height);
-    machine_pen_test_btn_ = make_button(secondary_row, Lang::Strings::MACHINE_PEN_TEST,
-                                        lv_color_hex(0x6D5BD0), half_width, safe_button_height);
+    lv_obj_t* secondary_row = make_row(panel);
+    machine_repeat_btn_ =
+        make_button(secondary_row, Lang::Strings::MACHINE_REPEAT, theme->accent_color(),
+                    theme->accent_text_color(), half_width, safe_button_height);
+    machine_pen_test_btn_ =
+        make_button(secondary_row, Lang::Strings::MACHINE_PEN_TEST, lv_color_hex(0x5F7180),
+                    lv_color_white(), half_width, safe_button_height);
 
     // 停止：危险动作独占末行，红色实心作语义警示，不与主操作行争视觉重心。
-    machine_abort_btn_ = make_button(panel, Lang::Strings::MACHINE_STOP,
-                                     lv_color_hex(0xD93A3A), content_width, safe_button_height);
+    machine_abort_btn_ = make_button(panel, Lang::Strings::MACHINE_STOP, theme->danger_color(),
+                                     lv_color_white(), content_width, safe_button_height);
+
+    // 高级调试默认折叠：孩子看到的是创作面板，点动/复位等工具仍在但不做主界面噪音。
+    machine_manual_toggle_btn_ = make_button(
+        panel, Lang::Strings::MACHINE_MANUAL_EXPAND, theme->assistant_bubble_color(),
+        theme->text_color(), content_width, safe_button_height, &machine_manual_toggle_label_);
+
+    machine_manual_section_ = lv_obj_create(panel);
+    lv_obj_remove_style_all(machine_manual_section_);
+    lv_obj_set_size(machine_manual_section_, content_width, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(machine_manual_section_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(machine_manual_section_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(machine_manual_section_, theme->spacing(3), 0);
+    lv_obj_clear_flag(machine_manual_section_, LV_OBJ_FLAG_SCROLLABLE);
 
     // ── 手动调试区（2026-08-18 用户决策全量开放；命令逐字对齐奎享实测序列）──
     // 动作不经 drawer 收起：点动/抬落笔需要连续操作。可用性统一由
     // ApplyMachineControlState 按 settled 态门控。
-    lv_obj_t* manual_label = lv_label_create(panel);
+    lv_obj_t* manual_label = lv_label_create(machine_manual_section_);
     lv_label_set_text(manual_label, Lang::Strings::MACHINE_MANUAL_SECTION);
-    lv_obj_set_style_text_color(manual_label, theme->text_color(), 0);
+    lv_obj_set_style_text_color(manual_label, theme->muted_text_color(), 0);
 
     const lv_coord_t third_width = (content_width - theme->spacing(8)) / 3;
     auto make_manual = [&](lv_obj_t* parent, const char* text, lv_color_t color,
-                           lv_coord_t width, const char* action) {
-        lv_obj_t* btn = make_button(parent, text, color, width, safe_button_height);
+                           lv_color_t text_color, lv_coord_t width, const char* action) {
+        lv_obj_t* btn = make_button(parent, text, color, text_color, width, safe_button_height);
         lv_obj_set_user_data(btn, const_cast<char*>(action));
         machine_manual_buttons_.push_back(btn);
         return btn;
     };
 
-    lv_obj_t* pen_row = make_row();
-    make_manual(pen_row, Lang::Strings::MACHINE_PEN_UP, lv_color_hex(0x2374E1), half_width,
-                "pen_up");
-    make_manual(pen_row, Lang::Strings::MACHINE_PEN_DOWN, lv_color_hex(0x2374E1), half_width,
-                "pen_down");
+    lv_obj_t* pen_row = make_row(machine_manual_section_);
+    make_manual(pen_row, Lang::Strings::MACHINE_PEN_UP, theme->accent_color(),
+                theme->accent_text_color(), half_width, "pen_up");
+    make_manual(pen_row, Lang::Strings::MACHINE_PEN_DOWN, theme->accent_color(),
+                theme->accent_text_color(), half_width, "pen_down");
 
     // 点动十字（对齐奎享面板）：Y+ 居上，X-/回原点/X+ 居中行，Y- 居下。
-    lv_obj_t* jog_up_row = make_row();
+    lv_obj_t* jog_up_row = make_row(machine_manual_section_);
     lv_obj_set_flex_align(jog_up_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
-    make_manual(jog_up_row, Lang::Strings::MACHINE_JOG_YP, lv_color_hex(0x626262), third_width,
-                "jog_y+");
-    lv_obj_t* jog_mid_row = make_row();
-    make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XM, lv_color_hex(0x626262), third_width,
-                "jog_x-");
-    make_manual(jog_mid_row, Lang::Strings::MACHINE_HOME, lv_color_hex(0x2E9E4F), third_width,
-                "home");
-    make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XP, lv_color_hex(0x626262), third_width,
-                "jog_x+");
-    lv_obj_t* jog_down_row = make_row();
+    make_manual(jog_up_row, Lang::Strings::MACHINE_JOG_YP, theme->assistant_bubble_color(),
+                theme->text_color(), third_width, "jog_y+");
+    lv_obj_t* jog_mid_row = make_row(machine_manual_section_);
+    make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XM, theme->assistant_bubble_color(),
+                theme->text_color(), third_width, "jog_x-");
+    make_manual(jog_mid_row, Lang::Strings::MACHINE_HOME, theme->success_color(),
+                lv_color_hex(0x071510), third_width, "home");
+    make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XP, theme->assistant_bubble_color(),
+                theme->text_color(), third_width, "jog_x+");
+    lv_obj_t* jog_down_row = make_row(machine_manual_section_);
     lv_obj_set_flex_align(jog_down_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
-    make_manual(jog_down_row, Lang::Strings::MACHINE_JOG_YM, lv_color_hex(0x626262), third_width,
-                "jog_y-");
+    make_manual(jog_down_row, Lang::Strings::MACHINE_JOG_YM, theme->assistant_bubble_color(),
+                theme->text_color(), third_width, "jog_y-");
 
-    lv_obj_t* origin_row = make_row();
-    make_manual(origin_row, Lang::Strings::MACHINE_SET_ORIGIN, lv_color_hex(0xE59A20), half_width,
-                "set_origin");
-    make_manual(origin_row, Lang::Strings::MACHINE_UNLOCK, lv_color_hex(0x626262), half_width,
-                "unlock");
+    lv_obj_t* origin_row = make_row(machine_manual_section_);
+    make_manual(origin_row, Lang::Strings::MACHINE_SET_ORIGIN, theme->warning_color(),
+                lv_color_hex(0x14110A), half_width, "set_origin");
+    make_manual(origin_row, Lang::Strings::MACHINE_UNLOCK, theme->assistant_bubble_color(),
+                theme->text_color(), half_width, "unlock");
 
-    lv_obj_t* power_row = make_row();
-    make_manual(power_row, Lang::Strings::MACHINE_MOTOR_OFF, lv_color_hex(0x626262), half_width,
-                "motor_off");
-    make_manual(power_row, Lang::Strings::MACHINE_RESET, lv_color_hex(0xD93A3A), half_width,
-                "reset");
+    lv_obj_t* power_row = make_row(machine_manual_section_);
+    make_manual(power_row, Lang::Strings::MACHINE_MOTOR_OFF, theme->assistant_bubble_color(),
+                theme->text_color(), half_width, "motor_off");
+    make_manual(power_row, Lang::Strings::MACHINE_RESET, theme->danger_color(), lv_color_white(),
+                half_width, "reset");
+    SetMachineManualSectionVisible(false);
 
     lv_obj_add_event_cb(
         machine_control_trigger_btn_,
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             ESP_LOGI(TAG, "machine controls opened");
+            self->SetMachineManualSectionVisible(false);
             self->ApplyMachineControlState();
             lv_obj_move_foreground(self->machine_control_root_);
             lv_obj_remove_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+        },
+        LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(
+        machine_manual_toggle_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            self->SetMachineManualSectionVisible(
+                lv_obj_has_flag(self->machine_manual_section_, LV_OBJ_FLAG_HIDDEN));
         },
         LV_EVENT_PRESSED, this);
     lv_obj_add_event_cb(
@@ -788,7 +889,8 @@ void LcdDisplay::EnsureMachineControlUi() {
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
-            if (self->machine_pause_) self->machine_pause_();
+            if (self->machine_pause_)
+                self->machine_pause_();
         },
         LV_EVENT_PRESSED, this);
     lv_obj_add_event_cb(
@@ -796,7 +898,8 @@ void LcdDisplay::EnsureMachineControlUi() {
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
-            if (self->machine_resume_) self->machine_resume_();
+            if (self->machine_resume_)
+                self->machine_resume_();
         },
         LV_EVENT_PRESSED, this);
     lv_obj_add_event_cb(
@@ -804,7 +907,8 @@ void LcdDisplay::EnsureMachineControlUi() {
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
-            if (self->machine_abort_) self->machine_abort_();
+            if (self->machine_abort_)
+                self->machine_abort_();
         },
         LV_EVENT_PRESSED, this);
     lv_obj_add_event_cb(
@@ -812,7 +916,8 @@ void LcdDisplay::EnsureMachineControlUi() {
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
-            if (self->machine_repeat_) self->machine_repeat_();
+            if (self->machine_repeat_)
+                self->machine_repeat_();
         },
         LV_EVENT_PRESSED, this);
     lv_obj_add_event_cb(
@@ -820,7 +925,8 @@ void LcdDisplay::EnsureMachineControlUi() {
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
-            if (self->machine_pen_test_) self->machine_pen_test_();
+            if (self->machine_pen_test_)
+                self->machine_pen_test_();
         },
         LV_EVENT_PRESSED, this);
     lv_obj_add_event_cb(
@@ -844,8 +950,8 @@ void LcdDisplay::EnsureMachineControlUi() {
             btn,
             [](lv_event_t* e) {
                 auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
-                const char* action = static_cast<const char*>(lv_obj_get_user_data(
-                    static_cast<lv_obj_t*>(lv_event_get_current_target(e))));
+                const char* action = static_cast<const char*>(
+                    lv_obj_get_user_data(static_cast<lv_obj_t*>(lv_event_get_current_target(e))));
                 if (self->machine_manual_ && action != nullptr) {
                     self->machine_manual_(action);
                 }
@@ -853,9 +959,21 @@ void LcdDisplay::EnsureMachineControlUi() {
             LV_EVENT_PRESSED, this);
     }
 
-
     lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);
     ApplyMachineControlState();
+}
+
+void LcdDisplay::SetMachineManualSectionVisible(bool visible) {
+    if (machine_manual_section_ == nullptr || machine_manual_toggle_label_ == nullptr) {
+        return;
+    }
+    if (visible) {
+        lv_obj_remove_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(machine_manual_toggle_label_, Lang::Strings::MACHINE_MANUAL_COLLAPSE);
+    } else {
+        lv_obj_add_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(machine_manual_toggle_label_, Lang::Strings::MACHINE_MANUAL_EXPAND);
+    }
 }
 
 void LcdDisplay::ApplyMachineControlState() {
@@ -889,29 +1007,31 @@ void LcdDisplay::ApplyMachineControlState() {
     }
 
     // 标题行状态灯：文案走 locale，颜色复用按钮语义色（进行中=琥珀、
-    // 完成=绿、出错=红、空闲/已停止=主题正文色），纯展示不改 Job 契约。
+    // 完成=绿、出错=红、空闲/已停止=柔和正文色），纯展示不改 Job 契约。
     if (machine_state_label_ != nullptr) {
+        auto* theme = static_cast<LvglTheme*>(current_theme_);
         const char* state_text = Lang::Strings::MACHINE_STATE_BUSY;
-        lv_color_t state_color = lv_color_hex(0xE59A20);
+        lv_color_t state_color = theme->warning_color();
         if (streaming) {
             state_text = Lang::Strings::MACHINE_STATE_STREAMING;
         } else if (paused) {
             state_text = Lang::Strings::MACHINE_STATE_PAUSED;
         } else if (machine_state_ == "done") {
             state_text = Lang::Strings::MACHINE_STATE_DONE;
-            state_color = lv_color_hex(0x2E9E4F);
+            state_color = theme->success_color();
         } else if (machine_state_ == "manual") {
             state_text = Lang::Strings::MACHINE_STATE_MANUAL;
         } else if (machine_state_ == "error") {
             state_text = Lang::Strings::MACHINE_STATE_ERROR;
-            state_color = lv_color_hex(0xD93A3A);
+            state_color = theme->danger_color();
         } else if (machine_state_ == "idle" || machine_state_ == "aborted") {
             state_text = machine_state_ == "idle" ? Lang::Strings::MACHINE_STATE_IDLE
                                                   : Lang::Strings::MACHINE_STATE_ABORTED;
-            state_color = static_cast<LvglTheme*>(current_theme_)->text_color();
+            state_color = theme->muted_text_color();
         }
         lv_label_set_text(machine_state_label_, state_text);
         lv_obj_set_style_text_color(machine_state_label_, state_color, 0);
+        lv_obj_set_style_bg_color(machine_state_label_, theme->assistant_bubble_color(), 0);
     }
 }
 
@@ -1039,6 +1159,22 @@ bool LcdDisplay::Lock(int timeout_ms) { return lvgl_port_lock(timeout_ms); }
 void LcdDisplay::Unlock() { lvgl_port_unlock(); }
 void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
                                      const lv_font_t* large_icon_font) {
+#if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
+    // 纸感舞台放在 Grobot 画布后面；画布自身仍保持整屏透明/黑色底，避免圆角裁切闪烁。
+    grobot_stage_ = lv_obj_create(screen);
+    lv_obj_set_size(grobot_stage_, 468, 308);
+    lv_obj_align(grobot_stage_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(grobot_stage_, 32, 0);
+    lv_obj_set_style_bg_color(grobot_stage_, theme->surface_color(), 0);
+    lv_obj_set_style_bg_opa(grobot_stage_, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(grobot_stage_, 1, 0);
+    lv_obj_set_style_border_color(grobot_stage_, theme->border_color(), 0);
+    lv_obj_set_style_shadow_width(grobot_stage_, 18, 0);
+    lv_obj_set_style_shadow_color(grobot_stage_, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(grobot_stage_, LV_OPA_20, 0);
+    lv_obj_clear_flag(grobot_stage_, LV_OBJ_FLAG_SCROLLABLE);
+#endif
+
     emoji_box_ = lv_obj_create(screen);
     lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
@@ -1056,7 +1192,7 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    auto eye_color = lv_color_make(0x00, 0xD4, 0xFF);
+    auto eye_color = theme->accent_color();
     auto eyes = std::make_unique<GrobotEyes>(eye_color, theme->background_color());
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
     // 480x320 横屏：四边仅留约 10px 安全边距，状态栏继续独立叠在最前层。
@@ -1072,16 +1208,17 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
         grobot_subtitle_bar_ = lv_obj_create(screen);
-        lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES, 40);
-        lv_obj_align(grobot_subtitle_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
-        lv_obj_set_style_radius(grobot_subtitle_bar_, 0, 0);
-        lv_obj_set_style_border_width(grobot_subtitle_bar_, 0, 0);
-        lv_obj_set_style_bg_color(grobot_subtitle_bar_, theme->background_color(), 0);
+        lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES * 72 / 100, 40);
+        lv_obj_align(grobot_subtitle_bar_, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_set_style_radius(grobot_subtitle_bar_, 20, 0);
+        lv_obj_set_style_border_width(grobot_subtitle_bar_, 1, 0);
+        lv_obj_set_style_border_color(grobot_subtitle_bar_, theme->border_color(), 0);
+        lv_obj_set_style_bg_color(grobot_subtitle_bar_, theme->surface_color(), 0);
         lv_obj_set_style_bg_opa(grobot_subtitle_bar_, LV_OPA_80, 0);
         lv_obj_set_style_pad_all(grobot_subtitle_bar_, 0, 0);
         lv_obj_clear_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_SCROLLABLE);
         grobot_subtitle_label_ = lv_label_create(grobot_subtitle_bar_);
-        lv_obj_set_width(grobot_subtitle_label_, LV_HOR_RES - 24);
+        lv_obj_set_width(grobot_subtitle_label_, LV_HOR_RES * 72 / 100 - 24);
         lv_label_set_long_mode(grobot_subtitle_label_, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_align(grobot_subtitle_label_, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(grobot_subtitle_label_, theme->text_color(), 0);
@@ -1101,13 +1238,12 @@ void LcdDisplay::SetGrobotSubtitle(const char* content) {
     }
     const bool has_content = content != nullptr && content[0] != '\0';
     lv_label_set_text(grobot_subtitle_label_, has_content ? content : "");
-    const bool overlay_visible =
-        (provisioning_qr_root_ != nullptr &&
-         !lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN)) ||
-        (draw_preview_root_ != nullptr &&
-         !lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN)) ||
-        (machine_control_root_ != nullptr &&
-         !lv_obj_has_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN));
+    const bool overlay_visible = (provisioning_qr_root_ != nullptr &&
+                                  !lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN)) ||
+                                 (draw_preview_root_ != nullptr &&
+                                  !lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN)) ||
+                                 (machine_control_root_ != nullptr &&
+                                  !lv_obj_has_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN));
     if (has_content && !hide_subtitle_ && !overlay_visible) {
         lv_obj_move_foreground(grobot_subtitle_bar_);
         lv_obj_remove_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
@@ -1152,14 +1288,13 @@ void LcdDisplay::SetupUI() {
     top_bar_ = lv_obj_create(container_);
     lv_obj_set_size(top_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
     lv_obj_set_style_radius(top_bar_, 0, 0);
-    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);  // 50% opacity background
-    lv_obj_set_style_bg_color(top_bar_, lvgl_theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(top_bar_, 0, 0);
     lv_obj_set_style_pad_all(top_bar_, 0, 0);
-    lv_obj_set_style_pad_top(top_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_bottom(top_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_left(top_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_pad_right(top_bar_, lvgl_theme->spacing(4), 0);
+    lv_obj_set_style_pad_top(top_bar_, lvgl_theme->spacing(3), 0);
+    lv_obj_set_style_pad_bottom(top_bar_, lvgl_theme->spacing(3), 0);
+    lv_obj_set_style_pad_left(top_bar_, lvgl_theme->spacing(5), 0);
+    lv_obj_set_style_pad_right(top_bar_, lvgl_theme->spacing(5), 0);
     lv_obj_set_flex_flow(top_bar_, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(top_bar_, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
@@ -1196,7 +1331,7 @@ void LcdDisplay::SetupUI() {
     status_bar_ = lv_obj_create(screen);
     lv_obj_set_size(status_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
     lv_obj_set_style_radius(status_bar_, 0, 0);
-    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);  // Transparent background
+    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(status_bar_, 0, 0);
     lv_obj_set_style_pad_all(status_bar_, 0, 0);
     lv_obj_set_style_pad_top(status_bar_, lvgl_theme->spacing(2), 0);
@@ -1205,19 +1340,31 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);  // Use absolute positioning
     lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);        // Overlap with top_bar_
 
+    // 状态只保留一枚居中软胶囊；网络/电池图标留在两侧，避免桌面式密集栏。
+    auto style_status_pill = [lvgl_theme](lv_obj_t* label) {
+        lv_obj_set_width(label, LV_HOR_RES * 56 / 100);
+        lv_obj_set_style_bg_color(label, lvgl_theme->surface_color(), 0);
+        lv_obj_set_style_bg_opa(label, LV_OPA_80, 0);
+        lv_obj_set_style_radius(label, 18, 0);
+        lv_obj_set_style_border_width(label, 1, 0);
+        lv_obj_set_style_border_color(label, lvgl_theme->border_color(), 0);
+        lv_obj_set_style_pad_left(label, lvgl_theme->spacing(5), 0);
+        lv_obj_set_style_pad_right(label, lvgl_theme->spacing(5), 0);
+        lv_obj_set_style_pad_top(label, lvgl_theme->spacing(2), 0);
+        lv_obj_set_style_pad_bottom(label, lvgl_theme->spacing(2), 0);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(label, lvgl_theme->text_color(), 0);
+    };
+
     notification_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(notification_label_, LV_HOR_RES * 0.8);
-    lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
+    style_status_pill(notification_label_);
     lv_label_set_text(notification_label_, "");
     lv_obj_align(notification_label_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
 
     status_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(status_label_, LV_HOR_RES * 0.8);
+    style_status_pill(status_label_);
     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
 
@@ -1228,8 +1375,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_grow(content_, 1);
     lv_obj_set_style_pad_all(content_, lvgl_theme->spacing(4), 0);
     lv_obj_set_style_border_width(content_, 0, 0);
-    lv_obj_set_style_bg_color(content_, lvgl_theme->chat_background_color(),
-                              0);  // Background for chat area
+    lv_obj_set_style_bg_color(content_, lvgl_theme->background_color(), 0);
 
     // Enable scrolling for chat content
     lv_obj_set_scrollbar_mode(content_, LV_SCROLLBAR_MODE_OFF);
@@ -2014,19 +2160,35 @@ void LcdDisplay::SetTheme(Theme* theme) {
         lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     }
 
-    // Update top bar background color with 50% opacity
+    lv_obj_set_style_bg_color(screen, lvgl_theme->background_color(), 0);
+
+    // 顶部图标不再占一整条半透明栏，只保留安静浮层。
     if (top_bar_ != nullptr) {
-        lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);
-        lv_obj_set_style_bg_color(top_bar_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);
     }
 
     // Update status bar elements
     lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_bg_color(status_label_, lvgl_theme->surface_color(), 0);
+    lv_obj_set_style_bg_color(notification_label_, lvgl_theme->surface_color(), 0);
+    lv_obj_set_style_border_color(status_label_, lvgl_theme->border_color(), 0);
+    lv_obj_set_style_border_color(notification_label_, lvgl_theme->border_color(), 0);
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
+    if (emoji_label_ != nullptr) {
+        lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
+    }
+    if (grobot_stage_ != nullptr) {
+        lv_obj_set_style_bg_color(grobot_stage_, lvgl_theme->surface_color(), 0);
+        lv_obj_set_style_border_color(grobot_stage_, lvgl_theme->border_color(), 0);
+    }
+    if (grobot_subtitle_bar_ != nullptr) {
+        lv_obj_set_style_bg_color(grobot_subtitle_bar_, lvgl_theme->surface_color(), 0);
+        lv_obj_set_style_border_color(grobot_subtitle_bar_, lvgl_theme->border_color(), 0);
+        lv_obj_set_style_text_color(grobot_subtitle_label_, lvgl_theme->text_color(), 0);
+    }
 
     // If we have the chat message style, update all message bubbles
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE

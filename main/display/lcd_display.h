@@ -35,6 +35,7 @@ protected:
     lv_obj_t* emoji_image_ = nullptr;
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
+    lv_obj_t* grobot_stage_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
     lv_obj_t* grobot_subtitle_bar_ = nullptr;
     lv_obj_t* grobot_subtitle_label_ = nullptr;
@@ -46,6 +47,7 @@ protected:
     lv_obj_t* provisioning_qr_hint_ = nullptr;
     std::unique_ptr<LvglImage> provisioning_qr_image_;
     lv_obj_t* draw_preview_root_ = nullptr;
+    lv_obj_t* draw_preview_card_ = nullptr;
     lv_obj_t* draw_preview_image_ = nullptr;
     lv_obj_t* draw_preview_hint_ = nullptr;
     lv_obj_t* draw_preview_confirm_btn_ = nullptr;
@@ -62,6 +64,9 @@ protected:
     lv_obj_t* machine_pen_test_btn_ = nullptr;
     lv_obj_t* machine_close_btn_ = nullptr;
     lv_obj_t* machine_state_label_ = nullptr;
+    lv_obj_t* machine_manual_section_ = nullptr;
+    lv_obj_t* machine_manual_toggle_btn_ = nullptr;
+    lv_obj_t* machine_manual_toggle_label_ = nullptr;
     std::function<void()> machine_pause_;
     std::function<void()> machine_resume_;
     std::function<void()> machine_abort_;
@@ -81,6 +86,7 @@ protected:
     void EnsureMachineControlUi();
     void ApplyMachineControlState();
     void SetGrobotSubtitle(const char* content);
+    void SetMachineManualSectionVisible(bool visible);
     void InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme, const lv_font_t* large_icon_font);
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
@@ -100,10 +106,8 @@ public:
                                  std::function<void()> on_confirm,
                                  std::function<void()> on_cancel) override;
     virtual void HideDrawPreview() override;
-    void ConfigureMachineControls(std::function<void()> on_pause,
-                                  std::function<void()> on_resume,
-                                  std::function<void()> on_abort,
-                                  std::function<void()> on_repeat,
+    void ConfigureMachineControls(std::function<void()> on_pause, std::function<void()> on_resume,
+                                  std::function<void()> on_abort, std::function<void()> on_repeat,
                                   std::function<void()> on_pen_test,
                                   std::function<void(const char* action)> on_manual);
     virtual void UpdateMachineControlState(const std::string& state) override;
