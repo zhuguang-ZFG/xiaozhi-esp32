@@ -653,6 +653,11 @@ void LcdDisplay::HideDrawPreview() {
     draw_preview_on_cancel_ = nullptr;
 }
 
+namespace {
+// 6px 只区分点按与拖动；位置从首个采样起跟手，越过阈值时不会丢掉起步位移。
+constexpr lv_coord_t kTriggerDragThresholdPx = 6;
+}  // namespace
+
 void LcdDisplay::EnsureMachineControlUi() {
     if (!machine_controls_configured_ || !setup_ui_called_ ||
         machine_control_trigger_btn_ != nullptr) {
@@ -663,6 +668,7 @@ void LcdDisplay::EnsureMachineControlUi() {
     // 480x320 横屏：主操作行取屏高 20%（64px），其余按钮行取 17%（54px），
     // 一律按 56px 下限兜底，保证儿童手指命中面。
     const lv_coord_t primary_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
+    const lv_coord_t trigger_width = LV_HOR_RES * 24 / 100;
     const lv_coord_t button_height = LV_VER_RES * 17 / 100;
     const lv_coord_t safe_button_height = button_height < 56 ? 56 : button_height;
     // disabled 用实心灰底+实心浅字：可辨靠的是填充色差异，不靠低对比文字。
@@ -670,10 +676,16 @@ void LcdDisplay::EnsureMachineControlUi() {
     const lv_color_t disabled_text = lv_color_hex(0xD8DEE2);
     auto* screen = lv_screen_active();
 
-    // 控制入口：主屏只留这一个右侧胶囊，青蓝品牌色承担唯一视觉锚点。
+    // 先固定为 TOP_LEFT：拖动坐标统一从父对象左上角计算，避免对齐偏移与拖动坐标混用。
     machine_control_trigger_btn_ = lv_button_create(screen);
-    lv_obj_set_size(machine_control_trigger_btn_, LV_HOR_RES * 24 / 100, primary_height);
-    lv_obj_align(machine_control_trigger_btn_, LV_ALIGN_RIGHT_MID, -theme->spacing(3), 0);
+    lv_obj_set_size(machine_control_trigger_btn_, trigger_width, primary_height);
+    lv_obj_set_align(machine_control_trigger_btn_, LV_ALIGN_TOP_LEFT);
+    lv_obj_set_pos(machine_control_trigger_btn_, LV_HOR_RES - trigger_width - theme->spacing(3),
+                   (LV_VER_RES - primary_height) / 2);
+    lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLL_CHAIN);
+    // 拖动时持续锁定最初命中的按钮；按钮本身不参与 LVGL 滚动判定。
+    lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_PRESS_LOCK);
     lv_obj_set_style_radius(machine_control_trigger_btn_, 24, 0);
     lv_obj_set_style_bg_color(machine_control_trigger_btn_, theme->accent_color(), 0);
     lv_obj_set_style_bg_opa(machine_control_trigger_btn_, LV_OPA_COVER, 0);
@@ -865,17 +877,71 @@ void LcdDisplay::EnsureMachineControlUi() {
                 half_width, "reset");
     SetMachineManualSectionVisible(false);
 
+    // 触发钮用“按下触点 + 按下时按钮位置”计算绝对位移：不累积采样误差，
+    // 也不吞掉越过点按阈值前的位移。松手总位移不超过阈值才打开抽屉。
     lv_obj_add_event_cb(
         machine_control_trigger_btn_,
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
-            ESP_LOGI(TAG, "machine controls opened");
-            self->SetMachineManualSectionVisible(false);
-            self->ApplyMachineControlState();
-            lv_obj_move_foreground(self->machine_control_root_);
-            lv_obj_remove_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_t* btn = self->machine_control_trigger_btn_;
+            switch (lv_event_get_code(e)) {
+                case LV_EVENT_PRESSED: {
+                    lv_indev_t* indev = lv_event_get_indev(e);
+                    if (indev == nullptr || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+                        break;
+                    }
+                    lv_indev_get_point(indev, &self->machine_trigger_press_point_);
+                    self->machine_trigger_press_x_ = lv_obj_get_x_aligned(btn);
+                    self->machine_trigger_press_y_ = lv_obj_get_y_aligned(btn);
+                    self->machine_trigger_dragging_ = false;
+                    break;
+                }
+                case LV_EVENT_PRESSING: {
+                    lv_indev_t* indev = lv_event_get_indev(e);
+                    if (indev == nullptr || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+                        break;
+                    }
+                    lv_point_t point;
+                    lv_indev_get_point(indev, &point);
+                    const lv_coord_t dx = point.x - self->machine_trigger_press_point_.x;
+                    const lv_coord_t dy = point.y - self->machine_trigger_press_point_.y;
+                    const lv_coord_t ax = dx < 0 ? -dx : dx;
+                    const lv_coord_t ay = dy < 0 ? -dy : dy;
+                    if (ax + ay > kTriggerDragThresholdPx) {
+                        self->machine_trigger_dragging_ = true;
+                    }
+
+                    lv_coord_t x = self->machine_trigger_press_x_ + dx;
+                    lv_coord_t y = self->machine_trigger_press_y_ + dy;
+                    const lv_coord_t max_x = LV_HOR_RES - lv_obj_get_width(btn);
+                    const lv_coord_t max_y = LV_VER_RES - lv_obj_get_height(btn);
+                    x = x < 0 ? 0 : (x > max_x ? max_x : x);
+                    y = y < 0 ? 0 : (y > max_y ? max_y : y);
+                    lv_obj_set_pos(btn, x, y);
+                    break;
+                }
+                case LV_EVENT_RELEASED: {
+                    if (!self->machine_trigger_dragging_) {
+                        lv_obj_set_pos(btn, self->machine_trigger_press_x_,
+                                       self->machine_trigger_press_y_);
+                        ESP_LOGI(TAG, "machine controls opened");
+                        self->SetMachineManualSectionVisible(false);
+                        self->ApplyMachineControlState();
+                        lv_obj_move_foreground(self->machine_control_root_);
+                        lv_obj_remove_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+                    }
+                    self->machine_trigger_dragging_ = false;
+                    break;
+                }
+                case LV_EVENT_PRESS_LOST: {
+                    self->machine_trigger_dragging_ = false;
+                    break;
+                }
+                default:
+                    break;
+            }
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_ALL, this);
     lv_obj_add_event_cb(
         machine_manual_toggle_btn_,
         [](lv_event_t* e) {
@@ -1160,6 +1226,9 @@ void LcdDisplay::Unlock() { lvgl_port_unlock(); }
 void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
                                      const lv_font_t* large_icon_font) {
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
+    // Waveshare 的 Grobot 主屏是固定画布；切断 screen 的滚动及滚动链，避免拖脸滚动整屏。
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLL_CHAIN);
     // 纸感舞台放在 Grobot 画布后面；画布自身仍保持整屏透明/黑色底，避免圆角裁切闪烁。
     grobot_stage_ = lv_obj_create(screen);
     lv_obj_set_size(grobot_stage_, 468, 308);
@@ -1173,6 +1242,7 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     lv_obj_set_style_shadow_color(grobot_stage_, lv_color_black(), 0);
     lv_obj_set_style_shadow_opa(grobot_stage_, LV_OPA_20, 0);
     lv_obj_clear_flag(grobot_stage_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(grobot_stage_, LV_OBJ_FLAG_SCROLL_CHAIN);
 #endif
 
     emoji_box_ = lv_obj_create(screen);
@@ -1181,6 +1251,10 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
     lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+    // lv_obj 默认可滚动：不关掉会让 Grobot 脸/表情被手指拖着做弹性漂移。
+    // 脸是主角画布，位移只允许来自布局，不允许来自触摸滚动。
+    lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_SCROLL_CHAIN);
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);

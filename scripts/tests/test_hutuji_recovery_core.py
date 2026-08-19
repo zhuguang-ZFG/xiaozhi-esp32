@@ -1484,6 +1484,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertNotIn("CONFIG_USE_EMOTE_MESSAGE_STYLE", lcd_cc)
         self.assertIn("grobot_stage_ = lv_obj_create(screen)", lcd_cc)
         self.assertIn("lv_obj_set_style_radius(grobot_stage_, 32, 0)", lcd_cc)
+        # 触摸落在 canvas 时，子对象和其滚动链都必须关闭；否则脸会被弹性滚动拖走。
+        self.assertIn("lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE)", lcd_cc)
+        self.assertIn("lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLL_CHAIN)", lcd_cc)
+        self.assertIn("lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_SCROLLABLE)", lcd_cc)
+        self.assertIn("lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_SCROLL_CHAIN)", lcd_cc)
+        self.assertIn("lv_obj_clear_flag(canvas_, LV_OBJ_FLAG_SCROLLABLE)", eyes_cc)
+        self.assertIn("lv_obj_clear_flag(canvas_, LV_OBJ_FLAG_SCROLL_CHAIN)", eyes_cc)
         self.assertIn("theme->surface_color()", lcd_cc)
         self.assertNotIn("otto_emoji_gif", eyes_cc)
         self.assertNotIn("emote::EmoteDisplay", lcd_cc)
@@ -1833,8 +1840,31 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         ):
             self.assertIn(member, ui_body)
         self.assertIn("button_height < 56 ? 56 : button_height", ui_body)
-        # 控制入口挂在右边缘垂直居中：不挡顶部状态图标、居中表情与底部字幕。
-        self.assertIn("LV_ALIGN_RIGHT_MID", ui_body)
+        # 默认视觉位置仍在右侧垂直居中，但对象采用 TOP_LEFT 坐标系；
+        # 非 TOP_LEFT 对齐与 set_pos 增量混用会让 LVGL 坐标损坏、按钮飞出屏幕。
+        self.assertIn("LV_ALIGN_TOP_LEFT", ui_body)
+        self.assertIn("const lv_coord_t trigger_width = LV_HOR_RES * 24 / 100", ui_body)
+        self.assertIn("LV_HOR_RES - trigger_width - theme->spacing(3)", ui_body)
+        trigger_setup = ui_body[: ui_body.index("lv_obj_add_event_cb")]
+        self.assertNotIn("lv_obj_get_width(machine_control_trigger_btn_)", trigger_setup)
+        self.assertNotIn("lv_obj_get_height(machine_control_trigger_btn_)", trigger_setup)
+        self.assertIn("LV_EVENT_PRESSING", ui_body)
+        self.assertIn("LV_EVENT_RELEASED", ui_body)
+        self.assertIn("lv_event_get_indev(e)", ui_body)
+        self.assertIn("lv_indev_get_point", ui_body)
+        self.assertNotIn("lv_indev_get_vect", ui_body)
+        self.assertIn("machine_trigger_press_point_", lcd_h)
+        self.assertIn("machine_trigger_press_x_", lcd_h)
+        self.assertIn("machine_trigger_press_y_", lcd_h)
+        self.assertIn("machine_trigger_dragging_", lcd_h)
+        self.assertIn("LV_OBJ_FLAG_PRESS_LOCK", ui_body)
+        self.assertIn("lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLLABLE)", ui_body)
+        self.assertIn("const lv_coord_t dx = point.x - self->machine_trigger_press_point_.x", ui_body)
+        self.assertIn("const lv_coord_t dy = point.y - self->machine_trigger_press_point_.y", ui_body)
+        self.assertIn("kTriggerDragThresholdPx = 6", lcd_cc)
+        self.assertIn("lv_obj_get_x_aligned", ui_body)
+        self.assertIn("lv_obj_get_y_aligned", ui_body)
+        self.assertIn("kTriggerDragThresholdPx", ui_body)
         # 抽屉必须有标题与当前状态，且状态由 ApplyMachineControlState 驱动。
         self.assertIn("Lang::Strings::MACHINE_DRAWER_TITLE", ui_body)
         self.assertIn("machine_state_label_", ui_body)

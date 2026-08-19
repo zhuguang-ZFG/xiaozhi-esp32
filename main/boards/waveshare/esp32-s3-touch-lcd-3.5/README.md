@@ -39,10 +39,10 @@ idf.py -B build-waveshare-35 build
 
 ## 已验证边界
 
-- ESP-IDF v6.0.1 构建通过；host 回归 60/60。
-- COM14 实机启动确认 8MB PSRAM、LCD、触摸、音频、OV5640、Grobot `460x300`、Wi-Fi、Grbl Telnet 与授权探测。
-- FT6X36 实机寄存器为 threshold `70`、active period `12`、chip `0x64`、vendor `0x11`；启动时把 threshold 调到 `40` 并回读确认。官方 demo 的 display `(swap=1, mirror_x=1, mirror_y=1)` 配 touch `(1,0,1)`；本仓 display 为 `(1,0,0)`，故触摸改为与其配对的 `(1,1,0)`。旧绝对照搬 `(1,0,1)` 的版本实机按钮未命中；新矩阵已烧入，但尚缺一次真实点击证据。
-- 屏幕控制抽屉只开放暂停、继续、停止、重画、试笔；二维码与出图预览显示时隐藏入口，不提供回原点、复位、点动或原始 G-code。所有动作改为 `LV_EVENT_PRESSED`，不依赖 release→click。
-- Grobot 使用独立 40px 单行字幕层，不依赖 WeChat `bottom_bar_`；用户已目视确认字幕恢复。省电改为 180 秒后降至 35%，自动关机保持禁用。
+- ESP-IDF v6.0.1 构建通过；host 回归 93/93，相关 C++ 通过仓库 `.clang-format` 的 dry-run 检查。
+- COM14 已刷入当前应用镜像：`xiaozhi.bin` 2,974,896B、SHA-256 `966bdf3d…a1adf`，esptool 写入后哈希校验通过；随后约 60 秒持续收到 Grbl `Idle`，最低 SRAM 27,803B，无 panic/assert/watchdog。
+- FT6X36 实机寄存器为 threshold `70`、active period `12`、chip `0x64`、vendor `0x11`；启动时把 threshold 调到 `40` 并回读确认。官方 demo 的 display `(swap=1, mirror_x=1, mirror_y=1)` 配 touch `(1,0,1)`；本仓 display 为 `(1,0,0)`，故触摸改为与其配对的 `(1,1,0)`。旧绝对照搬 `(1,0,1)` 的版本实机按钮未命中，当前矩阵已由按钮可见和可拖动的实机反馈覆盖。
+- 主屏控制入口使用 `TOP_LEFT` 父坐标、固定创建尺寸与绝对触点锚定拖动：对象关闭滚动/滚动链并启用 `PRESS_LOCK`，6px 仅区分点按与拖动，不吞掉阈值前位移。轻点在 `RELEASED` 打开抽屉；抽屉提供暂停、继续、停止、重画、试笔，并把抬落笔、点动、原点、解锁、关电机和复位折叠在高级区。二维码与出图预览显示时隐藏入口，所有机器动作仍只调度既有 Job API。
+- Grobot 使用独立 40px 单行字幕层，不依赖 WeChat `bottom_bar_`；用户已目视确认字幕恢复。`screen`、纸感舞台、表情容器与 canvas 均关闭滚动及滚动链，禁止触摸拖走脸层。省电改为 180 秒后降至 35%，自动关机保持禁用。
 - 换纸机械、时序、运动、传感器与错误码全部由 Grbl `user_m30()/paper_auto_change()` 实现；S3 页尾只发唯一 `M30` 并等待最终 `ok/error`，测试禁止任何纸路电机命令进入 S3 页尾事务。独立 `G1 X0Y0` 只实现画完回左下角，Grbl 的 `M30` 不归位。
-- 当前源码镜像 ELF `5ea8b3dd…0621f`、bin `9e1d1092…d859` 已构建；板上最近一次全量烧写为同一行为代码但不含最后的职责注释。预览确认、控制抽屉和绘图中语音并发仍待最终 HIL，不宣称实机通过。
+- 当前绝对锚定拖动镜像已构建、刷写并通过窄启动检查；用户此前已确认入口可见且增量版可拖动，当前版慢拖/快拖跟手性仍待现场复核。预览确认/取消、抽屉各机器动作和绘图中语音并发仍待最终 HIL，不宣称实机通过。

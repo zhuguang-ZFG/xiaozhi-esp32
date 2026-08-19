@@ -156,6 +156,9 @@ bool GrobotEyes::Init(lv_obj_t* parent, int w, int h) {
         draw_buf_ = nullptr;
         return false;
     }
+    // Canvas 继承 lv_obj 的默认滚动/链标志；触摸脸时必须在源头截断滚动手势。
+    lv_obj_clear_flag(canvas_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(canvas_, LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_canvas_set_draw_buf(canvas_, draw_buf_);
     lv_obj_center(canvas_);
     buf_ = (uint16_t*)draw_buf_->data;

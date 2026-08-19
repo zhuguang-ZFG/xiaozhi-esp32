@@ -56,6 +56,10 @@ protected:
     std::function<void()> draw_preview_on_confirm_;
     std::function<void()> draw_preview_on_cancel_;
     lv_obj_t* machine_control_trigger_btn_ = nullptr;
+    lv_point_t machine_trigger_press_point_{0, 0};
+    lv_coord_t machine_trigger_press_x_ = 0;
+    lv_coord_t machine_trigger_press_y_ = 0;
+    bool machine_trigger_dragging_ = false;
     lv_obj_t* machine_control_root_ = nullptr;
     lv_obj_t* machine_pause_btn_ = nullptr;
     lv_obj_t* machine_resume_btn_ = nullptr;
