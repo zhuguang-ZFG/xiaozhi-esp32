@@ -61,8 +61,8 @@ components:
     rounded: "{rounded.pill}"
     height: "36px"
   preview-card:
-    backgroundColor: "{colors.paper-card}"
-    textColor: "{colors.ink-navy}"
+    backgroundColor: "{colors.paper-surface}"
+    textColor: "{colors.text-light}"
     rounded: "{rounded.card}"
     padding: "10px"
 ---
