@@ -127,6 +127,40 @@ inline JogVerdict DecideJog(float mx, float my, float dx, float dy) {
     return JogVerdict::kOk;
 }
 
+/**
+ * 绘图机「射频 PERFORMANCE 持有」决策（2026-08-20）。
+ * 症状：音频通道关闭后 application.cc:535 把 WiFi 省电踩回 LOW_POWER(MAX_MODEM,
+ * listen_interval=10)，叠加 block-ack 拆链（RX DELBA reason:39）时 Telnet 往返从
+ * 常态 20~70ms 退化到 1440ms（`?`）/3200ms（`ok`），点动新鲜坐标与流内 ok 兜底
+ * 都因此假超时。对策是绘图/换纸/手动交互窗口把 WiFi 钉在 PERFORMANCE(WIFI_PS_NONE)，
+ * 窗口结束按 app 态回落。manual 不在下表：点动的新鲜坐标窗口由调用方单独短时持有，
+ * 整个 manual 态持有会让屏常亮到 settled。
+ */
+inline constexpr bool JobHoldsPerformance(const char* state) {
+    // 与 lcd_display.cc ApplyMachineControlState 的 active 谓词同源，单独实现以免
+    // 显示层与任务层互相 include；两侧任一改动须同步（已有 host 断言钉死该清单）。
+    const char* const kActive[] = {"streaming",   "paused",       "previewing",
+                                   "awaiting_confirmation",       "downloading",
+                                   "verifying",   "reconnecting", "paper_change",
+                                   "pen_test"};
+    for (const char* s : kActive) {
+        const char* a = state;
+        const char* b = s;
+        while (*a != '\0' && *a == *b) { ++a; ++b; }
+        if (*a == '\0' && *b == '\0') { return true; }
+    }
+    return false;
+}
+
+/**
+ * 点动新鲜坐标窗口（QueryAndWaitFreshMachineState）的 PERFORMANCE 重申周期。
+ * 4s：比实测最坏 BA 重建 3.2s 略长即可盖住一个完整重申空窗，又不至于像 1s 那样
+ * 频繁刷日志/拉亮背光。取 min(点动新鲜预算, 4000)，预算调小则同步收紧。
+ */
+inline constexpr uint32_t PerformanceReassertPeriodMs(uint32_t fresh_budget_ms) {
+    return fresh_budget_ms < 4000u ? fresh_budget_ms : 4000u;
+}
+
 /** 生成 ZXing/Android/iOS 识别的 open SoftAP 二维码内容；不包含家庭 Wi-Fi 凭据。 */
 inline std::string BuildOpenHotspotWifiQrPayload(const std::string& ssid) {
     std::string escaped;

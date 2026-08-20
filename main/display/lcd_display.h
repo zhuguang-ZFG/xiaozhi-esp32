@@ -71,6 +71,10 @@ protected:
     lv_obj_t* machine_manual_section_ = nullptr;
     lv_obj_t* machine_manual_toggle_btn_ = nullptr;
     lv_obj_t* machine_manual_toggle_label_ = nullptr;
+    // 抽屉分页：主操作区与手动区互斥显示，各自都塞得进 296px 面板内高。面板不可
+    // 滚（height 固定，见 lcd_display.cc EnsureMachineControlUi 注释），同屏堆叠会
+    // 把按钮挤出可视区——2026-08-20 四轮 HIL 实测丢按钮的根因。
+    lv_obj_t* machine_main_section_ = nullptr;
     std::function<void()> machine_pause_;
     std::function<void()> machine_resume_;
     std::function<void()> machine_abort_;

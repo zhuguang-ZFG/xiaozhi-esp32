@@ -865,7 +865,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         fallback_start = job_cc.index("bool Job::ConfirmInFlightDoneByStatus")
         fallback_end = job_cc.index("bool Job::WaitForIdle", fallback_start)
         fallback = job_cc[fallback_start:fallback_end]
-        self.assertIn("QueryAndWaitFreshMachineState()", fallback)
+        # 流式兜底保持 2s 预算（`?` 不排 planner 队列）；交互点动另有 6s 预算，
+        # 两者显式传参、不设默认值，避免哪一侧被悄悄改成另一侧的语义。
+        self.assertIn("QueryAndWaitFreshMachineState(kOkFallbackIdleTimeoutMs)", fallback)
 
     def test_open_hotspot_wifi_qr_payload_escapes_ssid(self):
         """二维码 payload 按 ZXing 规则转义，LCD 共享覆盖层覆盖两块板。"""
@@ -1835,8 +1837,11 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("ConfigureMachineControls", lcd_h)
         self.assertIn("UpdateMachineControlState", lcd_h)
         self.assertIn("EnsureMachineControlUi", lcd_h)
+        # ui_body 只切「构建函数本体」：切到 ConfigureMachineControls 会把 setter 与
+        # ApplyMachineControlState 一并吞进来，令「创建处只折叠一次」这类计数式断言
+        # 被别处的同名调用干扰（2026-08-20 实测 count 由 1 变 2 假红）。
         ui_start = lcd_cc.index("void LcdDisplay::EnsureMachineControlUi")
-        ui_end = lcd_cc.index("void LcdDisplay::ConfigureMachineControls", ui_start)
+        ui_end = lcd_cc.index("void LcdDisplay::SetMachineManualSectionVisible", ui_start)
         ui_body = lcd_cc[ui_start:ui_end]
         for member in (
             "machine_pause_btn_",
@@ -1868,7 +1873,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLLABLE)", ui_body)
         self.assertIn("const lv_coord_t dx = point.x - self->machine_trigger_press_point_.x", ui_body)
         self.assertIn("const lv_coord_t dy = point.y - self->machine_trigger_press_point_.y", ui_body)
-        self.assertIn("kTriggerDragThresholdPx = 6", lcd_cc)
+        # 2026-08-20 HIL：6px 在灵敏化触摸上把点按误判成拖动（抽屉打不开），钉 24px。
+        self.assertIn("kTriggerDragThresholdPx = 24", lcd_cc)
         self.assertIn("lv_obj_get_x_aligned", ui_body)
         self.assertIn("lv_obj_get_y_aligned", ui_body)
         self.assertIn("kTriggerDragThresholdPx", ui_body)
@@ -1883,6 +1889,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 释放时不发 CLICKED（lv_indev.c release 分支 `scroll_obj == NULL` 才发），
         # reset/set_origin 等高危键天然免疫滚动误触（2026-08-20 修复）；本抽屉
         # 不再注册任何 PRESSED 回调（触发钮走 LV_EVENT_ALL，不算）。
+        # 免疫前提：板级 indev 滚动阈值提到 24px——LVGL 默认 10px
+        # （LV_INDEV_DEF_SCROLL_LIMIT，lv_indev.c:1375 越限即 PRESS_LOST），FT5x06
+        # 调敏后静止按压抖动越限、CLICKED 全数被吃（2026-08-20 HIL 坐实：展开态
+        # 6 分钟仅 1 次折叠态 CLICKED 登记）。断 SCROLL_CHAIN 的反方案因按钮铺满
+        # 行、面板无处起手滚动（X/Y 十字不可达），被同日第三轮 HIL 否决、禁复活。
+        self.assertIn("lv_indev_set_scroll_limit(touch_indev, 24)", board)
+        self.assertNotIn("lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLL_CHAIN)", ui_body)
         self.assertEqual(ui_body.count("LV_EVENT_PRESSED, this)"), 0)
         self.assertGreaterEqual(ui_body.count("LV_EVENT_CLICKED, this)"), 8)
         self.assertIn("LV_OBJ_FLAG_HIDDEN", ui_body)
@@ -1895,8 +1908,81 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 展开态跨抽屉开合保持（2026-08-20 用户决策）：开机默认折叠只剩创建处一处，
         # 打开抽屉不再强制收起，连续点动无需反复展开。
         self.assertEqual(ui_body.count("SetMachineManualSectionVisible(false)"), 1)
+        # EXPAND 文案在构建处（初始态），COLLAPSE 只在切页 setter 里出现，
+        # 故后者对 setter_body 断言（见下）。
         self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", ui_body)
-        self.assertIn("Lang::Strings::MACHINE_MANUAL_COLLAPSE", ui_body)
+        # 标题行必须 locale-proof：en-US 下固定件（状态胶囊 + 切换 129 + 收起 96 +
+        # 3*8 间距）已占 ~324px，标题「Drawing Controls」按 SPACE_BETWEEN 排会溢出
+        # 432 成负间距并与状态胶囊重叠（lv_flex.c place_content）。标题必须 grow=1
+        # 吃余量 + DOTS 截断；grow 使 SPACE_BETWEEN 余量归零，故 header 间距要显式
+        # 给 pad_column。zh-CN HIL 装得下不代表 en-US 装得下，故按源码钉死。
+        self.assertIn("lv_obj_set_flex_grow(title, 1)", ui_body)
+        self.assertIn("lv_label_set_long_mode(title, LV_LABEL_LONG_MODE_DOTS)", ui_body)
+        self.assertIn("lv_obj_set_style_pad_column(header, theme->spacing(4), 0)", ui_body)
+        # 抽屉分页（2026-08-20 第五轮 HIL 后定案）：面板固定高、不可滚动，主操作区与
+        # 手动区互斥显示。旧实现 height=LV_SIZE_CONTENT + max_height 下超出视口的部分
+        # 被裁掉不画；阻断滚动的具体 LVGL 环节未逐一定位，但用户连续四轮实测按钮
+        # 依次丢 X/Y 十字、Y+、整段工具键，最后一轮明确「也不能滑动」——结论确定：
+        # 依赖面板滚动到达满铺按钮之外内容的方案在 480x320 上不可交付，故禁复活。
+        self.assertIn("lv_obj_set_height(panel, LV_VER_RES - theme->spacing(4))", ui_body)
+        self.assertNotIn("lv_obj_set_height(panel, LV_SIZE_CONTENT)", ui_body)
+        self.assertNotIn("lv_obj_set_style_max_height(panel", ui_body)
+        self.assertNotIn("lv_obj_set_scroll_dir(panel", ui_body)
+        self.assertNotIn("lv_obj_set_scrollbar_mode(panel", ui_body)
+        self.assertIn("lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE)", ui_body)
+        # 面板内不留任何滚动依赖：抽屉构建与切页里 scroll_to_* 一律不得复活
+        # （分页已保证可达；聊天区等其它 UI 的滚动与本抽屉无关，故只查这两段）。
+        self.assertNotIn("lv_obj_scroll_to_view_recursive(", ui_body)
+        self.assertNotIn("lv_obj_scroll_to_y(panel", ui_body)
+        setter_start = lcd_cc.index("void LcdDisplay::SetMachineManualSectionVisible")
+        setter_end = lcd_cc.index("void LcdDisplay::ApplyMachineControlState", setter_start)
+        setter_body = lcd_cc[setter_start:setter_end]
+        self.assertNotIn("lv_obj_scroll_to", setter_body)
+        # 切页 setter 必须两向都改文案，否则按钮标签与当前页脱节。
+        self.assertIn("Lang::Strings::MACHINE_MANUAL_COLLAPSE", setter_body)
+        self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", setter_body)
+        # 互斥：手动区显示则主区隐藏，反之亦然。
+        self.assertIn("machine_main_section_", lcd_h)
+        self.assertIn("lv_obj_add_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
+        self.assertIn("lv_obj_remove_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
+        self.assertIn("lv_obj_add_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
+        self.assertIn("lv_obj_remove_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
+        # 主页三行都挂在主区（不是 panel）：否则切页时它们不会跟着隐藏。
+        self.assertIn("make_row(machine_main_section_)", ui_body)
+        self.assertIn("make_button(machine_main_section_, Lang::Strings::MACHINE_STOP", ui_body)
+        # 手动页两列布局：左列点动十字（3×56 方键），右列 6 个工具键，3 行 ×56 = 184
+        # ≤ 232 可用高，无需滚动即全可见。
+        self.assertIn("LV_FLEX_FLOW_ROW", ui_body)
+        self.assertIn("const lv_coord_t jog_size = safe_button_height", ui_body)
+        self.assertIn("jog_size * 3 + theme->spacing(4) * 2", ui_body)
+        self.assertIn("content_width - jog_col_width - theme->spacing(4)", ui_body)
+        for action in ("jog_y+", "jog_x-", "home", "jog_x+", "jog_y-"):
+            self.assertIn(f'"{action}"', ui_body)
+        # 页切换钮进标题行：独占一行会吃掉 64px，主页就装不下 64+56+56 三行。
+        # 只钉「父对象是 header」这一语义，不钉 clang-format 的换行位置。
+        toggle_start = ui_body.index("machine_manual_toggle_btn_ = make_button(")
+        toggle_args = ui_body[toggle_start:ui_body.index(";", toggle_start)]
+        self.assertRegex(toggle_args, r"make_button\(\s*header,")
+        self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", toggle_args)
+        # active 态（含 streaming/paper_change）必须回主页，否则停止钮随主区一起被
+        # 隐藏，而手动键此刻全灰——屏上会一个可用键都没有。判据须是 active，用
+        # !settled 会把 manual（点动执行中）也踢回主页，点一下就跳页。
+        apply_start = lcd_cc.index("void LcdDisplay::ApplyMachineControlState")
+        apply_body = lcd_cc[apply_start:]
+        self.assertIn("if (active && machine_manual_section_ != nullptr &&", apply_body)
+        self.assertIn("SetMachineManualSectionVisible(false);", apply_body)
+        self.assertNotIn("if (!settled && machine_manual_section_", apply_body)
+
+        # taskLVGL 栈：默认 7168 装不下手动页（比主页深两级、四级 LV_SIZE_CONTENT
+        # 叠 flex），2026-08-20 实机首帧展开即 "stack overflow in task taskLVGL"
+        # + rst:0xc（elf SHA 61f8ae22e）。抬到 12288 并在切页日志带 HWM，回退到
+        # 默认或删掉 HWM 都会让这次崩溃静默复活。
+        spi_start = lcd_cc.index("SpiLcdDisplay::SpiLcdDisplay")
+        spi_body = lcd_cc[spi_start:lcd_cc.index("RgbLcdDisplay::RgbLcdDisplay", spi_start)]
+        self.assertIn("port_cfg.task_stack = 12288;", spi_body)
+        self.assertIn("lvgl stack hwm", setter_body)
+        self.assertIn("uxTaskGetStackHighWaterMark(nullptr)", setter_body)
+        self.assertIn("#include <freertos/task.h>", lcd_cc)
 
         self.assertIn("display_->ConfigureMachineControls", board)
         for request in (
@@ -1981,7 +2067,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("std::string RequestManualControl(const std::string& action);", job_h)
         self.assertIn("static void ManualTaskEntry(void* arg);", job_h)
         self.assertIn("void ManualTask();", job_h)
-        self.assertIn("bool QueryAndWaitFreshMachineState();", job_h)
+        self.assertIn("bool QueryAndWaitFreshMachineState(uint32_t timeout_ms);", job_h)
 
         entry = job_cc[job_cc.index("std::string Job::RequestManualControl"):
                        job_cc.index("void Job::ManualTaskEntry")]
@@ -2005,9 +2091,14 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn('"$J=G21G91X', task)
         # 越界判定只信 `?` 之后的新鲜有限 MPos（fail closed），再交 core 判包线；
         # 缓存坐标直读已移除（2026-08-20 安全加固，无限位机器的唯一防线）。
-        self.assertIn("QueryAndWaitFreshMachineState()", task)
+        # 预算 6s 而非流式兜底的 2s：2026-08-20 HIL 实测 MQTT goodbye 后 WiFi
+        # LOW_POWER(MAX_MODEM) 叠加 block-ack 拆链，Telnet 往返退化到 1.4~3.2s，
+        # 2s 下连点第二下必假失败「点动前未取到新鲜坐标」；超时仍 fail closed。
+        self.assertIn("kJogFreshStateTimeoutMs = 6000", job_cc)
+        self.assertIn("QueryAndWaitFreshMachineState(kJogFreshStateTimeoutMs)", task)
         self.assertLess(
-            task.index("QueryAndWaitFreshMachineState()"), task.index('"$J=G21G91X')
+            task.index("QueryAndWaitFreshMachineState(kJogFreshStateTimeoutMs)"),
+            task.index('"$J=G21G91X'),
         )
         self.assertIn("hutuji::DecideJog", task)
         self.assertIn("点动前未取到新鲜坐标", task)
@@ -2032,6 +2123,109 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 手动控制全程禁止触碰纸路机械命令（换纸职责边界不变）。
         for forbidden in ("M30", "ESP911", "ESP912", "ESP913", "M701", "M711"):
             self.assertNotIn(forbidden, task)
+
+    def test_job_holds_performance_active_set_and_reassert_period(self):
+        """射频 PERFORMANCE 持有决策与重申周期（2026-08-20 WiFi 省电抖动对策）。
+
+        active 清单必须与显示层 ApplyMachineControlState 的 active 谓词同源——两侧
+        任一改动不同步，会出现「屏上停止键可见但 WiFi 已掉回 MAX_MODEM」或反之。
+        manual 明确不持有（整个 manual 态持有会让屏常亮）；重申周期取
+        min(点动新鲜预算, 4000)，盖住实测最坏 BA 重建 3.2s 的空窗。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+
+            int main() {
+                using hutuji::JobHoldsPerformance;
+                using hutuji::PerformanceReassertPeriodMs;
+
+                // 与 lcd_display.cc active 谓词同源的 9 态全持有。
+                for (const char* s : {"streaming", "paused", "previewing",
+                                      "awaiting_confirmation", "downloading",
+                                      "verifying", "reconnecting", "paper_change",
+                                      "pen_test"}) {
+                    assert(JobHoldsPerformance(s));
+                }
+                // settled 与 manual 不持有。
+                for (const char* s : {"idle", "done", "error", "aborted", "manual"}) {
+                    assert(!JobHoldsPerformance(s));
+                }
+                // 前缀/子串不得误判（手写比较器，非 strcmp）。
+                assert(!JobHoldsPerformance("stream"));
+                assert(!JobHoldsPerformance("streamingx"));
+                assert(!JobHoldsPerformance("pause"));
+                assert(!JobHoldsPerformance(""));
+
+                // 重申周期 = min(预算, 4000)。
+                assert(PerformanceReassertPeriodMs(6000) == 4000);
+                assert(PerformanceReassertPeriodMs(4000) == 4000);
+                assert(PerformanceReassertPeriodMs(2000) == 2000);
+                assert(PerformanceReassertPeriodMs(1) == 1);
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_perf_hold_test")
+
+    def test_job_performance_hold_wiring(self):
+        """PERFORMANCE 持有接线：SetState 进出 active 开/停持有、点动窗口短时持有、
+        出窗口按 app 设备态回落（application.cc 零改动）。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(
+            encoding="utf-8"
+        )
+        job_h = (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(
+            encoding="utf-8"
+        )
+        # SetState 尾按 JobHoldsPerformance 开/停持有。
+        set_state = job_cc[
+            job_cc.index("void Job::SetState(const char* state)"): job_cc.index(
+                "void Job::StartPerformanceHold()"
+            )
+        ]
+        self.assertIn("hutuji::JobHoldsPerformance", set_state)
+        self.assertIn("StartPerformanceHold()", set_state)
+        self.assertIn("StopPerformanceHold()", set_state)
+        # 持有期幂等重申 + esp_timer 周期回调 + 立即重申一次。
+        self.assertIn("esp_timer_create", job_cc)
+        self.assertIn("esp_timer_start_periodic", job_cc)
+        self.assertIn("ReassertPerformance();", job_cc)
+        self.assertIn("SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE)", job_cc)
+        # 出窗口回落尊重 app 音频通道（listening/speaking），不盲目降。
+        self.assertIn("AppNeedsPerformance", job_cc)
+        self.assertIn("kDeviceStateListening", job_cc)
+        self.assertIn("kDeviceStateSpeaking", job_cc)
+        self.assertIn("PowerSaveLevel::LOW_POWER", job_cc)
+        # 点动新鲜坐标窗口短时持有：Start 在 `?` 之前、Stop 在 send_ok 之后。
+        task = job_cc[
+            job_cc.index("void Job::ManualTask()"): job_cc.index("std::string Job::StatusJson")
+        ]
+        self.assertLess(
+            task.index("StartPerformanceHold()"),
+            task.index("QueryAndWaitFreshMachineState(kJogFreshStateTimeoutMs)"),
+        )
+        self.assertIn("StopPerformanceHold();", task)
+        self.assertLess(
+            task.index('"$J=G21G91X'),
+            task.index("StopPerformanceHold();"),
+        )
+        # 头文件声明 + esp_timer 成员。
+        for decl in ("StartPerformanceHold", "StopPerformanceHold",
+                     "ReassertPerformance", "PerformanceTimerThunk"):
+            self.assertIn(decl, job_h)
+        self.assertIn("esp_timer_handle_t performance_timer_", job_h)
+        # 决策核在共享头里（host 可测），与显示层 active 谓词同源注释。
+        core = (ROOT / "main/boards/lichuang-dev/hutuji_recovery_core.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("JobHoldsPerformance", core)
+        self.assertIn("PerformanceReassertPeriodMs", core)
 
     def test_decide_jog_is_fail_closed_and_envelope_aligned(self):
         """点动判定 fail-closed：非有限输入一律 kStalePosition，包线恰 190/277。

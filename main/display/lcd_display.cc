@@ -17,6 +17,8 @@
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <material_symbols.h>
 #include <noto_emoji.h>
 #include <qrcode.h>
@@ -233,6 +235,14 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
 #if CONFIG_SOC_CPU_CORES_NUM > 1
     port_cfg.task_affinity = 1;
 #endif
+    // 默认 7168（esp_lvgl_port.h ESP_LVGL_PORT_INIT_CONFIG）装不下绘图机手动页：
+    // 该页嵌套比主页深两级（panel→section→body→col→row→button→label，四级
+    // LV_SIZE_CONTENT 叠在 flex 里），展开首帧的布局+绘制递归把 taskLVGL 压穿。
+    // 2026-08-20 实机证据：展开日志后紧跟 "stack overflow in task taskLVGL"、
+    // rst:0xc(RTC_SW_CPU_RST)，Backtrace 落在 vApplicationStackOverflowHook /
+    // vTaskSwitchContext（elf SHA 61f8ae22e，即 935dfbcf 构建）。抬到 12K 并在
+    // 切页日志带 HWM 作证据；不消嵌套层以免动已过 HIL 的分页两列布局。
+    port_cfg.task_stack = 12288;
     lvgl_port_init(&port_cfg);
 
     ESP_LOGI(TAG, "Adding LCD display");
@@ -654,8 +664,12 @@ void LcdDisplay::HideDrawPreview() {
 }
 
 namespace {
-// 6px 只区分点按与拖动；位置从首个采样起跟手，越过阈值时不会丢掉起步位移。
-constexpr lv_coord_t kTriggerDragThresholdPx = 6;
+// 24px 区分点按与拖动：FT5x06 灵敏化调参（threshold 70→40）后，静止按压的单轴
+// 抖动可达数 px，6px 曼哈顿阈值在 2026-08-20 HIL 实测中把正常点按误判成拖动、
+// 抽屉几乎打不开；24px 远高于抖动、仍远低于有意拖动的起步位移，且触发钮不参与
+// LVGL 滚动判定（SCROLLABLE/CHAIN 均关），放宽不与任何手势歧义。
+// 位置从首个采样起跟手，越过阈值时不会丢掉起步位移。
+constexpr lv_coord_t kTriggerDragThresholdPx = 24;
 }  // namespace
 
 void LcdDisplay::EnsureMachineControlUi() {
@@ -710,14 +724,18 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_clear_flag(machine_control_root_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_CLICKABLE);
 
-    // 面板 448 宽、内容高、最高贴屏内边；展开调试后允许面板内部垂直滚动。
+    // 面板 448 宽、固定高（不留滚动依赖）。原实现 height=LV_SIZE_CONTENT + max_height
+    // (LV_VER_RES-8) 下，超出视口的部分被裁掉不画；2026-08-20 连续四轮 HIL 实测按钮
+    // 依次丢 X/Y 十字、Y+、乃至手动区整段工具键，用户「也不能滑动」——拖不出被裁
+    // 内容。具体阻断滚动的 LVGL 环节未逐一定位，不据此断言机制；但结论是确定的：
+    // 任何依赖「面板滚动到达满铺按钮之外内容」的方案在 480x320 上不可交付。改为固定
+    // 高 + 主操作区/手动区互斥切页，每页都塞得进视口，彻底不靠滚动到达任何按钮。
     const lv_coord_t panel_width = LV_HOR_RES - theme->spacing(16);
     const lv_coord_t content_width = panel_width - theme->spacing(8);
     const lv_coord_t half_width = (content_width - theme->spacing(4)) / 2;
     lv_obj_t* panel = lv_obj_create(machine_control_root_);
     lv_obj_set_width(panel, panel_width);
-    lv_obj_set_height(panel, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_height(panel, LV_VER_RES - theme->spacing(4), 0);
+    lv_obj_set_height(panel, LV_VER_RES - theme->spacing(4));
     lv_obj_align(panel, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(panel, 24, 0);
     lv_obj_set_style_border_width(panel, 1, 0);
@@ -731,8 +749,9 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_set_style_pad_row(panel, theme->spacing(4), 0);
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_scroll_dir(panel, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
+    // 面板不滚动：分页保证每页都装得下，滚动条与滚动方向一并去掉，避免留下
+    // 「看起来能滑」的假象（2026-08-20 用户实测「也不能滑动」即源于此）。
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
     auto make_row = [&](lv_obj_t* parent) {
         lv_obj_t* row = lv_obj_create(parent);
@@ -750,6 +769,8 @@ void LcdDisplay::EnsureMachineControlUi() {
                            lv_color_t text_color, lv_coord_t width, lv_coord_t height,
                            lv_obj_t** label_out = nullptr) {
         lv_obj_t* btn = lv_button_create(parent);
+        // 面板已分页且不可滚动，按钮无需清 SCROLL_CHAIN；点按防误触靠板级 24px
+        // indev 滚动阈值（esp32-s3-touch-lcd-3.5.cc InitializeTouch），抖动不误判。
         lv_obj_set_size(btn, width, height);
         lv_obj_set_style_radius(btn, 18, 0);
         lv_obj_set_style_bg_color(btn, color, 0);
@@ -768,10 +789,21 @@ void LcdDisplay::EnsureMachineControlUi() {
         return btn;
     };
 
-    // 标题行：抽屉名 + 当前机器状态 + 收起，一眼看清“我在哪、机器在干嘛”。
+    // 标题行：抽屉名 + 机器状态 + 页切换 + 收起。切换钮放在标题行而不是独占一行：
+    // 面板内高只有 296px（312 - pad 2*8），独占一行要吃掉 64px，主页就装不下
+    // 暂停/继续(64) + 再画一张/试试笔(56) + 停止(56)。
     lv_obj_t* header = make_row(panel);
+    // 标题吃掉全部余量并在放不下时打点号：固定件（状态胶囊 + 切换 129 + 收起 96
+    // + 3 个 8px 间距）在 en-US 下已占 ~324px，标题「Drawing Controls」按 432 的
+    // SPACE_BETWEEN 排会溢出成负间距、与胶囊重叠（lv_flex.c:606 place_content）。
+    // 给标题 flex_grow=1 后 track 恒等于 432、余量归标题，min_width 默认 0 使最坏
+    // 情况是标题被压到 0 而非任何控件重叠；grow 让 SPACE_BETWEEN 余量归零，故间距
+    // 改由 pad_column 显式给（其余行无 grow，仍靠 SPACE_BETWEEN，不受影响）。
+    lv_obj_set_style_pad_column(header, theme->spacing(4), 0);
     lv_obj_t* title = lv_label_create(header);
     lv_label_set_text(title, Lang::Strings::MACHINE_DRAWER_TITLE);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_flex_grow(title, 1);
     lv_obj_set_style_text_color(title, theme->text_color(), 0);
     machine_state_label_ = lv_label_create(header);
     lv_label_set_text(machine_state_label_, "");
@@ -782,13 +814,29 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_set_style_pad_right(machine_state_label_, theme->spacing(3), 0);
     lv_obj_set_style_pad_top(machine_state_label_, theme->spacing(1), 0);
     lv_obj_set_style_pad_bottom(machine_state_label_, theme->spacing(1), 0);
+    // 「点动·手动」与主操作区互斥切页：孩子看到的是创作面板，点动/复位等工具
+    // 一键切过去，切回来一键回主页。不做同屏堆叠——堆叠必然溢出面板。
+    machine_manual_toggle_btn_ = make_button(
+        header, Lang::Strings::MACHINE_MANUAL_EXPAND, theme->assistant_bubble_color(),
+        theme->text_color(), LV_HOR_RES * 27 / 100, safe_button_height,
+        &machine_manual_toggle_label_);
     machine_close_btn_ =
         make_button(header, Lang::Strings::MACHINE_CLOSE, theme->assistant_bubble_color(),
                     theme->text_color(), LV_HOR_RES / 5, safe_button_height);
 
+    // ── 主页：暂停/继续 + 再画一张/试试笔 + 停止（56+8+56+8+64 = 192 ≤ 232）──
+    machine_main_section_ = lv_obj_create(panel);
+    lv_obj_remove_style_all(machine_main_section_);
+    lv_obj_set_size(machine_main_section_, content_width, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(machine_main_section_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(machine_main_section_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(machine_main_section_, theme->spacing(4), 0);
+    lv_obj_clear_flag(machine_main_section_, LV_OBJ_FLAG_SCROLLABLE);
+
     // 主操作行：暂停/继续同位二选一，Job 状态保证任一时刻只有一个可用；
     // 可用者保持实心高亮，即当前唯一主动作。
-    lv_obj_t* primary_row = make_row(panel);
+    lv_obj_t* primary_row = make_row(machine_main_section_);
     machine_pause_btn_ =
         make_button(primary_row, Lang::Strings::MACHINE_PAUSE, theme->warning_color(),
                     lv_color_hex(0x14110A), half_width, primary_height);
@@ -797,7 +845,7 @@ void LcdDisplay::EnsureMachineControlUi() {
                     lv_color_hex(0x071510), half_width, primary_height);
 
     // 次级行：再画一张/试试笔，仅结束态可用。
-    lv_obj_t* secondary_row = make_row(panel);
+    lv_obj_t* secondary_row = make_row(machine_main_section_);
     machine_repeat_btn_ =
         make_button(secondary_row, Lang::Strings::MACHINE_REPEAT, theme->accent_color(),
                     theme->accent_text_color(), half_width, safe_button_height);
@@ -806,14 +854,13 @@ void LcdDisplay::EnsureMachineControlUi() {
                     lv_color_white(), half_width, safe_button_height);
 
     // 停止：危险动作独占末行，红色实心作语义警示，不与主操作行争视觉重心。
-    machine_abort_btn_ = make_button(panel, Lang::Strings::MACHINE_STOP, theme->danger_color(),
-                                     lv_color_white(), content_width, safe_button_height);
+    machine_abort_btn_ =
+        make_button(machine_main_section_, Lang::Strings::MACHINE_STOP, theme->danger_color(),
+                    lv_color_white(), content_width, safe_button_height);
 
-    // 「点动·手动」默认折叠：孩子看到的是创作面板，点动/复位等工具仍在但不做主界面噪音。
-    machine_manual_toggle_btn_ = make_button(
-        panel, Lang::Strings::MACHINE_MANUAL_EXPAND, theme->assistant_bubble_color(),
-        theme->text_color(), content_width, safe_button_height, &machine_manual_toggle_label_);
-
+    // ── 手动页：左列点动十字 + 右列六个工具键，3 行 ×56 + 2 间距 = 184 ≤ 232 ──
+    // 单列纵排（旧实现）共 6 行 336px，必然溢出面板；面板又不可滚（见上方固定高
+    // 注释），2026-08-20 四轮 HIL 因此依次丢 X/Y 十字、Y+、乃至整段工具键。
     machine_manual_section_ = lv_obj_create(panel);
     lv_obj_remove_style_all(machine_manual_section_);
     lv_obj_set_size(machine_manual_section_, content_width, LV_SIZE_CONTENT);
@@ -823,14 +870,36 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_set_style_pad_row(machine_manual_section_, theme->spacing(3), 0);
     lv_obj_clear_flag(machine_manual_section_, LV_OBJ_FLAG_SCROLLABLE);
 
-    // ── 手动调试区（2026-08-18 用户决策全量开放；命令逐字对齐奎享实测序列）──
     // 动作不经 drawer 收起：点动/抬落笔需要连续操作。可用性统一由
     // ApplyMachineControlState 按 settled 态门控。
     lv_obj_t* manual_label = lv_label_create(machine_manual_section_);
     lv_label_set_text(manual_label, Lang::Strings::MACHINE_MANUAL_SECTION);
     lv_obj_set_style_text_color(manual_label, theme->muted_text_color(), 0);
 
-    const lv_coord_t third_width = (content_width - theme->spacing(8)) / 3;
+    // 双列容器：标题 24 + 间距 6 + 3 行 ×56 + 2 间距 ×8 = 214 ≤ 232 可用高。
+    lv_obj_t* manual_body = lv_obj_create(machine_manual_section_);
+    lv_obj_remove_style_all(manual_body);
+    lv_obj_set_size(manual_body, content_width, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(manual_body, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(manual_body, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(manual_body, LV_OBJ_FLAG_SCROLLABLE);
+
+    const lv_coord_t jog_size = safe_button_height;
+    const lv_coord_t jog_col_width = jog_size * 3 + theme->spacing(4) * 2;
+    const lv_coord_t tool_col_width = content_width - jog_col_width - theme->spacing(4);
+    const lv_coord_t tool_width = (tool_col_width - theme->spacing(4)) / 2;
+    auto make_col = [&](lv_coord_t width) {
+        lv_obj_t* col = lv_obj_create(manual_body);
+        lv_obj_remove_style_all(col);
+        lv_obj_set_size(col, width, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(col, theme->spacing(4), 0);
+        lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+        return col;
+    };
     auto make_manual = [&](lv_obj_t* parent, const char* text, lv_color_t color,
                            lv_color_t text_color, lv_coord_t width, const char* action) {
         lv_obj_t* btn = make_button(parent, text, color, text_color, width, safe_button_height);
@@ -839,42 +908,51 @@ void LcdDisplay::EnsureMachineControlUi() {
         return btn;
     };
 
-    lv_obj_t* pen_row = make_row(machine_manual_section_);
-    make_manual(pen_row, Lang::Strings::MACHINE_PEN_UP, theme->accent_color(),
-                theme->accent_text_color(), half_width, "pen_up");
-    make_manual(pen_row, Lang::Strings::MACHINE_PEN_DOWN, theme->accent_color(),
-                theme->accent_text_color(), half_width, "pen_down");
-
     // 点动十字（对齐奎享面板）：Y+ 居上，X-/回原点/X+ 居中行，Y- 居下。
-    lv_obj_t* jog_up_row = make_row(machine_manual_section_);
+    lv_obj_t* jog_col = make_col(jog_col_width);
+    lv_obj_t* jog_up_row = make_row(jog_col);
+    lv_obj_set_width(jog_up_row, jog_col_width);
     lv_obj_set_flex_align(jog_up_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
     make_manual(jog_up_row, Lang::Strings::MACHINE_JOG_YP, theme->assistant_bubble_color(),
-                theme->text_color(), third_width, "jog_y+");
-    lv_obj_t* jog_mid_row = make_row(machine_manual_section_);
+                theme->text_color(), jog_size, "jog_y+");
+    lv_obj_t* jog_mid_row = make_row(jog_col);
+    lv_obj_set_width(jog_mid_row, jog_col_width);
     make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XM, theme->assistant_bubble_color(),
-                theme->text_color(), third_width, "jog_x-");
+                theme->text_color(), jog_size, "jog_x-");
     make_manual(jog_mid_row, Lang::Strings::MACHINE_HOME, theme->success_color(),
-                lv_color_hex(0x071510), third_width, "home");
+                lv_color_hex(0x071510), jog_size, "home");
     make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XP, theme->assistant_bubble_color(),
-                theme->text_color(), third_width, "jog_x+");
-    lv_obj_t* jog_down_row = make_row(machine_manual_section_);
+                theme->text_color(), jog_size, "jog_x+");
+    lv_obj_t* jog_down_row = make_row(jog_col);
+    lv_obj_set_width(jog_down_row, jog_col_width);
     lv_obj_set_flex_align(jog_down_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
     make_manual(jog_down_row, Lang::Strings::MACHINE_JOG_YM, theme->assistant_bubble_color(),
-                theme->text_color(), third_width, "jog_y-");
+                theme->text_color(), jog_size, "jog_y-");
 
-    lv_obj_t* origin_row = make_row(machine_manual_section_);
+    // 右列六个工具键：抬笔/落笔、设置原点/解除警报、关闭电机/复位。
+    lv_obj_t* tool_col = make_col(tool_col_width);
+    lv_obj_t* pen_row = make_row(tool_col);
+    lv_obj_set_width(pen_row, tool_col_width);
+    make_manual(pen_row, Lang::Strings::MACHINE_PEN_UP, theme->accent_color(),
+                theme->accent_text_color(), tool_width, "pen_up");
+    make_manual(pen_row, Lang::Strings::MACHINE_PEN_DOWN, theme->accent_color(),
+                theme->accent_text_color(), tool_width, "pen_down");
+
+    lv_obj_t* origin_row = make_row(tool_col);
+    lv_obj_set_width(origin_row, tool_col_width);
     make_manual(origin_row, Lang::Strings::MACHINE_SET_ORIGIN, theme->warning_color(),
-                lv_color_hex(0x14110A), half_width, "set_origin");
+                lv_color_hex(0x14110A), tool_width, "set_origin");
     make_manual(origin_row, Lang::Strings::MACHINE_UNLOCK, theme->assistant_bubble_color(),
-                theme->text_color(), half_width, "unlock");
+                theme->text_color(), tool_width, "unlock");
 
-    lv_obj_t* power_row = make_row(machine_manual_section_);
+    lv_obj_t* power_row = make_row(tool_col);
+    lv_obj_set_width(power_row, tool_col_width);
     make_manual(power_row, Lang::Strings::MACHINE_MOTOR_OFF, theme->assistant_bubble_color(),
-                theme->text_color(), half_width, "motor_off");
+                theme->text_color(), tool_width, "motor_off");
     make_manual(power_row, Lang::Strings::MACHINE_RESET, theme->danger_color(), lv_color_white(),
-                half_width, "reset");
+                tool_width, "reset");
     SetMachineManualSectionVisible(false);
 
     // 触发钮用“按下触点 + 按下时按钮位置”计算绝对位移：不累积采样误差，
@@ -946,8 +1024,11 @@ void LcdDisplay::EnsureMachineControlUi() {
     // 面板可垂直滚动（:734），面板内按钮一律 CLICKED 而非 PRESSED：从按钮上起手、
     // 随后拖成滚动时，LVGL 对被滚对象只发 PRESS_LOST、释放时不发 CLICKED
     // （lv_indev.c release 分支 `scroll_obj == NULL` 才发 CLICKED），天然过滤滚动
-    // 误触；PRESSED 在按下瞬间即发，从 reset/set_origin 上起手滚屏会误触发
-    // （2026-08-20 用户取证后修复）。
+    // 误触。静止按压的抖动不被误判成滚动，靠板级 24px 滚动阈值兜底
+    // （esp32-s3-touch-lcd-3.5.cc InitializeTouch；LVGL 默认 10px 太小，
+    // 2026-08-20 HIL 坐实 CLICKED 被吃）。断 SCROLL_CHAIN 的反方案因按钮铺满行、
+    // 面板无处起手滚动，被同日第三轮 HIL 否决。PRESSED 在按下瞬间即发，从
+    // reset/set_origin 上起手滚屏会误触发（2026-08-20 用户取证后修复）。
     lv_obj_add_event_cb(
         machine_manual_toggle_btn_,
         [](lv_event_t* e) {
@@ -1039,13 +1120,25 @@ void LcdDisplay::SetMachineManualSectionVisible(bool visible) {
     if (machine_manual_section_ == nullptr || machine_manual_toggle_label_ == nullptr) {
         return;
     }
+    // 互斥切页而非同屏展开：面板高度固定、不可滚动，两区同屏必然把按钮挤出可视区。
     if (visible) {
         lv_obj_remove_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(machine_manual_toggle_label_, Lang::Strings::MACHINE_MANUAL_COLLAPSE);
+        if (machine_main_section_ != nullptr) {
+            lv_obj_add_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN);
+        }
     } else {
         lv_obj_add_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(machine_manual_toggle_label_, Lang::Strings::MACHINE_MANUAL_EXPAND);
+        if (machine_main_section_ != nullptr) {
+            lv_obj_remove_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
+    // 展开/收起无其他日志面，HIL 取证需要区分「CLICKED 没发」与「发了但别的环节断」。
+    // 顺带记 taskLVGL 历史最深空闲栈（HWM 单调只减，此刻读到的是手动页布局+绘制
+    // 全程峰值余量）：证据化 12288 抬栈后手动页是否仍贴底，防止它静默回压穿。
+    ESP_LOGI(TAG, "machine manual section %s, lvgl stack hwm %u", visible ? "expanded" : "collapsed",
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
 void LcdDisplay::ApplyMachineControlState() {
@@ -1076,6 +1169,14 @@ void LcdDisplay::ApplyMachineControlState() {
     // 手动调试按钮（含复位/设置原点等高危项）仅 settled 态可用；manual 态自身也灰。
     for (lv_obj_t* btn : machine_manual_buttons_) {
         set_enabled(btn, settled);
+    }
+    // active 态强制回主页：停止钮挂在主区，手动页显示时它被一并隐藏，而手动页的按钮
+    // 此刻又全灰——真在画/换纸时停留在手动页等于「屏上没有停止键、也没有任何可用键」。
+    // 判据用 active 而非 !settled：manual 态正是点动执行中，那时必须留在手动页。
+    // 切页钮在标题行常驻，用户随时可切回来。
+    if (active && machine_manual_section_ != nullptr &&
+        !lv_obj_has_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN)) {
+        SetMachineManualSectionVisible(false);
     }
 
     // 标题行状态灯：文案走 locale，颜色复用按钮语义色（进行中=琥珀、

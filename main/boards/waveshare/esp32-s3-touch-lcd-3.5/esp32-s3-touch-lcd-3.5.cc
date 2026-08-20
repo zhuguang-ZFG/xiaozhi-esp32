@@ -354,6 +354,13 @@ private:
         };
         lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);
         if (touch_indev != nullptr) {
+            // 本板 FT5x06 阈值已调敏（上方 70->40），静止按压抖动超过 LVGL 默认 10px
+            // 滚动阈值（LV_INDEV_DEF_SCROLL_LIMIT，lv_indev.c:1375 越限即 PRESS_LOST）：
+            // 点按被误判成拖动、CLICKED 全数被吃（2026-08-20 HIL 坐实：绘图机抽屉
+            // 展开态按钮几乎全哑）。提到 24px 与抽屉触发钮点按阈值（lcd_display.cc
+            // kTriggerDragThresholdPx）同量级：抖动不触发滚动，明确拖动仍可经
+            // SCROLL_CHAIN 滚面板。断 chain 的替代方案会让面板无处起手滚动，已否决。
+            lv_indev_set_scroll_limit(touch_indev, 24);
             lv_indev_add_event_cb(
                 touch_indev,
                 [](lv_event_t* event) {

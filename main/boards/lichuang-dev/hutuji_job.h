@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <esp_timer.h>
 #include <vector>
 
 namespace hutuji {
@@ -103,7 +104,7 @@ private:
      * 点动越界判定与 ConfirmInFlightDoneByStatus 共用——`$10=WPos`/NaN/Inf 只推进
      * 通用状态序号，缓存坐标未经本函数刷新不得冒充当前位置（fail closed）。
      */
-    bool QueryAndWaitFreshMachineState();
+    bool QueryAndWaitFreshMachineState(uint32_t timeout_ms);
     /** 正常页尾专有：G1 归位（不触发换纸），随后才允许 ChangePaperAfterDraw。 */
     bool ReturnHomeAfterDraw();
     bool ChangePaperAfterDraw();
@@ -112,6 +113,15 @@ private:
     void SetState(const char* state);
     /** 按 paused_ 真值写 streaming/paused，避免状态谎报。 */
     void SetStreamingOrPaused();
+    /**
+     * 射频 PERFORMANCE 持有（2026-08-20）：active 态/点动新鲜坐标窗口把 WiFi 钉在
+     * PERFORMANCE，盖住音频通道关闭后 LOW_POWER(MAX_MODEM)+BA 拆链造成的 Telnet
+     * 假超时（实测 1440ms/3200ms）。窗口结束按 app 音频通道是否仍开回落。
+     */
+    void StartPerformanceHold();
+    void StopPerformanceHold();
+    void ReassertPerformance();
+    static void PerformanceTimerThunk(void* arg);
     void Notify(const std::string& message);
 
     static uint32_t Crc32Ieee(const uint8_t* data, size_t len);
@@ -194,6 +204,11 @@ private:
     std::atomic<bool> buffer_replayable_{false};
     // 试笔期间不接受暂停/恢复；abort 只置标志，不并发 reset 抢占 Z 运动应答。
     std::atomic<bool> pen_test_active_{false};
+    // 射频 PERFORMANCE 持有：timer 由 StartPerformanceHold 惰性创建，StopPerformanceHold
+    // 停止；hold_active_ 防止重复创建/双重回落。timer 回调仅在 esp_timer 任务线程跑，
+    // 与任务线程的 SetState 不共享该标志的写路径外的状态。
+    esp_timer_handle_t performance_timer_ = nullptr;
+    bool performance_hold_active_ = false;
 
     bool stream_disconnected_ = false;
     // R21-F01：换纸播报一次性门控（多页连续换纸行不重复打扰）；仅任务线程读写。

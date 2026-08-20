@@ -49,6 +49,13 @@ constexpr uint32_t kPenOriginIdleTimeoutMs = 5000;
 // 等 ok 超时后的状态兜底探测：只要一份新状态报告，2s 足够（`?` 是实时命令，
 // 不排 planner 队列）。
 constexpr uint32_t kOkFallbackIdleTimeoutMs = 2000;
+// 交互点动前的新鲜坐标预算：与流式兜底分开，因为它落在用户连点的路径上。
+// 2026-08-20 HIL 实测：MQTT goodbye 后 WiFi 重设 LOW_POWER(MAX_MODEM) 叠加
+// block-ack 拆链重建（`wifi:[ADDBA] RX DELBA, reason:39`）时，Telnet 往返从常
+// 态 20~70ms 退化到 1440ms（`?` 回包）与 3200ms（`ok`），2s 预算下连点第二下必
+// 假失败「点动前未取到新鲜坐标」。6s 覆盖实测最坏 3.2s 仍有裕量；越界判定与
+// 限幅不变，超时依旧 fail closed（宁可拒动，不拿旧坐标放行运动）。
+constexpr uint32_t kJogFreshStateTimeoutMs = 6000;
 // 兜底次数上限。Telnet 偶发吃 ok 每页最多出现个别次；真丢行/真卡死必须暴露成
 // 失败，不能被兜底无限掩盖。
 constexpr int kMaxOkFallback = 3;
@@ -100,6 +107,76 @@ void Job::SetState(const char* state) {
         display->UpdateMachineControlState(state_snapshot);
     }
     ESP_LOGI(TAG, "job state=%s", state_snapshot.c_str());
+    // 射频 PERFORMANCE 持有：进 active 态开持有（钉 WIFI_PS_NONE），出 active 态
+    // 按 app 音频通道是否仍开回落。判定走 hutuji::JobHoldsPerformance（与显示层
+    // active 谓词同源）。manual 不在其中，点动窗口由 ManualTask 单独短时持有。
+    if (hutuji::JobHoldsPerformance(state_snapshot.c_str())) {
+        StartPerformanceHold();
+    } else {
+        StopPerformanceHold();
+    }
+}
+
+
+namespace {
+// app 侧是否仍需要 PERFORMANCE：音频通道开时设备处于 listening/speaking。
+// Application 不直接暴露 IsAudioChannelOpened（在私有 protocol_ 上），用设备态等价。
+bool AppNeedsPerformance() {
+    const DeviceState s = Application::GetInstance().GetDeviceState();
+    return s == kDeviceStateListening || s == kDeviceStateSpeaking;
+}
+}  // namespace
+void Job::StartPerformanceHold() {
+    if (performance_hold_active_) {
+        return;
+    }
+    performance_hold_active_ = true;
+    if (performance_timer_ == nullptr) {
+        const esp_timer_create_args_t args = {
+            .callback = &Job::PerformanceTimerThunk,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "hutuji_perf",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &performance_timer_) != ESP_OK) {
+            performance_timer_ = nullptr;
+        }
+    }
+    // 立即重申一次（不等首个周期），尽快退出 MAX_MODEM。
+    ReassertPerformance();
+    if (performance_timer_ != nullptr) {
+        const uint32_t period_ms =
+            hutuji::PerformanceReassertPeriodMs(kJogFreshStateTimeoutMs);
+        esp_timer_start_periodic(performance_timer_, (uint64_t)period_ms * 1000ULL);
+    }
+}
+
+void Job::StopPerformanceHold() {
+    if (!performance_hold_active_) {
+        return;
+    }
+    performance_hold_active_ = false;
+    if (performance_timer_ != nullptr) {
+        esp_timer_stop(performance_timer_);
+    }
+    // 交还控制权给 app：语音音频通道仍开时 app 需要 PERFORMANCE，否则回到 LOW_POWER
+    // （与 application.cc 的就绪/音频关回调同口径）。此调用本身幂等。
+    Board::GetInstance().SetPowerSaveLevel(AppNeedsPerformance()
+                                               ? PowerSaveLevel::PERFORMANCE
+                                               : PowerSaveLevel::LOW_POWER);
+}
+
+void Job::ReassertPerformance() {
+    // 幂等重申：OnAudioChannelClosed 会单向把省电踩回 LOW_POWER，故持有期按周期重申。
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+}
+
+void Job::PerformanceTimerThunk(void* arg) {
+    auto* self = static_cast<Job*>(arg);
+    if (self->performance_hold_active_) {
+        self->ReassertPerformance();
+    }
 }
 
 void Job::Notify(const std::string& message) {
@@ -818,7 +895,11 @@ void Job::ManualTask() {
         // 机器无限位开关，新鲜 MPos + 越界判定是点动的唯一防线（限幅与云端 §5 同源）。
         // 缓存坐标先经 `?` 新鲜读确认：$10=WPos/断连期的旧坐标不得放行运动（fail closed）。
         float mx = 0, my = 0, mz = 0;
-        if (!QueryAndWaitFreshMachineState()) {
+        // 点动新鲜坐标正是 LOW_POWER 抖动的实测受害者（音频已关、机器 idle）。短时
+        // 持有 PERFORMANCE 覆盖「取坐标 → 判界 → 发 $J → 等 Idle」整段；窗口几百 ms~
+        // 几秒，无需周期重申，背光被拉亮这一下属可接受代价。出窗口立即按 app 态回落。
+        StartPerformanceHold();
+        if (!QueryAndWaitFreshMachineState(kJogFreshStateTimeoutMs)) {
             ok = false;
             failed_step = "点动前未取到新鲜坐标";
         } else {
@@ -833,6 +914,7 @@ void Job::ManualTask() {
                 ok = send_ok(line, "点动") && WaitForIdle(false, kPenOriginIdleTimeoutMs);
             }
         }
+        StopPerformanceHold();
     } else if (action == "home") {
         // G1 落 (0,0) 不触发换纸（页尾归位同款语义）；homing 指令与 G0 一律禁止——
         // 无限位时 homing 全速撞死点，G0 X0Y0 会触发自动换纸。
@@ -1547,7 +1629,7 @@ bool Job::PreparePenOrigin() {
     return false;
 }
 
-bool Job::QueryAndWaitFreshMachineState() {
+bool Job::QueryAndWaitFreshMachineState(uint32_t timeout_ms) {
     auto& pipe = Pipe::GetInstance();
     if (!pipe.IsConnected() || !pipe.IsReady()) {
         return false;
@@ -1562,7 +1644,7 @@ bool Job::QueryAndWaitFreshMachineState() {
     const TickType_t began = xTaskGetTickCount();
     while (pipe.GetStatusReportSequence() == status_seq ||
            pipe.GetMposReportSequence() == mpos_seq) {
-        if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(kOkFallbackIdleTimeoutMs)) {
+        if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(timeout_ms)) {
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -1580,7 +1662,7 @@ bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t
         return false;
     }
 
-    if (!QueryAndWaitFreshMachineState()) {
+    if (!QueryAndWaitFreshMachineState(kOkFallbackIdleTimeoutMs)) {
         return false;
     }
     if (pipe.GetGrblState() != GrblState::Idle) {
