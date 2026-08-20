@@ -822,7 +822,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("quiesce_for_abort()", between)
 
     def test_status_position_requires_finite_fresh_mpos(self):
-        """P1：NaN/Inf 与只含 WPos 的 fresh status 都不能成为丢 ok 的位置证据。"""
+        """P1：NaN/Inf 与只含 WPos 的 fresh status 都不能成为丢 ok 的位置证据。
+
+        新鲜读协议 2026-08-20 起抽成 `QueryAndWaitFreshMachineState`（点动越界判定
+        同款前置），丢 ok 兜底只认对它的调用。"""
         compiler = find_compiler()
         if compiler is None:
             self.skipTest("no supported host C++ compiler found")
@@ -854,11 +857,15 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
         self.assertIn("GetMposReportSequence", pipe_h)
         self.assertIn("mpos_report_seq_.fetch_add(1)", pipe_cc)
+        fresh_start = job_cc.index("bool Job::QueryAndWaitFreshMachineState")
+        fresh_end = job_cc.index("bool Job::ConfirmInFlightDoneByStatus", fresh_start)
+        fresh = job_cc[fresh_start:fresh_end]
+        self.assertIn("GetMposReportSequence", fresh)
+        self.assertIn("mpos_seq", fresh)
         fallback_start = job_cc.index("bool Job::ConfirmInFlightDoneByStatus")
         fallback_end = job_cc.index("bool Job::WaitForIdle", fallback_start)
         fallback = job_cc[fallback_start:fallback_end]
-        self.assertIn("GetMposReportSequence", fallback)
-        self.assertIn("mpos_seq", fallback)
+        self.assertIn("QueryAndWaitFreshMachineState()", fallback)
 
     def test_open_hotspot_wifi_qr_payload_escapes_ssid(self):
         """二维码 payload 按 ZXing 规则转义，LCD 共享覆盖层覆盖两块板。"""
@@ -1872,8 +1879,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # disabled 用填充色差异（灰底）表达，不靠低对比文字。
         self.assertIn("LV_STATE_DISABLED", ui_body)
         self.assertIn("machine controls opened", ui_body)
-        self.assertNotIn("LV_EVENT_CLICKED", ui_body)
-        self.assertGreaterEqual(ui_body.count("LV_EVENT_PRESSED"), 8)
+        # 面板内按钮一律 CLICKED：从按钮起手拖成滚动时 LVGL 只发 PRESS_LOST、
+        # 释放时不发 CLICKED（lv_indev.c release 分支 `scroll_obj == NULL` 才发），
+        # reset/set_origin 等高危键天然免疫滚动误触（2026-08-20 修复）；本抽屉
+        # 不再注册任何 PRESSED 回调（触发钮走 LV_EVENT_ALL，不算）。
+        self.assertEqual(ui_body.count("LV_EVENT_PRESSED, this)"), 0)
+        self.assertGreaterEqual(ui_body.count("LV_EVENT_CLICKED, this)"), 8)
         self.assertIn("LV_OBJ_FLAG_HIDDEN", ui_body)
         self.assertIn("lv_screen_active()", ui_body)
         self.assertGreaterEqual(lcd_cc.count("lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN)"), 2)
@@ -1881,6 +1892,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("machine_manual_toggle_btn_", ui_body)
         self.assertIn("SetMachineManualSectionVisible(false)", ui_body)
         self.assertIn("SetMachineManualSectionVisible(", ui_body)
+        # 展开态跨抽屉开合保持（2026-08-20 用户决策）：开机默认折叠只剩创建处一处，
+        # 打开抽屉不再强制收起，连续点动无需反复展开。
+        self.assertEqual(ui_body.count("SetMachineManualSectionVisible(false)"), 1)
         self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", ui_body)
         self.assertIn("Lang::Strings::MACHINE_MANUAL_COLLAPSE", ui_body)
 
@@ -1949,6 +1963,15 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             for key in keys:
                 self.assertIn(key, strings, f"{locale} missing {key}")
                 self.assertTrue(strings[key].strip(), f"{locale} {key} empty")
+        # 展开文案点名点动（2026-08-20 可发现性决策）：不再用「高级调试」藏功能。
+        zh = json.loads(
+            (ROOT / "main/assets/locales/zh-CN/language.json").read_text(encoding="utf-8")
+        )["strings"]
+        en = json.loads(
+            (ROOT / "main/assets/locales/en-US/language.json").read_text(encoding="utf-8")
+        )["strings"]
+        self.assertIn("点动", zh["MACHINE_MANUAL_EXPAND"])
+        self.assertIn("Jog", en["MACHINE_MANUAL_EXPAND"])
 
     def test_manual_control_entry_is_gated_and_kx_aligned(self):
         """手动调试动作经 Job 统一入口：settled 态门控、独立任务执行、
@@ -1958,6 +1981,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("std::string RequestManualControl(const std::string& action);", job_h)
         self.assertIn("static void ManualTaskEntry(void* arg);", job_h)
         self.assertIn("void ManualTask();", job_h)
+        self.assertIn("bool QueryAndWaitFreshMachineState();", job_h)
 
         entry = job_cc[job_cc.index("std::string Job::RequestManualControl"):
                        job_cc.index("void Job::ManualTaskEntry")]
@@ -1979,9 +2003,20 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn('"G1G90 Z0.0F10000"', task)
         # 点动逐字对齐奎享 `$J=G21G91X1.0Y0.0Z0.0F8000.0` 格式，四方向参数化。
         self.assertIn('"$J=G21G91X', task)
-        self.assertIn("GetMachinePos", task)
-        self.assertIn("190", task)
-        self.assertIn("277", task)
+        # 越界判定只信 `?` 之后的新鲜有限 MPos（fail closed），再交 core 判包线；
+        # 缓存坐标直读已移除（2026-08-20 安全加固，无限位机器的唯一防线）。
+        self.assertIn("QueryAndWaitFreshMachineState()", task)
+        self.assertLess(
+            task.index("QueryAndWaitFreshMachineState()"), task.index('"$J=G21G91X')
+        )
+        self.assertIn("hutuji::DecideJog", task)
+        self.assertIn("点动前未取到新鲜坐标", task)
+        core = (ROOT / "main/boards/lichuang-dev/hutuji_recovery_core.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("kJogEnvelopeMaxXMm = 190.0f", core)
+        self.assertIn("kJogEnvelopeMaxYMm = 277.0f", core)
+        self.assertIn("kJogStepMm = 1.0f", core)
         # 回原点和设原点：G1 归位（不触发换纸），G92 三轴声明对齐奎享。
         self.assertIn('"G1G90 X0Y0F8000"', task)
         self.assertIn('"G92 X0.0 Y0.0 Z0"', task)
@@ -1997,6 +2032,51 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 手动控制全程禁止触碰纸路机械命令（换纸职责边界不变）。
         for forbidden in ("M30", "ESP911", "ESP912", "ESP913", "M701", "M711"):
             self.assertNotIn(forbidden, task)
+
+    def test_decide_jog_is_fail_closed_and_envelope_aligned(self):
+        """点动判定 fail-closed：非有限输入一律 kStalePosition，包线恰 190/277。
+
+        写字机无限位开关，新鲜 MPos + `DecideJog` 是点动唯一防线；包线与云端
+        `protocol.md` §5 限幅同源（X≤190 / Y≤277mm），漂移即撞机风险。目标点
+        恰贴包线合法（云端校验器同口径取等号），越出 1mm 步进即拒。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include <cassert>
+            #include <cmath>
+            #include <limits>
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            int main() {
+                using namespace hutuji;
+                // 包线内与恰贴包线：放行。
+                assert(DecideJog(0.0f, 0.0f, kJogStepMm, 0.0f) == JogVerdict::kOk);
+                assert(DecideJog(189.0f, 276.0f, kJogStepMm, kJogStepMm) == JogVerdict::kOk);
+                assert(DecideJog(1.0f, 1.0f, -kJogStepMm, -kJogStepMm) == JogVerdict::kOk);
+                // 越出包线：拒（四边各一例）。
+                assert(DecideJog(190.0f, 100.0f, kJogStepMm, 0.0f) == JogVerdict::kOutOfBounds);
+                assert(DecideJog(0.0f, 100.0f, -kJogStepMm, 0.0f) == JogVerdict::kOutOfBounds);
+                assert(DecideJog(100.0f, 277.0f, 0.0f, kJogStepMm) == JogVerdict::kOutOfBounds);
+                assert(DecideJog(100.0f, 0.0f, 0.0f, -kJogStepMm) == JogVerdict::kOutOfBounds);
+                // 非有限输入 fail-closed 为「坐标不新鲜」，绝不放行运动。
+                const float nan = std::nanf("");
+                const float inf = std::numeric_limits<float>::infinity();
+                assert(DecideJog(nan, 100.0f, kJogStepMm, 0.0f) == JogVerdict::kStalePosition);
+                assert(DecideJog(100.0f, inf, 0.0f, kJogStepMm) == JogVerdict::kStalePosition);
+                assert(DecideJog(100.0f, 100.0f, nan, 0.0f) == JogVerdict::kStalePosition);
+                // 包线与步进常量逐值钉死，与云端 §5 / 奎享 `$J=` 序列同源。
+                static_assert(kJogEnvelopeMaxXMm == 190.0f, "X envelope drifted from cloud S5");
+                static_assert(kJogEnvelopeMaxYMm == 277.0f, "Y envelope drifted from cloud S5");
+                static_assert(kJogStepMm == 1.0f, "jog step drifted from kx sequence");
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_decide_jog_test")
 
     def test_manual_control_wired_through_board_and_ui(self):
         """board 统一转发 action 字符串；UI 抽屉手动区按钮仅 settled 态可用。"""

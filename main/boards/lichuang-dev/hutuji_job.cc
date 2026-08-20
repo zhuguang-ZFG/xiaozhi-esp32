@@ -811,19 +811,27 @@ void Job::ManualTask() {
              WaitForIdle(false, kPenOriginIdleTimeoutMs);
     } else if (action == "jog_x+" || action == "jog_x-" || action == "jog_y+" ||
                action == "jog_y-") {
-        const float dx = action == "jog_x+" ? 1.0f : (action == "jog_x-" ? -1.0f : 0.0f);
-        const float dy = action == "jog_y+" ? 1.0f : (action == "jog_y-" ? -1.0f : 0.0f);
-        // 机器无限位开关，MPos 边界检查是点动的唯一防线（限幅与云端 §5 同源）。
+        const float dx = action == "jog_x+" ? hutuji::kJogStepMm
+                                            : (action == "jog_x-" ? -hutuji::kJogStepMm : 0.0f);
+        const float dy = action == "jog_y+" ? hutuji::kJogStepMm
+                                            : (action == "jog_y-" ? -hutuji::kJogStepMm : 0.0f);
+        // 机器无限位开关，新鲜 MPos + 越界判定是点动的唯一防线（限幅与云端 §5 同源）。
+        // 缓存坐标先经 `?` 新鲜读确认：$10=WPos/断连期的旧坐标不得放行运动（fail closed）。
         float mx = 0, my = 0, mz = 0;
-        pipe.GetMachinePos(mx, my, mz);
-        if (mx + dx < 0.0f || mx + dx > 190.0f || my + dy < 0.0f || my + dy > 277.0f) {
+        if (!QueryAndWaitFreshMachineState()) {
             ok = false;
-            failed_step = "点动越界";
+            failed_step = "点动前未取到新鲜坐标";
         } else {
-            // 逐字对齐奎享实测 `$J=G21G91X1.0Y0.0Z0.0F8000.0`（1mm 固定步进）。
-            char line[48];
-            snprintf(line, sizeof(line), "$J=G21G91X%.1fY%.1fZ0.0F8000.0", dx, dy);
-            ok = send_ok(line, "点动") && WaitForIdle(false, kPenOriginIdleTimeoutMs);
+            pipe.GetMachinePos(mx, my, mz);
+            if (hutuji::DecideJog(mx, my, dx, dy) != hutuji::JogVerdict::kOk) {
+                ok = false;
+                failed_step = "点动越界";
+            } else {
+                // 逐字对齐奎享实测 `$J=G21G91X1.0Y0.0Z0.0F8000.0`（1mm 固定步进）。
+                char line[48];
+                snprintf(line, sizeof(line), "$J=G21G91X%.1fY%.1fZ0.0F8000.0", dx, dy);
+                ok = send_ok(line, "点动") && WaitForIdle(false, kPenOriginIdleTimeoutMs);
+            }
         }
     } else if (action == "home") {
         // G1 落 (0,0) 不触发换纸（页尾归位同款语义）；homing 指令与 G0 一律禁止——
@@ -1539,18 +1547,13 @@ bool Job::PreparePenOrigin() {
     return false;
 }
 
-bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t from, size_t to) {
+bool Job::QueryAndWaitFreshMachineState() {
     auto& pipe = Pipe::GetInstance();
-    if (from >= to || to > spans.size()) {
+    if (!pipe.IsConnected() || !pipe.IsReady()) {
         return false;
     }
-    if (!pipe.IsConnected() || !pipe.IsReady() ||
-        pipe.GetConnectionSequence() != stream_connection_seq_) {
-        return false;
-    }
-
     // 必须同时取得 `?` 之后的新状态与新有限 MPos；$10=WPos 或 NaN/Inf 只能推进
-    // status_seq，不能让旧机器坐标冒充本批完成证据。
+    // status_seq，不能让旧机器坐标冒充当前位置。
     const uint32_t status_seq = pipe.GetStatusReportSequence();
     const uint32_t mpos_seq = pipe.GetMposReportSequence();
     if (!pipe.SendRealtime('?')) {
@@ -1563,6 +1566,22 @@ bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return true;
+}
+
+bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t from, size_t to) {
+    auto& pipe = Pipe::GetInstance();
+    if (from >= to || to > spans.size()) {
+        return false;
+    }
+    if (!pipe.IsConnected() || !pipe.IsReady() ||
+        pipe.GetConnectionSequence() != stream_connection_seq_) {
+        return false;
+    }
+
+    if (!QueryAndWaitFreshMachineState()) {
+        return false;
     }
     if (pipe.GetGrblState() != GrblState::Idle) {
         return false;  // 还在 Run/Hold：ok 没丢，是真没执行完

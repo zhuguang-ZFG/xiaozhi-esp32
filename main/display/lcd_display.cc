@@ -809,7 +809,7 @@ void LcdDisplay::EnsureMachineControlUi() {
     machine_abort_btn_ = make_button(panel, Lang::Strings::MACHINE_STOP, theme->danger_color(),
                                      lv_color_white(), content_width, safe_button_height);
 
-    // 高级调试默认折叠：孩子看到的是创作面板，点动/复位等工具仍在但不做主界面噪音。
+    // 「点动·手动」默认折叠：孩子看到的是创作面板，点动/复位等工具仍在但不做主界面噪音。
     machine_manual_toggle_btn_ = make_button(
         panel, Lang::Strings::MACHINE_MANUAL_EXPAND, theme->assistant_bubble_color(),
         theme->text_color(), content_width, safe_button_height, &machine_manual_toggle_label_);
@@ -925,7 +925,8 @@ void LcdDisplay::EnsureMachineControlUi() {
                         lv_obj_set_pos(btn, self->machine_trigger_press_x_,
                                        self->machine_trigger_press_y_);
                         ESP_LOGI(TAG, "machine controls opened");
-                        self->SetMachineManualSectionVisible(false);
+                        // 手动区展开态跨抽屉开合保持（2026-08-20 用户决策）：连续点动
+                        // 不必每次重开「点动·手动」；开机默认折叠仍在创建处 :878。
                         self->ApplyMachineControlState();
                         lv_obj_move_foreground(self->machine_control_root_);
                         lv_obj_remove_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
@@ -942,6 +943,11 @@ void LcdDisplay::EnsureMachineControlUi() {
             }
         },
         LV_EVENT_ALL, this);
+    // 面板可垂直滚动（:734），面板内按钮一律 CLICKED 而非 PRESSED：从按钮上起手、
+    // 随后拖成滚动时，LVGL 对被滚对象只发 PRESS_LOST、释放时不发 CLICKED
+    // （lv_indev.c release 分支 `scroll_obj == NULL` 才发 CLICKED），天然过滤滚动
+    // 误触；PRESSED 在按下瞬间即发，从 reset/set_origin 上起手滚屏会误触发
+    // （2026-08-20 用户取证后修复）。
     lv_obj_add_event_cb(
         machine_manual_toggle_btn_,
         [](lv_event_t* e) {
@@ -949,7 +955,7 @@ void LcdDisplay::EnsureMachineControlUi() {
             self->SetMachineManualSectionVisible(
                 lv_obj_has_flag(self->machine_manual_section_, LV_OBJ_FLAG_HIDDEN));
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         machine_pause_btn_,
         [](lv_event_t* e) {
@@ -958,7 +964,7 @@ void LcdDisplay::EnsureMachineControlUi() {
             if (self->machine_pause_)
                 self->machine_pause_();
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         machine_resume_btn_,
         [](lv_event_t* e) {
@@ -967,7 +973,7 @@ void LcdDisplay::EnsureMachineControlUi() {
             if (self->machine_resume_)
                 self->machine_resume_();
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         machine_abort_btn_,
         [](lv_event_t* e) {
@@ -976,7 +982,7 @@ void LcdDisplay::EnsureMachineControlUi() {
             if (self->machine_abort_)
                 self->machine_abort_();
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         machine_repeat_btn_,
         [](lv_event_t* e) {
@@ -985,7 +991,7 @@ void LcdDisplay::EnsureMachineControlUi() {
             if (self->machine_repeat_)
                 self->machine_repeat_();
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         machine_pen_test_btn_,
         [](lv_event_t* e) {
@@ -994,14 +1000,14 @@ void LcdDisplay::EnsureMachineControlUi() {
             if (self->machine_pen_test_)
                 self->machine_pen_test_();
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         machine_close_btn_,
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         machine_control_root_,
         [](lv_event_t* e) {
@@ -1010,7 +1016,7 @@ void LcdDisplay::EnsureMachineControlUi() {
                 lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
             }
         },
-        LV_EVENT_PRESSED, this);
+        LV_EVENT_CLICKED, this);
     for (lv_obj_t* btn : machine_manual_buttons_) {
         lv_obj_add_event_cb(
             btn,
@@ -1022,7 +1028,7 @@ void LcdDisplay::EnsureMachineControlUi() {
                     self->machine_manual_(action);
                 }
             },
-            LV_EVENT_PRESSED, this);
+            LV_EVENT_CLICKED, this);
     }
 
     lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);

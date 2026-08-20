@@ -98,6 +98,12 @@ private:
      * 全部完成。Run/Hold、坐标不符或拿不到新报告一律返回 false（fail closed）。
      */
     bool ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t from, size_t to);
+    /**
+     * 发 `?` 并等到「新状态报告 + 新有限 MPos」双序号都推进；断线/超时回 false。
+     * 点动越界判定与 ConfirmInFlightDoneByStatus 共用——`$10=WPos`/NaN/Inf 只推进
+     * 通用状态序号，缓存坐标未经本函数刷新不得冒充当前位置（fail closed）。
+     */
+    bool QueryAndWaitFreshMachineState();
     /** 正常页尾专有：G1 归位（不触发换纸），随后才允许 ChangePaperAfterDraw。 */
     bool ReturnHomeAfterDraw();
     bool ChangePaperAfterDraw();
