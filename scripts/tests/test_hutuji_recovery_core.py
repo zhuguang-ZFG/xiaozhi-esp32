@@ -1098,6 +1098,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn('LoadHomeButtonPos("trig"', lcd_cc)
         self.assertIn('LoadHomeButtonPos("wifi"', lcd_cc)
         self.assertIn('Settings settings("hutuji_ui", true);', lcd_cc)
+        # 复审 P2：点按松手回弹到按下位（PRESSING 阈值内残位移不残留，与触发钮
+        # 同语义）；贴边存档（露出不足 24px）视为脏数据回默认；nvs_open 失败时
+        # SetInt 告警跳过而非 ESP_ERROR_CHECK abort（settings.cc 句柄守卫）。
+        self.assertIn("lv_obj_set_pos(target, state->press_x, state->press_y);", lcd_cc)
+        self.assertIn("vx > LV_HOR_RES - 24", lcd_cc)
+        settings_cc = (ROOT / "main/settings.cc").read_text(encoding="utf-8")
+        self.assertIn('ESP_LOGW(TAG, "Namespace %s open failed, skip SetInt %s"', settings_cc)
         self.assertIn('AttachHomeEntryButton(voice_talk_btn_, &voice_talk_drag_, &voice_talk_, "talk");', lcd_cc)
         self.assertIn('AttachHomeEntryButton(wifi_config_btn_, &wifi_config_drag_, &wifi_config_, "wifi");', lcd_cc)
         entry = board[board.index("display_->ConfigureVoiceEntry("):]
@@ -1117,6 +1124,11 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         wd = wd[: wd.index("void StopWifiLostWatchdog()")]
         self.assertIn("EnterWifiConfigMode();", wd)
         self.assertIn("esp_timer_start_once", wd)
+        # 复审 P1-1：被状态门控早退后 one-shot 必须原地续表，否则「断连 120s
+        # 自动显码」在 AP 关停期间静默失效；起到主循环执行的间隙已恢复连接
+        # 则直接返回，不把已连上的设备踹进配网。
+        self.assertIn("self->StartWifiLostWatchdog();", wd)
+        self.assertIn("WifiManager::GetInstance().IsConnected()", wd)
         # 武装/撤除必须挂在网络事件包装里。
         wrapper = board[board.index("void SetNetworkEventCallback"):]
         wrapper = wrapper[: wrapper.index("void StartWifiLostWatchdog()")]
@@ -1199,7 +1211,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
 
     def test_waveshare_applies_experimental_touch_threshold_with_readback(self):
-        """实机默认 70；官方 60 仍漏触时实验调到 40，并回读验证。"""
+        """实机默认 70；40 仍漏轻触（2026-08-20 用户反馈）降到 30，并回读验证。
+        FT5x06 官方寄存器文档实值=4×寄存器值，Linux EDT 驱动接受 20–80，30 在界内。"""
         board = (
             ROOT
             / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
@@ -1207,7 +1220,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         start = board.index("void InitializeTouch()")
         end = board.index("void InitializeLcdDisplay()", start)
         body = board[start:end]
-        self.assertIn("kTouchThreshold = 40", body)
+        self.assertIn("kTouchThreshold = 30", body)
         self.assertIn("esp_lcd_panel_io_tx_param", body)
         self.assertIn("Touch threshold tuned: %u -> %u", body)
         self.assertIn("Touch threshold tune failed", body)
@@ -1243,8 +1256,19 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn(".swap_xy = 1", body)
         self.assertIn(".mirror_x = 1", body)
         self.assertIn(".mirror_y = 0", body)
-        self.assertNotIn("lv_indev_get_read_timer", body)
-        self.assertNotIn("lv_timer_set_period", body)
+
+    def test_waveshare_touch_indev_read_period_is_10ms(self):
+        """LV_DEF_REFR_PERIOD=33（sdkconfig 实测）时 indev 默认 33ms 才读一次触摸，
+        是「不跟手」主延迟源（LVGL issue #8152 同因）；FT6336 INT 未接 GPIO 只能
+        轮询，显式 10ms 一读。0x88 芯片采样周期 12 已是官方最小推荐，不降。"""
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        start = board.index("void InitializeTouch()")
+        end = board.index("void InitializeLcdDisplay()", start)
+        body = board[start:end]
+        self.assertIn("lv_timer_set_period(lv_indev_get_read_timer(touch_indev), 10);", body)
 
     def test_paper_change_resets_blocking_peer_by_raii(self):
         """R11-PIPE-02：换纸编排的 blocking 标记必须 RAII 复位，不留手工出口。

@@ -316,7 +316,11 @@ private:
         constexpr int kFt6x36ChipIdReg = 0xA3;
         constexpr int kFt6x36VendorIdReg = 0xA8;
         uint8_t threshold = 0;
-        constexpr uint8_t kTouchThreshold = 40;
+        // FT5x06 0x80 TH_GROUP（实值 = 4×寄存器值，出厂 70 即 280）。40 仍漏
+        // 轻触（2026-08-20 用户反馈不灵敏），降到 30（实值 120；Linux EDT
+        // 驱动接受 20–80 区间，仍在官方有效范围）。灵敏度提高带来的静止抖动
+        // 由下方 24px 滚动阈值与 24px 拖动阈值兜底。
+        constexpr uint8_t kTouchThreshold = 30;
         uint8_t active_period = 0;
         uint8_t chip_id = 0;
         uint8_t vendor_id = 0;
@@ -359,13 +363,20 @@ private:
         };
         lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);
         if (touch_indev != nullptr) {
-            // 本板 FT5x06 阈值已调敏（上方 70->40），静止按压抖动超过 LVGL 默认 10px
+            // 本板 FT5x06 阈值已调敏（上方 70->30），静止按压抖动超过 LVGL 默认 10px
             // 滚动阈值（LV_INDEV_DEF_SCROLL_LIMIT，lv_indev.c:1375 越限即 PRESS_LOST）：
             // 点按被误判成拖动、CLICKED 全数被吃（2026-08-20 HIL 坐实：绘图机抽屉
             // 展开态按钮几乎全哑）。提到 24px 与抽屉触发钮点按阈值（lcd_display.cc
             // kTriggerDragThresholdPx）同量级：抖动不触发滚动，明确拖动仍可经
             // SCROLL_CHAIN 滚面板。断 chain 的替代方案会让面板无处起手滚动，已否决。
             lv_indev_set_scroll_limit(touch_indev, 24);
+            // LV_DEF_REFR_PERIOD=33（sdkconfig 实测）：indev 读定时器默认 33ms 才
+            // 采一次触摸，是「不跟手」的主延迟源（LVGL issue #8152 同因）。FT6336
+            // INT 未接 GPIO 只能轮询，显式提到 10ms 一读——400kHz I2C 读状态+坐标
+            // 几字节约 0.2ms，CPU 代价可忽略。芯片侧 0x88 主动采样周期 12 已是官方
+            // 文档最小推荐值（FT5x06_registers.pdf「should not less than 12」），
+            // 无空间再降。
+            lv_timer_set_period(lv_indev_get_read_timer(touch_indev), 10);
             lv_indev_add_event_cb(
                 touch_indev,
                 [](lv_event_t* event) {
@@ -615,8 +626,19 @@ private:
             const esp_timer_create_args_t args = {
                 .callback = [](void* arg) {
                     auto* self = static_cast<CustomBoard*>(arg);
+                    // 先原地续表再 Schedule：EnterWifiConfigMode 对 Connecting/配网中/
+                    // 升级中等状态门控早退（wifi_board.cc 的 state 检查），one-shot 若
+                    // 不重武装，AP 关停期间「断连 120s 自动显码」静默失效（2026-08-20
+                    // 复审 P1-1）。成功进配网由 WifiConfigModeEnter 事件 Stop，连上由
+                    // Connected 事件 Stop；esp_timer 回调上下文内 stop/start_once 合法。
+                    self->StartWifiLostWatchdog();
                     // esp_timer 任务上下文不直接碰网络状态机：Schedule 回主循环执行。
                     Application::GetInstance().Schedule([self]() {
+                        if (WifiManager::GetInstance().IsConnected()) {
+                            // 起到主循环执行的间隙里已恢复（Connected 事件会停表），
+                            // 不把已连上的设备踹进配网。
+                            return;
+                        }
                         ESP_LOGW(TAG, "WiFi lost >120s, entering config mode (QR on screen)");
                         self->EnterWifiConfigMode();
                     });

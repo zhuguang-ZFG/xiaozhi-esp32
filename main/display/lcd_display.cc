@@ -1380,7 +1380,9 @@ bool LcdDisplay::LoadHomeButtonPos(const char* prefix, lv_coord_t* x, lv_coord_t
     const int32_t vx = settings.GetInt(std::string(prefix) + "_x", -1);
     const int32_t vy = settings.GetInt(std::string(prefix) + "_y", -1);
     // 越界即视为无存档/脏数据：宁可回默认位，也不能把按钮藏到屏外找不回。
-    if (vx < 0 || vy < 0 || vx >= LV_HOR_RES || vy >= LV_VER_RES) {
+    // 贴边也要挡：按钮最小约 48px 见方，存档点距右/下缘不足 24px 时露出
+    // 部分太小几乎抓不到，同样回默认（2026-08-20 复审 P2-3）。
+    if (vx < 0 || vy < 0 || vx > LV_HOR_RES - 24 || vy > LV_VER_RES - 24) {
         return false;
     }
     *x = vx;
@@ -1437,8 +1439,15 @@ void LcdDisplay::AttachHomeEntryButton(lv_obj_t* btn, HomeButtonDrag* state,
                     break;
                 }
                 case LV_EVENT_RELEASED: {
-                    if (!state->dragging && state->action != nullptr && *state->action) {
-                        (*state->action)();
+                    if (!state->dragging) {
+                        // 与触发钮同语义（其 RELEASED 未拖分支 set_pos 回按下位）：
+                        // PRESSING 逐样本跟随会在 24px 阈值内留残余位移，点按松手
+                        // 必须回弹，否则 talk/wifi 悄悄漂移而 trig 不漂（2026-08-20
+                        // 复审 P2-2）。回弹先于动作，动作里若开抽屉也看到的是原位。
+                        lv_obj_set_pos(target, state->press_x, state->press_y);
+                        if (state->action != nullptr && *state->action) {
+                            (*state->action)();
+                        }
                     }
                     // 布局记忆（2026-08-20 用户决策）：真拖动才写 NVS，重启后原地
                     // 恢复；点按（未拖）不写，避免每次点击都擦写 flash。
