@@ -205,18 +205,6 @@ void Job::ReleaseBuffer() {
     buffer_len_ = 0;
 }
 
-uint32_t Job::Crc32Ieee(const uint8_t* data, size_t len) {
-    // zlib/IEEE CRC32，与 Python zlib.crc32 一致（初值 0，结果已按惯例取反折叠）
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; ++b) {
-            uint32_t mask = -(crc & 1u);
-            crc = (crc >> 1) ^ (0xEDB88320u & mask);
-        }
-    }
-    return ~crc;
-}
 
 bool Job::LooksLikePaperLine(const std::string& line) {
     // 匹配现役换纸相关命令字；不解析参数语义。词边界匹配（S3-P3d）：

@@ -124,7 +124,6 @@ private:
     static void PerformanceTimerThunk(void* arg);
     void Notify(const std::string& message);
 
-    static uint32_t Crc32Ieee(const uint8_t* data, size_t len);
     static bool LooksLikePaperLine(const std::string& line);
     static bool LooksLikeMotionLine(const std::string& line);
 

@@ -254,6 +254,20 @@ inline constexpr bool Crc32Matches(uint32_t expected, uint32_t actual) {
     return expected == actual;
 }
 
+/** zlib/IEEE CRC32，与 Python zlib.crc32 一致（初值 0，结果按惯例取反折叠）。
+ *  下载完整性校验的单一事实源：hutuji_job 与 hutuji_music 共用。 */
+inline uint32_t Crc32Ieee(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            uint32_t mask = static_cast<uint32_t>(-static_cast<int32_t>(crc & 1u));
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
 inline bool ParseDecimalOctet(const std::string& text, size_t begin, size_t end, uint32_t& out) {
     if (begin == end || end - begin > 3) {
         return false;

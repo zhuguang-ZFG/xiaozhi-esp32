@@ -7,6 +7,7 @@
 #include "esp32_camera.h"
 #include "hutuji_ble_diag.h"
 #include "hutuji_job.h"
+#include "hutuji_music.h"
 #include "hutuji_pipe.h"
 #include "i2c_device.h"
 #include "mcp_server.h"
@@ -386,6 +387,32 @@ private:
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().RequestPenTest();
             });
+
+        mcp_server.AddTool(
+            "hutuji.sing",
+            "播放歌曲：url 是云端 hutuji_sing 返回的歌曲地址，title 是歌名。"
+            "只放歌不碰写字机；下载完成后自动开始唱，唱完自动停。"
+            "想换一首直接再调本工具（自动切歌）；用户说停下时用 hutuji.stop_song。"
+            "不要瞎编 url——用户点歌时应先走云端 hutuji_sing 查目录。",
+            PropertyList({Property("url", kPropertyTypeString),
+                          Property("title", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string& url = properties["url"].value<std::string>();
+                const std::string& title = properties["title"].value<std::string>();
+                auto& music = hutuji::HutujiMusic::GetInstance();
+                if (music.Play(url, title)) {
+                    return std::string("{\"ok\":true}");
+                }
+                return std::string("{\"ok\":false,\"error\":\"") + music.LastError() +
+                       "\"}";
+            });
+
+        mcp_server.AddTool("hutuji.stop_song",
+                           "停止当前播放的歌曲。用户说别唱了/停下/安静时用。没歌在放时调用也安全。",
+                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                               hutuji::HutujiMusic::GetInstance().Stop();
+                               return true;
+                           });
 
 #ifdef HUTUJI_AUTO_TEST_DRAW
         xTaskCreate(
