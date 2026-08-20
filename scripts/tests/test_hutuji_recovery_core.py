@@ -2298,19 +2298,23 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("machine_manual_buttons_", state_body)
         self.assertIn("settled", state_body)
 
-
-    def test_visible_assistant_name_is_xiaopai_without_faking_wake_model(self):
-        """用户面统一小派；声学模型未替换前，待机文案不得伪称“你好小派”。"""
+    def test_visible_assistant_name_is_xiaopai_and_wake_word_is_real(self):
+        """用户面统一小派；2026-08-20 声学模型已真换为 multinet mn7_cn 自定义词
+        「xiao pai」，待机文案须如实告诉用户唤醒词是「小派」，且不得伪称
+        「你好小派」（multinet 命令只有 xiao pai 两个音节，加「你好」唤不醒）。"""
         zh = json.loads(
             (ROOT / "main/assets/locales/zh-CN/language.json").read_text(encoding="utf-8")
         )["strings"]
         standby = zh["STANDBY"]
         self.assertNotIn("小智", standby)
+        self.assertIn("小派", standby)
         self.assertNotIn("你好小派", standby)
 
         sdkconfig = (ROOT / "sdkconfig").read_text(encoding="utf-8")
-        self.assertIn("CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y", sdkconfig)
-        self.assertIn("# CONFIG_USE_CUSTOM_WAKE_WORD is not set", sdkconfig)
+        self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=y", sdkconfig)
+        self.assertIn('CONFIG_CUSTOM_WAKE_WORD="xiao pai"', sdkconfig)
+        self.assertIn('CONFIG_CUSTOM_WAKE_WORD_DISPLAY="小派"', sdkconfig)
+        self.assertIn("CONFIG_SR_MN_CN_MULTINET7_QUANT=y", sdkconfig)
 
         matrix = (
             ROOT / "main/boards/waveshare/esp32-s3-rgb-matrix/rgb_matrix_display.cc"
