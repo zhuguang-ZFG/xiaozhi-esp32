@@ -7,6 +7,7 @@
 #include "boards/lichuang-dev/hutuji_pipe.h"
 #include "boards/lichuang-dev/hutuji_ble_diag.h"
 #include "boards/lichuang-dev/hutuji_recovery_core.h"
+#include "boards/lichuang-dev/hutuji_music.h"
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
@@ -223,6 +224,14 @@ private:
     }
 
     void InitializeAxp2101() {
+        // WAVESHARE 3.5 若无 AXP2101 PMIC 则探测不到 ACK，缺失则跳过。
+        // 用 i2c_master_probe（吃 bus handle）而非 i2c_master_transmit_receive
+        //（吃 device handle），与全仓 35 处板级探测用法一致。
+        esp_err_t ret = i2c_master_probe(i2c_bus_, 0x34, 100);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "no AXP2101 on I2C, skipping PMIC init");
+            return;
+        }
         ESP_LOGI(TAG, "Init AXP2101");
         pmic_ = new Pmic(i2c_bus_, 0x34);
     }
@@ -586,6 +595,34 @@ private:
             [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().RequestPenTest();
             });
+
+        // 唱歌与绘图完全解耦：只走 AudioService 播放泵，不碰写字机管道。
+        // 工具描述与 lichuang_dev_board 保持逐字一致，避免双板行为漂移。
+        mcp_server.AddTool(
+            "hutuji.sing",
+            "播放歌曲：url 是云端 hutuji_sing 返回的歌曲地址，title 是歌名。"
+            "只放歌不碰写字机；下载完成后自动开始唱，唱完自动停。"
+            "想换一首直接再调本工具（自动切歌）；用户说停下时用 hutuji.stop_song。"
+            "不要瞎编 url——用户点歌时应先走云端 hutuji_sing 查目录。",
+            PropertyList({Property("url", kPropertyTypeString),
+                          Property("title", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string& url = properties["url"].value<std::string>();
+                const std::string& title = properties["title"].value<std::string>();
+                auto& music = hutuji::HutujiMusic::GetInstance();
+                if (music.Play(url, title)) {
+                    return std::string("{\"ok\":true}");
+                }
+                return std::string("{\"ok\":false,\"error\":\"") + music.LastError() +
+                       "\"}";
+            });
+
+        mcp_server.AddTool("hutuji.stop_song",
+                           "停止当前播放的歌曲。用户说别唱了/停下/安静时用。没歌在放时调用也安全。",
+                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                               hutuji::HutujiMusic::GetInstance().Stop();
+                               return true;
+                           });
 
     }
     // 同室部署写字机：10dBm(40=0.25dBm 单位) 足够覆盖，显著降低 Wi-Fi 峰值电流，
