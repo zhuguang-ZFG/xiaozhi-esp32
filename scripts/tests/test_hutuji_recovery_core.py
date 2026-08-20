@@ -2322,6 +2322,41 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn('lv_label_set_text(message_label_, "hi 小派")', matrix)
         self.assertNotIn('lv_label_set_text(message_label_, "hi 小智")', matrix)
 
+    def test_activation_relay_wiring_and_redaction(self):
+        """激活码中转接线（2026-08-20 用户决策，京东云中转）：
+        中继源进 waveshare 编译面、application.cc 钩子带板型守卫、
+        日志绝不出现激活码/请求体（脱敏硬约定）。"""
+        cmake = (ROOT / "main/CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn("hutuji_activation_relay.cc", cmake)
+
+        app_cc = (ROOT / "main/application.cc").read_text(encoding="utf-8")
+        self.assertIn("hutuji_activation_relay.h", app_cc)
+        self.assertIn("hutuji::ReportActivationCode(ota_->GetActivationCode())", app_cc)
+        # 钩子必须带板型守卫，其余板型上游行为不变。
+        hook = app_cc[app_cc.index("hutuji::ReportActivationCode(ota_->GetActivationCode())"):]
+        guard_region = app_cc[:app_cc.index("hutuji::ReportActivationCode(ota_->GetActivationCode())")]
+        self.assertIn("#ifdef CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5",
+                      guard_region[-800:])
+        self.assertIn("#endif", hook[:200])
+
+        relay = (ROOT / "main/boards/lichuang-dev/hutuji_activation_relay.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("https://hutuji.donglicao.com/register", relay)
+        self.assertIn('cJSON_AddStringToObject(root, "mac"', relay)
+        self.assertIn('cJSON_AddStringToObject(root, "code"', relay)
+        self.assertIn('SetHeader("Content-Type", "application/json")', relay)
+        self.assertIn('http->Open("POST", kRelayUrl)', relay)
+        # 一次性异步任务：不阻塞激活循环；失败路径都要释放 payload 并自删。
+        self.assertIn("xTaskCreate(RelayTask", relay)
+        self.assertGreaterEqual(relay.count("vTaskDelete(nullptr)"), 4)
+        # 脱敏：日志调用不得直接格式化激活码或请求体变量。
+        for line in relay.splitlines():
+            if "ESP_LOG" in line:
+                self.assertNotIn("payload->code", line)
+                self.assertNotIn("body", line)
+
 if __name__ == "__main__":
     unittest.main()
+
 
