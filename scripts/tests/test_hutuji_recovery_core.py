@@ -1041,6 +1041,103 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("power_save_timer_->WakeUp();", body)
         self.assertLess(body.index("power_save_timer_->WakeUp();"), body.index("app.ToggleChatState();"))
 
+    def test_waveshare_boot_functions_on_screen_and_wifi_lost_watchdog(self):
+        """boot 键功能上屏 + 断连自动显二维码（2026-08-20 商业化少按键决策）。
+
+        「说话」与 boot 单击同语义（starting 转配网，否则 ToggleChatState）；
+        「配网」直接 EnterWifiConfigMode；Disconnected 起 120s 看门狗到期自动进
+        配网显二维码，Connected/进配网即撤，全程不需要实体键。
+        """
+        board = (
+            ROOT
+            / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
+        ).read_text(encoding="utf-8")
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
+
+        # 显示层：两个按钮 + 配置入口 + 与触发钮同进退的可见性（4 处联动）。
+        self.assertIn("voice_talk_btn_", lcd_h)
+        self.assertIn("wifi_config_btn_", lcd_h)
+        self.assertIn("ConfigureVoiceEntry", lcd_h)
+        self.assertIn("Lang::Strings::VOICE_TALK", lcd_cc)
+        self.assertIn("Lang::Strings::WIFI_CONFIG_SHORT", lcd_cc)
+        self.assertGreaterEqual(lcd_cc.count("voice_talk_btn_, LV_OBJ_FLAG_HIDDEN"), 4)
+        self.assertGreaterEqual(lcd_cc.count("wifi_config_btn_, LV_OBJ_FLAG_HIDDEN"), 4)
+        # 说话/配网复刻触发钮的按下跟随拖动：共享 AttachHomeEntryButton、
+        # PRESS_LOCK、24px 阈值、松手未拖才触发（用户要求与「绘图控制」同款可拖）。
+        self.assertIn("AttachHomeEntryButton", lcd_h)
+        # （带 NVS 前缀的 4 参调用在下方布局记忆段单独钉）
+        self.assertIn("lv_obj_add_flag(voice_talk_btn_, LV_OBJ_FLAG_PRESS_LOCK);", lcd_cc)
+        self.assertIn("lv_obj_add_flag(wifi_config_btn_, LV_OBJ_FLAG_PRESS_LOCK);", lcd_cc)
+        attach = lcd_cc[lcd_cc.index("void LcdDisplay::AttachHomeEntryButton"):]
+        attach = attach[: attach.index("LV_EVENT_ALL, state);") + len("LV_EVENT_ALL, state);")]
+        self.assertIn("kTriggerDragThresholdPx", attach)
+        self.assertIn("LV_EVENT_PRESSING", attach)
+        self.assertIn("LV_EVENT_RELEASED", attach)
+        self.assertIn("state->dragging", attach)
+        # user_data 必须传 state（回调按 HomeButtonDrag* 解引用）：2026-08-20 实机
+        # 曾照抄触发钮传 this → LoadProhibited 白屏重启；钉死防回退。
+        self.assertIn("LV_EVENT_ALL, state);", attach)
+        self.assertNotIn("LV_EVENT_ALL, this);", attach)
+
+        # 板级接线：说话 = boot 单击同语义（不重复 WakeUp——触摸钩子已做）。
+        # 二维码「关闭」退出配网：Schedule 回主循环（StopConfigAp 事件回调同步，
+        # 新机无凭据时 TryWifiConnect 有 1.5s delay，卡 taskLVGL），再由
+        # ConfigModeExit→WifiBoard 自动回连。按钮 IGNORE_LAYOUT 绝对定位左上角，
+        # 不被 320px 高 flex 列裁掉。
+        self.assertIn("SetProvisioningCancelHandler", board)
+        self.assertIn("Application::GetInstance().Schedule(", board)
+        self.assertIn("WifiManager::GetInstance().StopConfigAp();", board)
+        self.assertIn("provisioning_cancel_btn_", lcd_cc)
+        self.assertIn("provisioning_on_cancel_", lcd_cc)
+        self.assertIn("lv_obj_add_flag(provisioning_cancel_btn_, LV_OBJ_FLAG_IGNORE_LAYOUT);", lcd_cc)
+        # 布局记忆（2026-08-20 用户决策）：三个可拖钮落点存 NVS hutuji_ui，
+        # 真拖动才写、越界存档回默认、建钮时读回。
+        self.assertIn('SaveHomeButtonPos("trig"', lcd_cc)
+        self.assertIn('LoadHomeButtonPos("talk"', lcd_cc)
+        self.assertIn('LoadHomeButtonPos("trig"', lcd_cc)
+        self.assertIn('LoadHomeButtonPos("wifi"', lcd_cc)
+        self.assertIn('Settings settings("hutuji_ui", true);', lcd_cc)
+        self.assertIn('AttachHomeEntryButton(voice_talk_btn_, &voice_talk_drag_, &voice_talk_, "talk");', lcd_cc)
+        self.assertIn('AttachHomeEntryButton(wifi_config_btn_, &wifi_config_drag_, &wifi_config_, "wifi");', lcd_cc)
+        entry = board[board.index("display_->ConfigureVoiceEntry("):]
+        entry = entry[: entry.index(");", entry.index("EnterWifiConfigMode(); }")) + 2]
+        self.assertIn("app.GetDeviceState() == kDeviceStateStarting", entry)
+        self.assertIn("app.ToggleChatState();", entry)
+        self.assertNotIn("WakeUp", entry)
+
+        # 断连看门狗：120s 定时、Disconnected 武装、Connected/进配网撤除、
+        # 到期 Schedule 回主循环 EnterWifiConfigMode（esp_timer 上下文不碰网络状态机）。
+        self.assertIn("wifi_lost_timer_", board)
+        self.assertIn("120ULL * 1000 * 1000", board)
+        self.assertIn("StartWifiLostWatchdog();", board)
+        self.assertIn("StopWifiLostWatchdog();", board)
+        self.assertIn("Application::GetInstance().Schedule", board)
+        wd = board[board.index("void StartWifiLostWatchdog()"):]
+        wd = wd[: wd.index("void StopWifiLostWatchdog()")]
+        self.assertIn("EnterWifiConfigMode();", wd)
+        self.assertIn("esp_timer_start_once", wd)
+        # 武装/撤除必须挂在网络事件包装里。
+        wrapper = board[board.index("void SetNetworkEventCallback"):]
+        wrapper = wrapper[: wrapper.index("void StartWifiLostWatchdog()")]
+        self.assertIn("NetworkEvent::Disconnected", wrapper)
+        self.assertLess(wrapper.index("NetworkEvent::Connected"), wrapper.index("HideProvisioningQr"))
+
+        # 语言键双语齐备。
+        zh = json.loads(
+            (ROOT / "main/assets/locales/zh-CN/language.json").read_text(encoding="utf-8")
+        )["strings"]
+        en = json.loads(
+            (ROOT / "main/assets/locales/en-US/language.json").read_text(encoding="utf-8")
+        )["strings"]
+        self.assertEqual(zh["VOICE_TALK"], "说话")
+        self.assertEqual(zh["WIFI_CONFIG_SHORT"], "配网")
+        self.assertIn("VOICE_TALK", en)
+        self.assertIn("WIFI_CONFIG_SHORT", en)
+        lang_h = (ROOT / "main/assets/lang_config.h").read_text(encoding="utf-8")
+        self.assertIn("VOICE_TALK", lang_h)
+        self.assertIn("WIFI_CONFIG_SHORT", lang_h)
+
     def test_window_error_requests_immediate_hold_and_controlled_reset(self):
         """P1：窗口 error 后 RX 后续行仍会执行；必须立即 hold 并在退窗后受控 reset。"""
         source = (
@@ -1852,11 +1949,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         ):
             self.assertIn(member, ui_body)
         self.assertIn("button_height < 56 ? 56 : button_height", ui_body)
-        # 默认视觉位置仍在右侧垂直居中，但对象采用 TOP_LEFT 坐标系；
-        # 非 TOP_LEFT 对齐与 set_pos 增量混用会让 LVGL 坐标损坏、按钮飞出屏幕。
+        # 默认视觉：说话大圆钮中下、触发/配网 48px 小方钮右上（2026-08-20 美观
+        # 改版，主角/角落分层）；对象采用 TOP_LEFT 坐标系，非 TOP_LEFT 对齐与
+        # set_pos 增量混用会让 LVGL 坐标损坏、按钮飞出屏幕。
         self.assertIn("LV_ALIGN_TOP_LEFT", ui_body)
-        self.assertIn("const lv_coord_t trigger_width = LV_HOR_RES * 24 / 100", ui_body)
-        self.assertIn("LV_HOR_RES - trigger_width - theme->spacing(3)", ui_body)
+        self.assertIn("const lv_coord_t corner_btn_size = 48;", ui_body)
+        self.assertIn("const lv_coord_t talk_diameter = 96;", ui_body)
+        self.assertIn("LV_HOR_RES - 90 - theme->spacing(3), theme->spacing(3));", ui_body)
         trigger_setup = ui_body[: ui_body.index("lv_obj_add_event_cb")]
         self.assertNotIn("lv_obj_get_width(machine_control_trigger_btn_)", trigger_setup)
         self.assertNotIn("lv_obj_get_height(machine_control_trigger_btn_)", trigger_setup)

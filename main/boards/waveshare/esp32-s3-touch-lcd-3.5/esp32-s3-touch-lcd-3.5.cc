@@ -155,6 +155,11 @@ private:
     LcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
     EspVideo* camera_;
+    // 断连看门狗（2026-08-20「找不到 WiFi 直接显二维码」决策）：已配网但持续
+    // 连不上（换路由器/改密码/AP 关机）时，上游只在 WifiManager 内无限重连、
+    // 永不进配网模式，用户只能摸实体 boot 键。Disconnected 起 120s 定时，
+    // Connected/进配网即撤；到期自动进配网、屏显二维码，全程无按键。
+    esp_timer_handle_t wifi_lost_timer_ = nullptr;
 
     void ReplayPmicBootStatusAfterUsbReady() {
         Pmic* pmic = pmic_;
@@ -497,6 +502,28 @@ private:
             [this]() { ScheduleMachineControl("pen_test", &hutuji::Job::RequestPenTest); },
             [this](const char* action) { ScheduleManualControl(action); });
 
+        // boot 键功能上屏：「说话」与 boot 单击完全同语义（starting 态转配网，
+        // 否则 ToggleChatState）；触摸唤醒已由 LV_EVENT_PRESSED 钩子在板级完成，
+        // 这里不再重复 WakeUp。「配网」直接进配网模式，屏显二维码。
+        display_->ConfigureVoiceEntry(
+            [this]() {
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    EnterWifiConfigMode();
+                    return;
+                }
+                app.ToggleChatState();
+            },
+            [this]() { EnterWifiConfigMode(); });
+        // 二维码「关闭」= 退出配网：StopConfigAp→ConfigModeExit→WifiBoard 自动
+        // TryWifiConnect（有凭据回连；无凭据新机按上游流程弹回配网）。必须
+        // Schedule 回主循环：StopConfigAp 的事件回调是同步调用，新机无凭据时
+        // TryWifiConnect 内部有 vTaskDelay(1500)，在 taskLVGL 上跑会卡死 UI。
+        display_->SetProvisioningCancelHandler([]() {
+            Application::GetInstance().Schedule(
+                []() { WifiManager::GetInstance().StopConfigAp(); });
+        });
+
         mcp_server.AddTool("hutuji.status",
             "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、任务状态。"
             "state 含 previewing 预览加载中、awaiting_confirmation 等用户确认。",
@@ -564,18 +591,57 @@ private:
         WifiBoard::SetNetworkEventCallback(
             [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
                 if (event == NetworkEvent::WifiConfigModeEnter) {
+                    StopWifiLostWatchdog();
                     const std::string ap_ssid = WifiManager::GetInstance().GetApSsid();
                     display_->ShowProvisioningQr(
                         hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid),
                         "Scan: " + ap_ssid + "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
                 } else if (event == NetworkEvent::WifiConfigModeExit ||
                            event == NetworkEvent::Connected) {
+                    StopWifiLostWatchdog();
                     display_->HideProvisioningQr();
+                } else if (event == NetworkEvent::Disconnected) {
+                    StartWifiLostWatchdog();
                 }
                 if (callback) {
                     callback(event, data);
                 }
             });
+    }
+
+    void StartWifiLostWatchdog() {
+        constexpr uint64_t kWifiLostTimeoutUs = 120ULL * 1000 * 1000;
+        if (wifi_lost_timer_ == nullptr) {
+            const esp_timer_create_args_t args = {
+                .callback = [](void* arg) {
+                    auto* self = static_cast<CustomBoard*>(arg);
+                    // esp_timer 任务上下文不直接碰网络状态机：Schedule 回主循环执行。
+                    Application::GetInstance().Schedule([self]() {
+                        ESP_LOGW(TAG, "WiFi lost >120s, entering config mode (QR on screen)");
+                        self->EnterWifiConfigMode();
+                    });
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "wifi_lost_wd",
+                .skip_unhandled_events = true,
+            };
+            if (esp_timer_create(&args, &wifi_lost_timer_) != ESP_OK) {
+                wifi_lost_timer_ = nullptr;
+                // 安全网静默缺失比日志噪音更糟：alloc 失败时 esp_timer 自身不打日志。
+                ESP_LOGW(TAG, "wifi lost watchdog create failed");
+                return;
+            }
+        }
+        // 重复 Disconnected 重新起表：看的是「最后一次断连起持续 120s 未恢复」。
+        esp_timer_stop(wifi_lost_timer_);
+        esp_timer_start_once(wifi_lost_timer_, kWifiLostTimeoutUs);
+    }
+
+    void StopWifiLostWatchdog() {
+        if (wifi_lost_timer_ != nullptr) {
+            esp_timer_stop(wifi_lost_timer_);
+        }
     }
 
 public:

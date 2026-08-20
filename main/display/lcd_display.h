@@ -56,6 +56,32 @@ protected:
     std::function<void()> draw_preview_on_confirm_;
     std::function<void()> draw_preview_on_cancel_;
     lv_obj_t* machine_control_trigger_btn_ = nullptr;
+    // 实体 boot 键功能上屏（2026-08-20 商业化少按键决策）：说话 = boot 单击
+    // （ToggleChatState，starting 态转配网），配网 = 直接进配网模式显二维码。
+    lv_obj_t* voice_talk_btn_ = nullptr;
+    lv_obj_t* wifi_config_btn_ = nullptr;
+    std::function<void()> voice_talk_;
+    std::function<void()> wifi_config_;
+    // 配网二维码层的「关闭」：仅在板级注册过取消回调时显示（其他板不受影响）。
+    lv_obj_t* provisioning_cancel_btn_ = nullptr;
+    std::function<void()> provisioning_on_cancel_;
+    // 与触发钮同款的按下跟随拖动状态（24px 阈值区分点按/拖动）。
+    struct HomeButtonDrag {
+        lv_point_t press_point{0, 0};
+        lv_coord_t press_x = 0;
+        lv_coord_t press_y = 0;
+        bool dragging = false;
+        std::function<void()>* action = nullptr;  // 非拥有指针，指向 LcdDisplay 成员的槽位
+        const char* nvs_prefix = nullptr;  // NVS「hutuji_ui」命名空间下的坐标键前缀
+    };
+    HomeButtonDrag voice_talk_drag_;
+    HomeButtonDrag wifi_config_drag_;
+    /** 给主页入口钮挂「按下跟随 + 24px 阈值 + 松手未拖才触发 + 落点写 NVS」行为。 */
+    void AttachHomeEntryButton(lv_obj_t* btn, HomeButtonDrag* state,
+                               std::function<void()>* action, const char* nvs_prefix);
+    /** 布局记忆：写/读 NVS「hutuji_ui」中的按钮坐标；Load 越界返回 false。 */
+    static void SaveHomeButtonPos(const char* prefix, lv_coord_t x, lv_coord_t y);
+    static bool LoadHomeButtonPos(const char* prefix, lv_coord_t* x, lv_coord_t* y);
     lv_point_t machine_trigger_press_point_{0, 0};
     lv_coord_t machine_trigger_press_x_ = 0;
     lv_coord_t machine_trigger_press_y_ = 0;
@@ -118,6 +144,10 @@ public:
                                   std::function<void()> on_abort, std::function<void()> on_repeat,
                                   std::function<void()> on_pen_test,
                                   std::function<void(const char* action)> on_manual);
+    /** boot 键功能上屏：on_talk = boot 单击等效，on_wifi = 进配网显二维码。 */
+    void ConfigureVoiceEntry(std::function<void()> on_talk, std::function<void()> on_wifi);
+    /** 配网二维码「关闭」回调：调用方负责退出配网模式（如 StopConfigAp）。 */
+    void SetProvisioningCancelHandler(std::function<void()> on_cancel);
     virtual void UpdateMachineControlState(const std::string& state) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;

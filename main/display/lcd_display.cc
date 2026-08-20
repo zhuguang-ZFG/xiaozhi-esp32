@@ -420,6 +420,35 @@ void LcdDisplay::EnsureProvisioningQrUi() {
     lv_obj_set_style_text_color(provisioning_qr_hint_, theme->text_color(), 0);
     lv_obj_set_style_text_align(provisioning_qr_hint_, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(provisioning_qr_hint_, LV_LABEL_LONG_WRAP);
+
+    // 「关闭」退出配网（无凭据新机按上游流程弹回配网：没网什么都做不了，弹回
+    // 是诚实行为）。绝对定位左上角、脱离 flex 流：QR 200px + 多行 hint + 56px
+    // 按钮在 320px 高 flex 列里会溢出，留在流内会被裁到屏外等于没有返回。
+    provisioning_cancel_btn_ = lv_button_create(provisioning_qr_root_);
+    lv_obj_add_flag(provisioning_cancel_btn_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_size(provisioning_cancel_btn_, LV_SIZE_CONTENT, 56);
+    lv_obj_set_style_pad_left(provisioning_cancel_btn_, theme->spacing(6), 0);
+    lv_obj_set_style_pad_right(provisioning_cancel_btn_, theme->spacing(6), 0);
+    lv_obj_set_align(provisioning_cancel_btn_, LV_ALIGN_TOP_LEFT);
+    lv_obj_set_pos(provisioning_cancel_btn_, theme->spacing(3), theme->spacing(3));
+    lv_obj_set_style_radius(provisioning_cancel_btn_, 12, 0);
+    lv_obj_set_style_bg_color(provisioning_cancel_btn_, theme->assistant_bubble_color(), 0);
+    lv_obj_set_style_bg_opa(provisioning_cancel_btn_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(provisioning_cancel_btn_, 1, 0);
+    lv_obj_set_style_border_color(provisioning_cancel_btn_, theme->border_color(), 0);
+    lv_obj_t* cancel_label = lv_label_create(provisioning_cancel_btn_);
+    lv_label_set_text(cancel_label, Lang::Strings::MACHINE_CLOSE);
+    lv_obj_set_style_text_color(cancel_label, theme->text_color(), 0);
+    lv_obj_center(cancel_label);
+    lv_obj_add_event_cb(
+        provisioning_cancel_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) == LV_EVENT_CLICKED && self->provisioning_on_cancel_) {
+                self->provisioning_on_cancel_();
+            }
+        },
+        LV_EVENT_CLICKED, this);
     lv_obj_add_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -446,13 +475,29 @@ void LcdDisplay::ShowProvisioningQr(const std::string& payload, const std::strin
     if (machine_control_trigger_btn_ != nullptr) {
         lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
     }
+    // 说话/配网按钮与触发钮同进退：二维码/预览遮挡期间一并隐藏。
+    if (voice_talk_btn_ != nullptr) {
+        lv_obj_add_flag(voice_talk_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (wifi_config_btn_ != nullptr) {
+        lv_obj_add_flag(wifi_config_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
     if (machine_control_root_ != nullptr) {
         lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+    }
+    // 未注册取消回调的板不显示「关闭」（保持旧观感）。
+    if (provisioning_on_cancel_) {
+        lv_obj_remove_flag(provisioning_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(provisioning_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_move_foreground(provisioning_qr_root_);
     lv_obj_remove_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
 }
 
+void LcdDisplay::SetProvisioningCancelHandler(std::function<void()> on_cancel) {
+    provisioning_on_cancel_ = std::move(on_cancel);
+}
 void LcdDisplay::HideProvisioningQr() {
     DisplayLockGuard lock(this);
     if (provisioning_qr_root_ == nullptr) {
@@ -463,6 +508,16 @@ void LcdDisplay::HideProvisioningQr() {
         (draw_preview_root_ == nullptr ||
          lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
         lv_obj_remove_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (voice_talk_btn_ != nullptr &&
+        (draw_preview_root_ == nullptr ||
+         lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
+        lv_obj_remove_flag(voice_talk_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (wifi_config_btn_ != nullptr &&
+        (draw_preview_root_ == nullptr ||
+         lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
+        lv_obj_remove_flag(wifi_config_btn_, LV_OBJ_FLAG_HIDDEN);
     }
     lv_image_set_src(provisioning_qr_code_, nullptr);
     provisioning_qr_image_.reset();
@@ -633,6 +688,12 @@ void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::st
     if (machine_control_trigger_btn_ != nullptr) {
         lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
     }
+    if (voice_talk_btn_ != nullptr) {
+        lv_obj_add_flag(voice_talk_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (wifi_config_btn_ != nullptr) {
+        lv_obj_add_flag(wifi_config_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
     if (machine_control_root_ != nullptr) {
         lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);
     }
@@ -660,6 +721,16 @@ void LcdDisplay::HideDrawPreview() {
          lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN))) {
         lv_obj_remove_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
     }
+    if (voice_talk_btn_ != nullptr &&
+        (provisioning_qr_root_ == nullptr ||
+         lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN))) {
+        lv_obj_remove_flag(voice_talk_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (wifi_config_btn_ != nullptr &&
+        (provisioning_qr_root_ == nullptr ||
+         lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN))) {
+        lv_obj_remove_flag(wifi_config_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
     draw_preview_on_cancel_ = nullptr;
 }
 
@@ -677,12 +748,15 @@ void LcdDisplay::EnsureMachineControlUi() {
         machine_control_trigger_btn_ != nullptr) {
         return;
     }
-
     auto* theme = static_cast<LvglTheme*>(current_theme_);
-    // 480x320 横屏：主操作行取屏高 20%（64px），其余按钮行取 17%（54px），
-    // 一律按 56px 下限兜底，保证儿童手指命中面。
+    // 480x320 横屏布局（2026-08-20 美观改版，用户否决「三个大钮一排」）：
+    // 主角/角落分层——「说话」是语音设备主动作，做成中下大圆钮（拇指区、
+    // 孩子看到就想按）；「绘图控制」「配网」是次要入口，退到右上角 48px 小
+    // 方钮。三个钮都保留按下跟随拖动，位置可挪。
+    const lv_coord_t corner_btn_size = 48;
+    const lv_coord_t talk_diameter = 96;
+    // 抽屉内按钮行高：主操作行 20% 屏高、其余 17%，56px 下限兜底（儿童命中面）。
     const lv_coord_t primary_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
-    const lv_coord_t trigger_width = LV_HOR_RES * 24 / 100;
     const lv_coord_t button_height = LV_VER_RES * 17 / 100;
     const lv_coord_t safe_button_height = button_height < 56 ? 56 : button_height;
     // disabled 用实心灰底+实心浅字：可辨靠的是填充色差异，不靠低对比文字。
@@ -690,28 +764,89 @@ void LcdDisplay::EnsureMachineControlUi() {
     const lv_color_t disabled_text = lv_color_hex(0xD8DEE2);
     auto* screen = lv_screen_active();
 
-    // 先固定为 TOP_LEFT：拖动坐标统一从父对象左上角计算，避免对齐偏移与拖动坐标混用。
+    // 说话大圆钮：中下拇指区，accent 实色 + 投影，全屏视觉主角。
+    voice_talk_btn_ = lv_button_create(screen);
+    lv_obj_set_size(voice_talk_btn_, talk_diameter, talk_diameter);
+    lv_obj_set_align(voice_talk_btn_, LV_ALIGN_TOP_LEFT);
+    lv_obj_set_pos(voice_talk_btn_, (LV_HOR_RES - talk_diameter) / 2,
+                   LV_VER_RES - talk_diameter - theme->spacing(5));
+    lv_obj_clear_flag(voice_talk_btn_, LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_clear_flag(voice_talk_btn_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(voice_talk_btn_, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_set_style_radius(voice_talk_btn_, talk_diameter / 2, 0);
+    lv_obj_set_style_bg_color(voice_talk_btn_, theme->accent_color(), 0);
+    lv_obj_set_style_bg_opa(voice_talk_btn_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(voice_talk_btn_, 2, 0);
+    lv_obj_set_style_border_color(voice_talk_btn_, theme->border_color(), 0);
+    lv_obj_set_style_shadow_width(voice_talk_btn_, 24, 0);
+    lv_obj_set_style_shadow_color(voice_talk_btn_, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(voice_talk_btn_, LV_OPA_30, 0);
+    lv_obj_t* talk_label = lv_label_create(voice_talk_btn_);
+    lv_label_set_text(talk_label, Lang::Strings::VOICE_TALK);
+    lv_obj_set_style_text_color(talk_label, theme->accent_text_color(), 0);
+    lv_obj_center(talk_label);
+    AttachHomeEntryButton(voice_talk_btn_, &voice_talk_drag_, &voice_talk_, "talk");
+
+    // 宽按内容自适应：en-US "Controls" 在 48px 定宽下必然裁切；高度仍 48px。
+    // x 用右对齐占位（内容宽未定先估 90px），拖动后位置以实际对象为准。
     machine_control_trigger_btn_ = lv_button_create(screen);
-    lv_obj_set_size(machine_control_trigger_btn_, trigger_width, primary_height);
+    lv_obj_set_size(machine_control_trigger_btn_, LV_SIZE_CONTENT, corner_btn_size);
+    lv_obj_set_style_pad_left(machine_control_trigger_btn_, theme->spacing(3), 0);
+    lv_obj_set_style_pad_right(machine_control_trigger_btn_, theme->spacing(3), 0);
     lv_obj_set_align(machine_control_trigger_btn_, LV_ALIGN_TOP_LEFT);
-    lv_obj_set_pos(machine_control_trigger_btn_, LV_HOR_RES - trigger_width - theme->spacing(3),
-                   (LV_VER_RES - primary_height) / 2);
+    lv_obj_set_pos(machine_control_trigger_btn_,
+                   LV_HOR_RES - 90 - theme->spacing(3), theme->spacing(3));
     lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLL_CHAIN);
     // 拖动时持续锁定最初命中的按钮；按钮本身不参与 LVGL 滚动判定。
     lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_PRESS_LOCK);
-    lv_obj_set_style_radius(machine_control_trigger_btn_, 24, 0);
+    lv_obj_set_style_radius(machine_control_trigger_btn_, 12, 0);
     lv_obj_set_style_bg_color(machine_control_trigger_btn_, theme->accent_color(), 0);
     lv_obj_set_style_bg_opa(machine_control_trigger_btn_, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(machine_control_trigger_btn_, 1, 0);
     lv_obj_set_style_border_color(machine_control_trigger_btn_, theme->border_color(), 0);
-    lv_obj_set_style_shadow_width(machine_control_trigger_btn_, 18, 0);
-    lv_obj_set_style_shadow_color(machine_control_trigger_btn_, lv_color_black(), 0);
-    lv_obj_set_style_shadow_opa(machine_control_trigger_btn_, LV_OPA_30, 0);
     lv_obj_t* trigger_label = lv_label_create(machine_control_trigger_btn_);
     lv_label_set_text(trigger_label, Lang::Strings::MACHINE_CONTROL);
     lv_obj_set_style_text_color(trigger_label, theme->accent_text_color(), 0);
     lv_obj_center(trigger_label);
+
+    // 配网钮：同按内容宽自适应（en "Wi-Fi" 超 48px），初始排在触发钮左侧
+    // （触发钮估宽 90、本钮估宽 76，仅为初始落位，拖动后互不相关）。
+    wifi_config_btn_ = lv_button_create(screen);
+    lv_obj_set_size(wifi_config_btn_, LV_SIZE_CONTENT, corner_btn_size);
+    lv_obj_set_style_pad_left(wifi_config_btn_, theme->spacing(3), 0);
+    lv_obj_set_style_pad_right(wifi_config_btn_, theme->spacing(3), 0);
+    lv_obj_set_align(wifi_config_btn_, LV_ALIGN_TOP_LEFT);
+    lv_obj_set_pos(wifi_config_btn_,
+                   LV_HOR_RES - 90 - 76 - theme->spacing(3) * 2 - theme->spacing(2),
+                   theme->spacing(3));
+    lv_obj_clear_flag(wifi_config_btn_, LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_clear_flag(wifi_config_btn_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wifi_config_btn_, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_set_style_radius(wifi_config_btn_, 12, 0);
+    lv_obj_set_style_bg_color(wifi_config_btn_, theme->accent_color(), 0);
+    lv_obj_set_style_bg_opa(wifi_config_btn_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wifi_config_btn_, 1, 0);
+    lv_obj_set_style_border_color(wifi_config_btn_, theme->border_color(), 0);
+    lv_obj_t* wifi_label = lv_label_create(wifi_config_btn_);
+    lv_label_set_text(wifi_label, Lang::Strings::WIFI_CONFIG_SHORT);
+    lv_obj_set_style_text_color(wifi_label, theme->accent_text_color(), 0);
+    lv_obj_center(wifi_label);
+    AttachHomeEntryButton(wifi_config_btn_, &wifi_config_drag_, &wifi_config_, "wifi");
+    // 布局记忆恢复：NVS 有存档就覆盖上面的默认位（越界/无存档回默认，不会
+    // 把按钮藏到屏外）。
+    {
+        lv_coord_t saved_x, saved_y;
+        if (LoadHomeButtonPos("talk", &saved_x, &saved_y)) {
+            lv_obj_set_pos(voice_talk_btn_, saved_x, saved_y);
+        }
+        if (LoadHomeButtonPos("trig", &saved_x, &saved_y)) {
+            lv_obj_set_pos(machine_control_trigger_btn_, saved_x, saved_y);
+        }
+        if (LoadHomeButtonPos("wifi", &saved_x, &saved_y)) {
+            lv_obj_set_pos(wifi_config_btn_, saved_x, saved_y);
+        }
+    }
 
     // 抽屉：暗场压底 + 居中纸感面板；点遮罩空白处收起（保留原有语义）。
     machine_control_root_ = lv_obj_create(screen);
@@ -1008,6 +1143,10 @@ void LcdDisplay::EnsureMachineControlUi() {
                         self->ApplyMachineControlState();
                         lv_obj_move_foreground(self->machine_control_root_);
                         lv_obj_remove_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+                    } else {
+                        // 布局记忆：真拖动才写 NVS（点按开抽屉不擦写 flash）。
+                        SaveHomeButtonPos("trig", lv_obj_get_x_aligned(btn),
+                                          lv_obj_get_y_aligned(btn));
                     }
                     self->machine_trigger_dragging_ = false;
                     break;
@@ -1225,6 +1364,109 @@ void LcdDisplay::ConfigureMachineControls(std::function<void()> on_pause,
         DisplayLockGuard lock(this);
         EnsureMachineControlUi();
     }
+}
+
+// 布局记忆（2026-08-20 用户决策）：主页三个可拖按钮的落点存 NVS「hutuji_ui」
+// 命名空间（trig/talk/wifi × _x/_y），重启后原地恢复。键值对少、写入频次低
+// （仅拖动松手一次），直接用项目 Settings 封装。
+void LcdDisplay::SaveHomeButtonPos(const char* prefix, lv_coord_t x, lv_coord_t y) {
+    Settings settings("hutuji_ui", true);
+    settings.SetInt(std::string(prefix) + "_x", x);
+    settings.SetInt(std::string(prefix) + "_y", y);
+}
+
+bool LcdDisplay::LoadHomeButtonPos(const char* prefix, lv_coord_t* x, lv_coord_t* y) {
+    Settings settings("hutuji_ui");
+    const int32_t vx = settings.GetInt(std::string(prefix) + "_x", -1);
+    const int32_t vy = settings.GetInt(std::string(prefix) + "_y", -1);
+    // 越界即视为无存档/脏数据：宁可回默认位，也不能把按钮藏到屏外找不回。
+    if (vx < 0 || vy < 0 || vx >= LV_HOR_RES || vy >= LV_VER_RES) {
+        return false;
+    }
+    *x = vx;
+    *y = vy;
+    return true;
+}
+
+void LcdDisplay::AttachHomeEntryButton(lv_obj_t* btn, HomeButtonDrag* state,
+                                       std::function<void()>* action, const char* nvs_prefix) {
+    // 与触发钮同式：按下记触点与按钮位置，按住按绝对差跟随（不累积采样误差、
+    // 不吞起步位移），越 24px 记拖动，松手未拖才触发动作；PRESS_LOCK 由创建处加。
+    state->action = action;
+    state->nvs_prefix = nvs_prefix;
+    lv_obj_add_event_cb(
+        btn,
+        [](lv_event_t* e) {
+            auto* state = static_cast<HomeButtonDrag*>(lv_event_get_user_data(e));
+            // 用 current_target（回调注册对象=按钮本身）：若日后标签子对象变可
+            // 点击，get_target 会指向标签，拖动会把标签拽飞而按钮不动。
+            lv_obj_t* target = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+            switch (lv_event_get_code(e)) {
+                case LV_EVENT_PRESSED: {
+                    lv_indev_t* indev = lv_event_get_indev(e);
+                    if (indev == nullptr || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+                        break;
+                    }
+                    lv_indev_get_point(indev, &state->press_point);
+                    state->press_x = lv_obj_get_x_aligned(target);
+                    state->press_y = lv_obj_get_y_aligned(target);
+                    state->dragging = false;
+                    break;
+                }
+                case LV_EVENT_PRESSING: {
+                    lv_indev_t* indev = lv_event_get_indev(e);
+                    if (indev == nullptr || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+                        break;
+                    }
+                    lv_point_t point;
+                    lv_indev_get_point(indev, &point);
+                    const lv_coord_t dx = point.x - state->press_point.x;
+                    const lv_coord_t dy = point.y - state->press_point.y;
+                    const lv_coord_t ax = dx < 0 ? -dx : dx;
+                    const lv_coord_t ay = dy < 0 ? -dy : dy;
+                    if (ax + ay > kTriggerDragThresholdPx) {
+                        state->dragging = true;
+                    }
+                    lv_coord_t x = state->press_x + dx;
+                    lv_coord_t y = state->press_y + dy;
+                    const lv_coord_t max_x = LV_HOR_RES - lv_obj_get_width(target);
+                    const lv_coord_t max_y = LV_VER_RES - lv_obj_get_height(target);
+                    x = x < 0 ? 0 : (x > max_x ? max_x : x);
+                    y = y < 0 ? 0 : (y > max_y ? max_y : y);
+                    lv_obj_set_pos(target, x, y);
+                    break;
+                }
+                case LV_EVENT_RELEASED: {
+                    if (!state->dragging && state->action != nullptr && *state->action) {
+                        (*state->action)();
+                    }
+                    // 布局记忆（2026-08-20 用户决策）：真拖动才写 NVS，重启后原地
+                    // 恢复；点按（未拖）不写，避免每次点击都擦写 flash。
+                    if (state->dragging && state->nvs_prefix != nullptr) {
+                        SaveHomeButtonPos(state->nvs_prefix, lv_obj_get_x_aligned(target),
+                                          lv_obj_get_y_aligned(target));
+                    }
+                    state->dragging = false;
+                    break;
+                }
+                case LV_EVENT_PRESS_LOST: {
+                    state->dragging = false;
+                    break;
+                }
+                default:
+                    break;
+            }
+        },
+        // user_data 必须是 state：回调按 HomeButtonDrag* 解引用；曾照抄触发钮传
+        // this（LcdDisplay*），被当成 HomeButtonDrag 写入 → LoadProhibited 白屏重启
+        // （2026-08-20 实机，Backtrace 0x42026ca6）。
+        LV_EVENT_ALL, state);
+}
+
+void LcdDisplay::ConfigureVoiceEntry(std::function<void()> on_talk,
+                                     std::function<void()> on_wifi) {
+    voice_talk_ = std::move(on_talk);
+    wifi_config_ = std::move(on_wifi);
 }
 
 void LcdDisplay::UpdateMachineControlState(const std::string& state) {

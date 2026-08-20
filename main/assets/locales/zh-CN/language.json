@@ -90,6 +90,8 @@
         "MACHINE_UNLOCK": "解除警报",
         "MACHINE_MOTOR_OFF": "关闭电机",
         "MACHINE_RESET": "复位",
-        "MACHINE_STATE_MANUAL": "手动控制中"
+        "MACHINE_STATE_MANUAL": "手动控制中",
+        "VOICE_TALK": "说话",
+        "WIFI_CONFIG_SHORT": "配网"
     }
 }

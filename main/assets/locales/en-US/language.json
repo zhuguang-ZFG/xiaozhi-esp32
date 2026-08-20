@@ -90,6 +90,8 @@
         "MACHINE_UNLOCK": "Unlock",
         "MACHINE_MOTOR_OFF": "Motors Off",
         "MACHINE_RESET": "Reset",
-        "MACHINE_STATE_MANUAL": "Manual"
+        "MACHINE_STATE_MANUAL": "Manual",
+        "VOICE_TALK": "Talk",
+        "WIFI_CONFIG_SHORT": "Wi-Fi"
     }
 }
