@@ -1192,7 +1192,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("timer->WakeUp();", body)
 
     def test_waveshare_logs_live_touch_controller_registers(self):
-        """触摸调参必须先读取板上真实 threshold/rate/chip/vendor，不盲写官方示例值。"""
+        """触摸调参必须先读取板上真实 threshold/peak/rate/chip/vendor，不盲写官方示例值。"""
         board = (
             ROOT
             / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
@@ -1201,18 +1201,22 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         end = board.index("void InitializeLcdDisplay()", start)
         body = board[start:end]
         self.assertIn("kFt6x36ThresholdReg = 0x80", body)
+        self.assertIn("kFt6x36PeakThresholdReg = 0x81", body)
         self.assertIn("kFt6x36ActivePeriodReg = 0x88", body)
         self.assertIn("kFt6x36ChipIdReg = 0xA3", body)
         self.assertIn("kFt6x36VendorIdReg = 0xA8", body)
         self.assertIn("esp_lcd_panel_io_rx_param", body)
         self.assertIn(
-            "Touch registers: threshold=%u active_period=%u chip=0x%02X vendor=0x%02X",
+            "Touch registers: threshold=%u peak=%u active_period=%u chip=0x%02X vendor=0x%02X",
             body,
         )
 
     def test_waveshare_applies_experimental_touch_threshold_with_readback(self):
         """实机默认 70；40 仍漏轻触（2026-08-20 用户反馈）降到 30，并回读验证。
-        FT5x06 官方寄存器文档实值=4×寄存器值，Linux EDT 驱动接受 20–80，30 在界内。"""
+        FT5x06 官方寄存器文档实值=4×寄存器值，Linux EDT 驱动接受 20–80，30 在界内。
+        2026-08-21 三轮反馈仍不灵敏：驱动 demo 初始化把 THPEAK(0x81) 写死 60
+        （按压瞬间峰值检测门），慢速轻触峰值过不了门、GROUP 再低也无济于事——
+        GROUP 30→20（EDT 钳位下限）且 PEAK 60→40（首个保守步长），双值回读验证。"""
         board = (
             ROOT
             / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
@@ -1220,12 +1224,14 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         start = board.index("void InitializeTouch()")
         end = board.index("void InitializeLcdDisplay()", start)
         body = board[start:end]
-        self.assertIn("kTouchThreshold = 30", body)
+        self.assertIn("kTouchThreshold = 20", body)
+        self.assertIn("kTouchPeakThreshold = 40", body)
         self.assertIn("esp_lcd_panel_io_tx_param", body)
-        self.assertIn("Touch threshold tuned: %u -> %u", body)
+        self.assertIn("Touch threshold tuned: %u -> %u peak %u -> %u", body)
         self.assertIn("Touch threshold tune failed", body)
-        self.assertEqual(body.count("esp_lcd_panel_io_tx_param"), 1)
+        self.assertEqual(body.count("esp_lcd_panel_io_tx_param"), 2)
         self.assertIn("kFt6x36ThresholdReg, &kTouchThreshold", body)
+        self.assertIn("kFt6x36PeakThresholdReg, &kTouchPeakThreshold", body)
 
     def test_waveshare_touch_diagnostics_are_not_left_in_production(self):
         """逐触摸原始坐标和按下日志只用于实机定位，最终固件不得持续刷日志。"""

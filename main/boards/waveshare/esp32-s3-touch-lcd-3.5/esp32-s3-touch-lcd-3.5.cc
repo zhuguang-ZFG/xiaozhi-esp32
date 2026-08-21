@@ -321,49 +321,78 @@ private:
         ESP_LOGI(TAG, "Initialize touch controller");
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp));
         constexpr int kFt6x36ThresholdReg = 0x80;
+        constexpr int kFt6x36PeakThresholdReg = 0x81;
         constexpr int kFt6x36ActivePeriodReg = 0x88;
         constexpr int kFt6x36ChipIdReg = 0xA3;
         constexpr int kFt6x36VendorIdReg = 0xA8;
         uint8_t threshold = 0;
-        // FT5x06 0x80 TH_GROUP（实值 = 4×寄存器值，出厂 70 即 280）。40 仍漏
-        // 轻触（2026-08-20 用户反馈不灵敏），降到 30（实值 120；Linux EDT
-        // 驱动接受 20–80 区间，仍在官方有效范围）。灵敏度提高带来的静止抖动
-        // 由下方 24px 滚动阈值与 24px 拖动阈值兜底。
-        constexpr uint8_t kTouchThreshold = 30;
+        // FT5x06 兼容寄存器（实值 = 4×寄存器值）。Espressif 驱动的 demo 初始化把
+        // 本板 FT6336 写死 TH_GROUP=70 / THPEAK=60（ft5x06.c touch_ft5x06_init），
+        // 面板出厂调校在创建驱动那一刻就被覆盖。GROUP 70→40→30 三轮后仍不灵敏：
+        // GROUP(0x80) 只管持续检测，慢速轻触的差分峰值过不了 PEAK(0x81) 门，
+        // GROUP 再低也无济于事。本轮双门齐调：GROUP 20 是 Linux edt-ft5x06 钳位
+        // 区间下限（最敏感的主流发布值），PEAK 40 为首个保守步长。提敏带来的静止
+        // 抖动由 24px 滚动阈值与 24px 拖动阈值兜底；开机日志打印前后值供串口归因。
+        constexpr uint8_t kTouchThreshold = 20;
+        constexpr uint8_t kTouchPeakThreshold = 40;
+        uint8_t peak_threshold = 0;
         uint8_t active_period = 0;
         uint8_t chip_id = 0;
         uint8_t vendor_id = 0;
         const esp_err_t threshold_err =
             esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ThresholdReg, &threshold, 1);
+        const esp_err_t peak_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36PeakThresholdReg, &peak_threshold, 1);
         const esp_err_t period_err =
             esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ActivePeriodReg, &active_period, 1);
         const esp_err_t chip_err =
             esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ChipIdReg, &chip_id, 1);
         const esp_err_t vendor_err =
             esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36VendorIdReg, &vendor_id, 1);
-        if (threshold_err == ESP_OK && period_err == ESP_OK && chip_err == ESP_OK &&
-            vendor_err == ESP_OK) {
+        if (threshold_err == ESP_OK && peak_err == ESP_OK && period_err == ESP_OK &&
+            chip_err == ESP_OK && vendor_err == ESP_OK) {
             ESP_LOGI(TAG,
-                     "Touch registers: threshold=%u active_period=%u chip=0x%02X vendor=0x%02X",
-                     threshold, active_period, chip_id, vendor_id);
+                     "Touch registers: threshold=%u peak=%u active_period=%u chip=0x%02X vendor=0x%02X",
+                     threshold, peak_threshold, active_period, chip_id, vendor_id);
         } else {
-            ESP_LOGW(TAG, "Touch register read failed: threshold=%s period=%s chip=%s vendor=%s",
-                     esp_err_to_name(threshold_err), esp_err_to_name(period_err),
-                     esp_err_to_name(chip_err), esp_err_to_name(vendor_err));
+            ESP_LOGW(TAG,
+                     "Touch register read failed: threshold=%s peak=%s period=%s chip=%s vendor=%s",
+                     esp_err_to_name(threshold_err), esp_err_to_name(peak_err),
+                     esp_err_to_name(period_err), esp_err_to_name(chip_err),
+                     esp_err_to_name(vendor_err));
         }
-        if (threshold_err == ESP_OK && threshold != kTouchThreshold) {
+        // 双门各自「读回→写→回读校验」：任一读失败就不动对应门（不盲写未知状态），
+        // 任一回读不符即告警保留现场值，绝不带着未验证的假设出初始化。
+        const bool group_need = threshold_err == ESP_OK && threshold != kTouchThreshold;
+        const bool peak_need = peak_err == ESP_OK && peak_threshold != kTouchPeakThreshold;
+        if (group_need || peak_need) {
             const uint8_t old_threshold = threshold;
-            const esp_err_t write_err =
-                esp_lcd_panel_io_tx_param(tp_io_handle, kFt6x36ThresholdReg, &kTouchThreshold, 1);
-            const esp_err_t verify_err =
-                write_err == ESP_OK
+            const uint8_t old_peak = peak_threshold;
+            const esp_err_t group_write =
+                group_need
+                    ? esp_lcd_panel_io_tx_param(tp_io_handle, kFt6x36ThresholdReg, &kTouchThreshold, 1)
+                    : ESP_OK;
+            const esp_err_t group_verify =
+                group_write == ESP_OK
                     ? esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ThresholdReg, &threshold, 1)
-                    : write_err;
-            if (verify_err == ESP_OK && threshold == kTouchThreshold) {
-                ESP_LOGI(TAG, "Touch threshold tuned: %u -> %u", old_threshold, threshold);
+                    : group_write;
+            const esp_err_t peak_write =
+                peak_need
+                    ? esp_lcd_panel_io_tx_param(tp_io_handle, kFt6x36PeakThresholdReg, &kTouchPeakThreshold, 1)
+                    : ESP_OK;
+            const esp_err_t peak_verify =
+                peak_write == ESP_OK
+                    ? esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36PeakThresholdReg, &peak_threshold, 1)
+                    : peak_write;
+            if (group_verify == ESP_OK && peak_verify == ESP_OK) {
+                ESP_LOGI(TAG, "Touch threshold tuned: %u -> %u peak %u -> %u",
+                         old_threshold, threshold, old_peak, peak_threshold);
             } else {
-                ESP_LOGW(TAG, "Touch threshold tune failed: write=%s verify=%s value=%u",
-                         esp_err_to_name(write_err), esp_err_to_name(verify_err), threshold);
+                ESP_LOGW(TAG,
+                         "Touch threshold tune failed: group w/v=%s/%s peak w/v=%s/%s value=%u/%u",
+                         esp_err_to_name(group_write), esp_err_to_name(group_verify),
+                         esp_err_to_name(peak_write), esp_err_to_name(peak_verify),
+                         threshold, peak_threshold);
             }
         }
         const lvgl_port_touch_cfg_t touch_cfg = {
