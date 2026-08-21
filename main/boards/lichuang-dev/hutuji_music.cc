@@ -60,10 +60,14 @@ std::string HutujiMusic::LastError() const {
 }
 
 bool HutujiMusic::DeviceStateAllowsMusic() {
-    // 音乐只在「陪聊不出声」或「TTS 正在说话」时成立；用户一开口（listening）
-    // 或链路重建（connecting/activating/upgrade）立即让位，绝不抢对话。
+    // 音乐在 idle/speaking/listening 都成立：会话开着时设备就停在 listening
+    // （喇叭此时空闲，AEC 以播放为参考，歌声不会误唤醒）；2026-08-21 实机
+    // 实测点歌后下载完成的瞬间设备必在 listening，把它当「忙」会让真唱永远
+    // 被掐死。真正的让位条件是链路重建类状态（connecting/activating/upgrade），
+    // 用户喊停走云端 hutuji.stop_song。
     const DeviceState state = Application::GetInstance().GetDeviceState();
-    return state == kDeviceStateIdle || state == kDeviceStateSpeaking;
+    return state == kDeviceStateIdle || state == kDeviceStateSpeaking ||
+           state == kDeviceStateListening;
 }
 
 bool HutujiMusic::Play(const std::string& url, const std::string& title) {
