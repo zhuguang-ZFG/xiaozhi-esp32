@@ -78,8 +78,10 @@ bool HutujiMusic::Play(const std::string& url, const std::string& title) {
     if (IsActive()) {
         ESP_LOGI(kTag, "切歌：先停上一首");
         Stop();
-        if (!WaitStopped(5000)) {
-            SetError("上一首未能在 5s 内退出");
+        // 16s 兜底 = http 读超时 15s + 余量：下载阻塞中的上一首最坏等一次
+        // Read 返回才看到 stop 标志；正常网络下 Stop 即刻生效，不会真等。
+        if (!WaitStopped(16000)) {
+            SetError("上一首未能及时退出");
             return false;
         }
     }
@@ -186,7 +188,10 @@ bool HutujiMusic::DownloadToPsram(const std::string& url) {
         SetError("CreateHttp 失败");
         return false;
     }
-    http->SetTimeout(60000);
+    // 15s 而非 60s：Read 阻塞期间喊停/切歌只能等当前 Read 返回，超时越小
+    // WaitStopped 的兜底等待越短；150KiB 歌曲在能用的网络上秒级下完，
+    // 15s 已盖过 2026-08-21 实测 Cloudflare 冷回源 8-10s 的上限。
+    http->SetTimeout(15000);
     // 生产域由 IsValidSongUrl 强制 HTTPS；HTTP 只允许 RFC1918 联调主机。
     if (!http->Open("GET", url)) {
         SetError("HTTP Open 失败");
@@ -293,6 +298,9 @@ void HutujiMusic::PumpDecoded() {
             packet->sample_rate = sample_rate;
             packet->frame_duration = 60;
             // wait=true 提供背压：投喂速度被解码消费钳住，PSRAM 缓冲不会撑爆队列。
+            // 已知可接受残留：Stop() 的 ResetDecoder 会把阻塞在本 push 上的一帧
+            // （≤60ms）唤醒放进已清空的队列，喊停后可能多出一帧尾音；再清一次
+            // 队列会误伤随后进来的 TTS，故接受。
             if (!audio_service.PushPacketToDecodeQueue(std::move(packet), true)) {
                 push_failed.store(true);
             }
