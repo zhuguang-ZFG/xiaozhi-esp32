@@ -31,6 +31,10 @@
 #include "board.h"
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
 #include "boards/lichuang-dev/grobot_eyes.h"
+#include "boards/lichuang-dev/hutuji_pi_splash_core.h"
+#endif
+#if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
+#include "boards/lichuang-dev/hutuji_pi_splash.h"
 #endif
 
 #define TAG "LcdDisplay"
@@ -108,12 +112,26 @@ void LcdDisplay::InitializeLcdThemes() {
     auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_material_symbols_30_4);
     auto emoji_font = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
 
-    // light theme：暖纸底 + 墨青文字，供主题切换/资产包覆写使用。
+#if CONFIG_HUTUJI_GROBOT_FACE
+    const auto light_accent = lv_color_hex(PiGradientHex(kPiBrandGradientT));
+    const auto dark_accent = light_accent;
+    const auto dark_success = lv_color_hex(PiGradientHex(kPiSuccessGradientT));
+    const auto dark_warning = lv_color_hex(PiGradientHex(kPiWarningGradientT));
+    const auto dark_danger = lv_color_hex(PiGradientHex(kPiDangerGradientT));
+#else
+    const auto light_accent = lv_color_hex(0x0F8F8A);
+    const auto dark_accent = lv_color_hex(0x32D6CB);
+    const auto dark_success = lv_color_hex(0x5ECB9A);
+    const auto dark_warning = lv_color_hex(0xE4B15D);
+    const auto dark_danger = lv_color_hex(0xE06A70);
+#endif
+
+    // light theme：暖纸底 + 墨青文字；主 accent 取 π 中段品牌蓝紫，按钮与 splash 同调。
     auto light_theme = new LvglTheme("light");
     light_theme->set_background_color(lv_color_hex(0xF4F1EA));
     light_theme->set_text_color(lv_color_hex(0x1E252B));
     light_theme->set_chat_background_color(lv_color_hex(0xEDE8DE));
-    light_theme->set_user_bubble_color(lv_color_hex(0xD8F3F0));
+    light_theme->set_user_bubble_color(lv_color_hex(0xE4E1F8));
     light_theme->set_assistant_bubble_color(lv_color_hex(0xFFFDF8));
     light_theme->set_system_bubble_color(lv_color_hex(0xF4F1EA));
     light_theme->set_system_text_color(lv_color_hex(0x667078));
@@ -121,8 +139,8 @@ void LcdDisplay::InitializeLcdThemes() {
     light_theme->set_low_battery_color(lv_color_hex(0xC64F52));
     light_theme->set_surface_color(lv_color_hex(0xFFFDF8));
     light_theme->set_muted_text_color(lv_color_hex(0x667078));
-    light_theme->set_accent_color(lv_color_hex(0x0F8F8A));
-    light_theme->set_accent_text_color(lv_color_hex(0xFFFFFF));
+    light_theme->set_accent_color(light_accent);
+    light_theme->set_accent_text_color(lv_color_hex(0x1E252B));
     light_theme->set_success_color(lv_color_hex(0x2F8F68));
     light_theme->set_warning_color(lv_color_hex(0xC8862A));
     light_theme->set_danger_color(lv_color_hex(0xC64F52));
@@ -131,12 +149,12 @@ void LcdDisplay::InitializeLcdThemes() {
     light_theme->set_large_icon_font(large_icon_font);
     light_theme->set_emoji_font(emoji_font);
 
-    // dark theme：低饱和墨蓝底，青蓝只做注意力，不用霓虹铺满屏幕。
+    // dark theme：深色底承载 π 中段蓝紫；青/薄荷只留给冷静、成功等语义状态。
     auto dark_theme = new LvglTheme("dark");
     dark_theme->set_background_color(lv_color_hex(0x10161C));
     dark_theme->set_text_color(lv_color_hex(0xF2F0E8));
     dark_theme->set_chat_background_color(lv_color_hex(0x141C22));
-    dark_theme->set_user_bubble_color(lv_color_hex(0x1B7773));
+    dark_theme->set_user_bubble_color(lv_color_hex(0x302D5A));
     dark_theme->set_assistant_bubble_color(lv_color_hex(0x1E2930));
     dark_theme->set_system_bubble_color(lv_color_hex(0x172026));
     dark_theme->set_system_text_color(lv_color_hex(0xA7B1B8));
@@ -144,11 +162,11 @@ void LcdDisplay::InitializeLcdThemes() {
     dark_theme->set_low_battery_color(lv_color_hex(0xD95D62));
     dark_theme->set_surface_color(lv_color_hex(0x1A242B));
     dark_theme->set_muted_text_color(lv_color_hex(0xA7B1B8));
-    dark_theme->set_accent_color(lv_color_hex(0x32D6CB));
+    dark_theme->set_accent_color(dark_accent);
     dark_theme->set_accent_text_color(lv_color_hex(0x071316));
-    dark_theme->set_success_color(lv_color_hex(0x5ECB9A));
-    dark_theme->set_warning_color(lv_color_hex(0xE4B15D));
-    dark_theme->set_danger_color(lv_color_hex(0xE06A70));
+    dark_theme->set_success_color(dark_success);
+    dark_theme->set_warning_color(dark_warning);
+    dark_theme->set_danger_color(dark_danger);
     dark_theme->set_text_font(text_font);
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
@@ -509,14 +527,12 @@ void LcdDisplay::HideProvisioningQr() {
          lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
         lv_obj_remove_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
     }
-    if (voice_talk_btn_ != nullptr &&
-        (draw_preview_root_ == nullptr ||
-         lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
+    if (voice_talk_btn_ != nullptr && (draw_preview_root_ == nullptr ||
+                                       lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
         lv_obj_remove_flag(voice_talk_btn_, LV_OBJ_FLAG_HIDDEN);
     }
-    if (wifi_config_btn_ != nullptr &&
-        (draw_preview_root_ == nullptr ||
-         lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
+    if (wifi_config_btn_ != nullptr && (draw_preview_root_ == nullptr ||
+                                        lv_obj_has_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN))) {
         lv_obj_remove_flag(wifi_config_btn_, LV_OBJ_FLAG_HIDDEN);
     }
     lv_image_set_src(provisioning_qr_code_, nullptr);
@@ -794,8 +810,8 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_set_style_pad_left(machine_control_trigger_btn_, theme->spacing(3), 0);
     lv_obj_set_style_pad_right(machine_control_trigger_btn_, theme->spacing(3), 0);
     lv_obj_set_align(machine_control_trigger_btn_, LV_ALIGN_TOP_LEFT);
-    lv_obj_set_pos(machine_control_trigger_btn_,
-                   LV_HOR_RES - 90 - theme->spacing(3), theme->spacing(3));
+    lv_obj_set_pos(machine_control_trigger_btn_, LV_HOR_RES - 90 - theme->spacing(3),
+                   theme->spacing(3));
     lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLL_CHAIN);
     // 拖动时持续锁定最初命中的按钮；按钮本身不参与 LVGL 滚动判定。
     lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLLABLE);
@@ -951,10 +967,10 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_set_style_pad_bottom(machine_state_label_, theme->spacing(1), 0);
     // 「点动·手动」与主操作区互斥切页：孩子看到的是创作面板，点动/复位等工具
     // 一键切过去，切回来一键回主页。不做同屏堆叠——堆叠必然溢出面板。
-    machine_manual_toggle_btn_ = make_button(
-        header, Lang::Strings::MACHINE_MANUAL_EXPAND, theme->assistant_bubble_color(),
-        theme->text_color(), LV_HOR_RES * 27 / 100, safe_button_height,
-        &machine_manual_toggle_label_);
+    machine_manual_toggle_btn_ =
+        make_button(header, Lang::Strings::MACHINE_MANUAL_EXPAND, theme->assistant_bubble_color(),
+                    theme->text_color(), LV_HOR_RES * 27 / 100, safe_button_height,
+                    &machine_manual_toggle_label_);
     machine_close_btn_ =
         make_button(header, Lang::Strings::MACHINE_CLOSE, theme->assistant_bubble_color(),
                     theme->text_color(), LV_HOR_RES / 5, safe_button_height);
@@ -1029,8 +1045,7 @@ void LcdDisplay::EnsureMachineControlUi() {
         lv_obj_remove_style_all(col);
         lv_obj_set_size(col, width, LV_SIZE_CONTENT);
         lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_row(col, theme->spacing(4), 0);
         lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
         return col;
@@ -1276,8 +1291,8 @@ void LcdDisplay::SetMachineManualSectionVisible(bool visible) {
     // 展开/收起无其他日志面，HIL 取证需要区分「CLICKED 没发」与「发了但别的环节断」。
     // 顺带记 taskLVGL 历史最深空闲栈（HWM 单调只减，此刻读到的是手动页布局+绘制
     // 全程峰值余量）：证据化 12288 抬栈后手动页是否仍贴底，防止它静默回压穿。
-    ESP_LOGI(TAG, "machine manual section %s, lvgl stack hwm %u", visible ? "expanded" : "collapsed",
-             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    ESP_LOGI(TAG, "machine manual section %s, lvgl stack hwm %u",
+             visible ? "expanded" : "collapsed", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
 void LcdDisplay::ApplyMachineControlState() {
@@ -1472,8 +1487,7 @@ void LcdDisplay::AttachHomeEntryButton(lv_obj_t* btn, HomeButtonDrag* state,
         LV_EVENT_ALL, state);
 }
 
-void LcdDisplay::ConfigureVoiceEntry(std::function<void()> on_talk,
-                                     std::function<void()> on_wifi) {
+void LcdDisplay::ConfigureVoiceEntry(std::function<void()> on_talk, std::function<void()> on_wifi) {
     voice_talk_ = std::move(on_talk);
     wifi_config_ = std::move(on_wifi);
 }
@@ -1486,6 +1500,12 @@ void LcdDisplay::UpdateMachineControlState(const std::string& state) {
 
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
+#if CONFIG_HUTUJI_GROBOT_FACE
+    if (accent_drift_timer_ != nullptr) {
+        lv_timer_delete(accent_drift_timer_);
+        accent_drift_timer_ = nullptr;
+    }
+#endif
 
     // Clean up GIF controller
     if (gif_controller_) {
@@ -1624,8 +1644,8 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    auto eye_color = theme->accent_color();
-    auto eyes = std::make_unique<GrobotEyes>(eye_color, theme->background_color());
+    // Grobot 自己从 π splash 的共享渐变取色；主题 accent 仍只用于按钮/状态语义。
+    auto eyes = std::make_unique<GrobotEyes>(theme->background_color());
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
     // 480x320 横屏：四边仅留约 10px 安全边距，状态栏继续独立叠在最前层。
     constexpr int kFaceWidth = 460;
@@ -1683,6 +1703,31 @@ void LcdDisplay::SetGrobotSubtitle(const char* content) {
         lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
     }
 }
+
+#if CONFIG_HUTUJI_GROBOT_FACE
+void LcdDisplay::AccentDriftTimerCb(lv_timer_t* timer) {
+    auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
+    // 8s 正弦绕 π 品牌中段（0.50）±0.10：明显可辨的色相呼吸，不出品牌色带。
+    const uint32_t tick = lv_tick_get();
+    const float drift = 0.10f * sinf((float)(tick % 8000) / 8000.0f * 6.2832f);
+    const lv_color_t c = lv_color_hex(PiGradientHex(kPiBrandGradientT + drift));
+    lv_obj_t* targets[] = {self->voice_talk_btn_, self->machine_control_trigger_btn_,
+                           self->wifi_config_btn_, self->draw_preview_confirm_btn_};
+    for (lv_obj_t* btn : targets) {
+        if (btn != nullptr) {
+            lv_obj_set_style_bg_color(btn, c, 0);
+        }
+    }
+    // 说话大圆钮再叠 2.5s 呼吸光晕：彩色阴影宽度/不透明度脉动，全屏视觉主角。
+    if (self->voice_talk_btn_ != nullptr) {
+        const float breath = 0.5f + 0.5f * sinf((float)(tick % 2500) / 2500.0f * 6.2832f);
+        lv_obj_set_style_shadow_width(self->voice_talk_btn_, 24 + (int)(12.0f * breath), 0);
+        lv_obj_set_style_shadow_color(self->voice_talk_btn_, c, 0);
+        lv_obj_set_style_shadow_opa(self->voice_talk_btn_, (lv_opa_t)(60 + (int)(120.0f * breath)),
+                                    0);
+    }
+}
+#endif
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
 void LcdDisplay::SetupUI() {
@@ -1838,6 +1883,20 @@ void LcdDisplay::SetupUI() {
     if (provisioning_qr_root_ != nullptr) {
         lv_obj_move_foreground(provisioning_qr_root_);
     }
+#if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
+    // 主界面搭好后立刻盖上启动画面：π 播 3000ms（上游原值）再 500ms 交接给脸。
+    // 交接目标取 emoji_box_（Grobot 画布容器），淡入上浮的是脸本身，不动状态栏
+    // 与按钮——它们在 backdrop 底下，随 backdrop 一起淡出即自然露出。
+    pi_splash_ = std::make_unique<HutujiPiSplash>();
+    if (!pi_splash_->Start(screen, LV_HOR_RES, LV_VER_RES, emoji_box_)) {
+        pi_splash_.reset();
+    }
+#endif
+#if CONFIG_HUTUJI_GROBOT_FACE
+    // accent 按钮呼吸：与脸共用 π 品牌中段，10s 正弦 ±0.06 漂移，100ms 刷新。
+    // 只刷主屏 accent 钮；成功/警告/危险等安全语义色保持恒定。
+    accent_drift_timer_ = lv_timer_create(AccentDriftTimerCb, 100, this);
+#endif
 }
 #if CONFIG_IDF_TARGET_ESP32P4
 #define MAX_MESSAGES 40

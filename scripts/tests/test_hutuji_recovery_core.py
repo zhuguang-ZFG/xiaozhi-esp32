@@ -1509,12 +1509,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self.assertIn("0.15f, 0", wink_line)
 
-        # 情绪配色：angry 红 / loving 粉 / thinking 紫 必须在表内
-        self.assertIn("kMoodColors", eyes_cc)
-        self.assertIn("0xFF7A70", eyes_cc)
-        self.assertIn("0xFF7EB6", eyes_cc)
-        self.assertIn("0xBF8FFF", eyes_cc)
-        self.assertIn("RecomputePalette(color != 0 ? lv_color_hex(color) : eye_color_default_)", eyes_cc)
+        # 情绪配色：所有眼色从 π logo 共享渐变的位置表导出，禁止回到独立色相。
+        self.assertIn("kMoodGradientT", eyes_cc)
+        self.assertRegex(eyes_cc, r"0\.02f,\s+// angry：热粉起点")
+        self.assertRegex(eyes_cc, r"0\.06f,\s+// loving：粉紫")
+        self.assertRegex(eyes_cc, r"0\.32f,\s+// thinking：紫")
+        self.assertIn("RecomputePalette(mood_t)", eyes_cc)
 
         # 说话/聆听钩子：LcdDisplay::SetStatus 先调基类再驱动眼睛
         self.assertIn("void LcdDisplay::SetStatus(const char* status)", lcd_cc)
@@ -1567,14 +1567,16 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         # 抗锯齿：圆边 1px 按覆盖率与底层像素混合（Blend565）
         self.assertIn("Blend565", eyes_h)
-        self.assertIn("buf_[row * s + cl] = Blend565(cv, buf_[row * s + cl], frac)", eyes_cc)
+        self.assertIn("buf_[row * s + cl] = Blend565(Resolve(p, cl, row), buf_[row * s + cl], frac)", eyes_cc)
 
-        # 配色族系：喜悦族暖金进表，happy/laughing/funny/winking 四席
-        self.assertEqual(eyes_cc.count("0xFFCF3F"), 4)
-        self.assertIn("0xD8B4E2", eyes_cc)  # embarrassed 薰衣草
-        self.assertIn("0xBDF3FF", eyes_cc)  # cool 冰蓝
-        self.assertIn("0xFF6B35", eyes_cc)  # delicious 橙
-        self.assertIn("0xFF9770", eyes_cc)  # silly 蜜桃
+        # 配色族系：21 个情绪各自落在 π 的同一条渐变上，喜悦族占冷端青/薄荷，
+        # 不再引入渐变外的暖金/橙/珊瑚色。
+        self.assertIn("static constexpr float kMoodGradientT[]", eyes_cc)
+        for entry in (r"0\.99f,\s+// happy", r"1\.00f,\s+// laughing",
+                      r"0\.94f,\s+// funny", r"0\.90f,\s+// winking"):
+            self.assertRegex(eyes_cc, entry)
+        self.assertNotIn("0xFFCF3F", eyes_cc)
+        self.assertNotIn("0xFF6B35", eyes_cc)
 
 
 
@@ -1631,6 +1633,29 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertNotIn("otto_emoji_gif", eyes_cc)
         self.assertNotIn("emote::EmoteDisplay", lcd_cc)
 
+    def test_pi_palette_drives_theme_buttons_and_grobot(self):
+        """常驻按钮与 Grobot 默认色必须共用 π 品牌锚点，旧青色不可覆盖新主题。"""
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        core_h = (ROOT / "main/boards/lichuang-dev/hutuji_pi_splash_core.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("kPiBrandGradientT = 0.50f", core_h)
+        self.assertIn("PiGradientHex(kPiBrandGradientT)", lcd_cc)
+        self.assertIn("dark_accent = light_accent", lcd_cc)
+        self.assertIn("dark_success = lv_color_hex(PiGradientHex(kPiSuccessGradientT))", lcd_cc)
+        self.assertIn("dark_warning = lv_color_hex(PiGradientHex(kPiWarningGradientT))", lcd_cc)
+        self.assertIn("dark_danger = lv_color_hex(PiGradientHex(kPiDangerGradientT))", lcd_cc)
+        self.assertEqual(lcd_cc.count("dark_theme->set_accent_color("), 1)
+        self.assertEqual(lcd_cc.count("dark_theme->set_warning_color("), 1)
+        self.assertEqual(lcd_cc.count("dark_theme->set_danger_color("), 1)
+        self.assertIn("RecomputePalette(kMoodGradientT[0])", eyes_cc)
+        self.assertRegex(eyes_cc, r"0\.62f,\s+// sad：长春花偏青")
+        self.assertNotIn("set_accent_color(lv_color_hex(0x32D6CB))", lcd_cc)
+        self.assertNotIn("set_accent_color(lv_color_hex(0x0F8F8A))", lcd_cc)
+
 
     def test_grobot_full_face_shows_compact_response_subtitle(self):
         """全脸必须用独立单行字幕层显示语音/工具反馈，不依赖某个消息样式
@@ -1672,7 +1697,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         bg_end = eyes_cc.index("void GrobotEyes::DrawEye", bg_start)
         bg_body = eyes_cc[bg_start:bg_end]
         self.assertEqual(eyes_cc.count("scan_color_ ="), 1)
-        self.assertIn("scan_color_ = lv_color_mix(eye_color_, bg_color_, 7)", eyes_cc)
+        self.assertIn("scan_color_ = lv_color_mix(center_eye, bg_color_, 7)", eyes_cc)
         self.assertNotIn("BufHLine(0, w_ - 1, h_ / 2", bg_body)
 
         clear_start = lcd_cc.index("void LcdDisplay::ClearChatMessages")
@@ -1707,7 +1732,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("{55, 0, 0, 20, 42, 0, 0}", eyes_cc)
         self.assertIn("{0, 0, 0.22f, 0.02f, 0.45f, 0.02f", eyes_cc)
         self.assertNotIn("0x3E8E96,  // sleepy", eyes_cc)
-        self.assertIn("0,         // sleepy：品牌青", eyes_cc)
+        self.assertRegex(eyes_cc, r"0\.44f,\s+// sleepy：长春花偏紫")
 
     def test_grobot_sleepy_disables_blink_and_idle_saccade(self):
         """sleepy 保持稳定半闭眼和居中视线，退出后重新开始眨眼间隔。"""
@@ -1744,8 +1769,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("const int browArch = std::max(10, eyeR / 6)", body)
         self.assertIn("const int browWeight = std::max(2, eyeR / 24)", body)
         self.assertIn("browGlowWeight", body)
-        self.assertIn("glow_[0]", body)
-        self.assertIn("brow, browWeight", body)
+        self.assertIn("Shade(kShadeGlow0)", body)
+        self.assertIn("Shade(kShadeBrow), browWeight", body)
         self.assertIn("drawBrow", body)
         self.assertNotIn("cx - offset - halfW, yL - tiltL", body)
 
@@ -1762,9 +1787,14 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("{18, 18, -0.04f, -0.04f, -0.20f, 0.06f", eyes_cc)
         self.assertIn("{-8, -8, -0.06f, -0.06f, -0.40f, 0.18f", eyes_cc)
         self.assertIn("{0, 0, 0.18f, 0.18f, 0, 0.72f", eyes_cc)
-        self.assertIn("0xFF7A70,  // angry：柔珊瑚", eyes_cc)
-        self.assertIn("0xA8CAFF,  // crying：柔浅蓝", eyes_cc)
-        self.assertIn("0xFFD166,  // shocked：暖金", eyes_cc)
+        # 负面情绪仍有区分，但颜色也必须留在 π 的粉→紫→青渐变：
+        # angry 暖端、sad 长春花偏青、crying 青蓝、shocked 冷端。
+        self.assertRegex(eyes_cc, r"0\.02f,\s+// angry：热粉起点")
+        self.assertRegex(eyes_cc, r"0\.62f,\s+// sad：长春花偏青")
+        self.assertRegex(eyes_cc, r"0\.70f,\s+// crying：青蓝")
+        self.assertRegex(eyes_cc, r"0\.66f,\s+// shocked：青蓝")
+        self.assertNotIn("0xFF7A70", eyes_cc)
+        self.assertNotIn("0xFFD166", eyes_cc)
         self.assertIn("mood_index_ == kSleepyMoodIndex ? 0", eyes_cc)
         self.assertIn("1.0f * sinf", eyes_cc)
         self.assertNotIn("2.0f * sinf", eyes_cc)
@@ -1779,9 +1809,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         effects_start = eyes_cc.index("void GrobotEyes::DrawFacialEffects", mouth_start)
         nose_body = eyes_cc[nose_start:mouth_start]
         mouth_body = eyes_cc[mouth_start:effects_start]
-        self.assertIn("bg_color_, 145", nose_body)
+        self.assertIn("lv_color_mix(eye, bg_color_, 145)", eyes_cc)
         self.assertIn("const int noseRx = std::max(14, eyeR / 3)", nose_body)
-        self.assertIn("noseHighlight", nose_body)
+        self.assertIn("Shade(kShadeNoseHi)", nose_body)
         self.assertNotIn("BufFillEllipse(cx, noseY - 1", nose_body)
         self.assertIn("if (open > 5)", mouth_body)
         self.assertIn("tongue", mouth_body)
@@ -1804,7 +1834,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("const int halfW = eyeR * 3 / 4", eyes_cc)
         self.assertIn("const int browWeight = std::max(2, eyeR / 24)", eyes_cc)
         self.assertIn("const int noseRx = std::max(14, eyeR / 3)", eyes_cc)
-        self.assertIn("noseShadow", eyes_cc)
+        self.assertIn("kShadeNoseShadow", eyes_cc)
         self.assertIn("const int width = eyeR * 11 / 5", eyes_cc)
         self.assertIn("const int lipGap = std::max(6, open / 2)", eyes_cc)
         self.assertIn("{0, 0, 0, 0, 0.48f, 0.12f", eyes_cc)
@@ -1812,7 +1842,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("const int lipSeparation = lipGap - lipGap * iabs", eyes_cc)
         self.assertIn("layout_.scale *= 1.08f", eyes_cc)
         self.assertIn("layout_.centerY = h_ / 2 + eyeR / 5", eyes_cc)
-        self.assertIn("mouthCorner", eyes_cc)
+        self.assertIn("kShadeMouthCorner", eyes_cc)
         self.assertIn("const int cy = layout_.centerY", eyes_cc)
     def test_grobot_uses_cached_golden_ratio_layout(self):
         """全脸采用缓存的黄金比例构图，避免按画布高度直接把眼睛撑满。"""
@@ -1846,7 +1876,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         palette_start = eyes_cc.index("void GrobotEyes::RecomputePalette")
         palette_end = eyes_cc.index("GrobotEyes::~GrobotEyes", palette_start)
         palette_body = eyes_cc[palette_start:palette_end]
-        self.assertIn("eye_color_ = eye_color", palette_body)
+        self.assertIn("PiGradientRgb(tc, shine_strength, shine_pos", palette_body)
+        self.assertIn("kPiFacePhaseSwing", palette_body)
         self.assertIn("void GrobotEyes::UpdateDeltaTime()", eyes_cc)
 
         status_start = lcd_cc.index("void LcdDisplay::SetStatus")
@@ -1872,8 +1903,40 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         self.assertIn("static_assert(std::size(kMoods) == std::size(kNames))", eyes_cc)
         self.assertIn("static_assert(std::size(kFacialMoods) == std::size(kNames))", eyes_cc)
-        self.assertIn("static_assert(std::size(kMoodColors) == std::size(kNames))", eyes_cc)
+        self.assertIn("static_assert(std::size(kMoodGradientT) == std::size(kNames))", eyes_cc)
         self.assertIn("kMoodCount = std::size(kNames)", eyes_cc)
+
+    def test_grobot_face_shine_flows_and_accent_buttons_breathe(self):
+        """脸的「活」= 色相潮汐（5s 正弦 ±0.22，钳制映射无接缝）+ 上游 shine 扫光
+        （说话 1.5s/周 0.90 连续扫、空闲 6s 周期占空 34%、sleepy 全停）；主屏 accent
+        按钮 8s ±0.10 呼吸，说话大圆钮叠 2.5s 光晕脉动，安全语义色不参与。"""
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
+            encoding="utf-8"
+        )
+        eyes_h = (ROOT / "main/boards/lichuang-dev/grobot_eyes.h").read_text(
+            encoding="utf-8"
+        )
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        # 潮汐 + 扫光：钳制映射（禁绕回硬边），每帧重建 64 级 LUT
+        self.assertIn("BuildShadeLut", eyes_h)
+        self.assertIn("std::clamp(base + phase, 0.0f, 1.0f)", eyes_cc)
+        self.assertNotIn("PiWrap01(base + phase)", eyes_cc)
+        self.assertIn("0.22f * sinf", eyes_cc)
+        self.assertIn("PiGradientRgb(tc, shine_strength, shine_pos", eyes_cc)
+        self.assertIn("kPiShineHalfWidth", eyes_cc)
+        self.assertIn("speaking_ ? 1500000 : 6000000", eyes_cc)
+        self.assertIn("speaking_ ? 1.0f : 0.34f", eyes_cc)
+        self.assertIn("speaking_ ? 0.90f : 0.85f", eyes_cc)
+        self.assertIn("mood_index_ != kSleepyMoodIndex", eyes_cc)
+        self.assertIn("BuildShadeLut(mood_base_phase_ + tide", eyes_cc)
+        # 按钮呼吸 + 说话钮光晕：只刷 accent 系，安全语义色恒定
+        self.assertIn("AccentDriftTimerCb", lcd_cc)
+        self.assertIn("0.10f * sinf", lcd_cc)
+        self.assertIn("kPiBrandGradientT + drift", lcd_cc)
+        self.assertIn("lv_obj_set_style_shadow_width(self->voice_talk_btn_", lcd_cc)
+        self.assertIn("tick % 2500", lcd_cc)
+        self.assertIn("lv_timer_create(AccentDriftTimerCb, 100, this)", lcd_cc)
+        self.assertIn("lv_timer_delete(accent_drift_timer_)", lcd_cc)
 
     def test_production_board_registers_preview_confirm_tools(self):
         """产品板是 Waveshare：预览/确认必须在这块板上注册，否则真机走不到确认门。"""
@@ -1985,7 +2048,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("LV_ALIGN_TOP_LEFT", ui_body)
         self.assertIn("const lv_coord_t corner_btn_size = 48;", ui_body)
         self.assertIn("const lv_coord_t talk_diameter = 96;", ui_body)
-        self.assertIn("LV_HOR_RES - 90 - theme->spacing(3), theme->spacing(3));", ui_body)
+        self.assertRegex(
+            ui_body,
+            r"LV_HOR_RES - 90 - theme->spacing\(3\),\s*theme->spacing\(3\)\);",
+        )
         trigger_setup = ui_body[: ui_body.index("lv_obj_add_event_cb")]
         self.assertNotIn("lv_obj_get_width(machine_control_trigger_btn_)", trigger_setup)
         self.assertNotIn("lv_obj_get_height(machine_control_trigger_btn_)", trigger_setup)
@@ -2089,7 +2155,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             self.assertIn(f'"{action}"', ui_body)
         # 页切换钮进标题行：独占一行会吃掉 64px，主页就装不下 64+56+56 三行。
         # 只钉「父对象是 header」这一语义，不钉 clang-format 的换行位置。
-        toggle_start = ui_body.index("machine_manual_toggle_btn_ = make_button(")
+        toggle_start = ui_body.index("machine_manual_toggle_btn_ =")
         toggle_args = ui_body[toggle_start:ui_body.index(";", toggle_start)]
         self.assertRegex(toggle_args, r"make_button\(\s*header,")
         self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", toggle_args)

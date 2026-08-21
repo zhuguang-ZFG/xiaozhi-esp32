@@ -7,6 +7,9 @@
 #include <cstring>
 #include <iterator>
 
+// 情绪配色与开机 π logo 共用同一条渐变，色标定义只此一处。
+#include "hutuji_pi_splash_core.h"
+
 static const char* TAG = "GrobotEyes";
 
 // 每情绪 7 参：topH, botH, tilt, pR, radius, lookX, lookY。
@@ -61,32 +64,43 @@ static const FacialData kFacialMoods[] = {
     {18, -6, 0.14f, 0.03f, 0.80f, 0.40f, 0.30f, 0, 0, 0.25f},  // silly
     {20, -18, 0.12f, -0.04f, -0.22f, 0.06f, 0, 0, 0.2f, 0},    // confused
 };
-// 情绪配色；0 = 保持品牌青（构造色）。原则：色相只给语义强关联的情绪，同族同色系，
-// 避免彩虹屏——暖金=喜悦族、红=怒、蓝系=悲、粉=爱、紫=思考、绿=平静、暗青=困、
-// 琥珀=惊、橙/蜜桃=顽皮、冰蓝=酷、薰衣草=窘。
-static const uint32_t kMoodColors[] = {
-    0,         // neutral：品牌青
-    0xFFCF3F,  // happy：暖金（喜悦族）
-    0xFFCF3F,  // laughing：暖金
-    0xFFCF3F,  // funny：暖金
-    0x5E9BFF,  // sad：柔蓝
-    0xFF7A70,  // angry：柔珊瑚
-    0xA8CAFF,  // crying：柔浅蓝
-    0xFF7EB6,  // loving：粉
-    0xD8B4E2,  // embarrassed：薰衣草
-    0,         // surprised：品牌青
-    0xFFD166,  // shocked：暖金
-    0xBF8FFF,  // thinking：紫
-    0xFFCF3F,  // winking：暖金
-    0xBDF3FF,  // cool：冰蓝
-    0x58D68D,  // relaxed：绿
-    0xFF6B35,  // delicious：橙
-    0xFF7EB6,  // kissy：粉
-    0,         // confident：品牌青
-    0,         // sleepy：品牌青
-    0xFF9770,  // silly：蜜桃
-    0,         // confused：品牌青
+// 情绪配色：整张脸铺与开机 π logo 静止帧完全相同的 0..1 全程对角线渐变
+// （左下热粉→右上薄荷）。本表的 t 不再是取色点，而是情绪相位：相对品牌中段
+// 的偏移经 kPiFacePhaseSwing 压缩成 ±0.15 的彩虹旋转（见 RecomputePalette），
+// 情绪保持可辨，但任何情绪下脸都和 π 一样是彩虹。语义映射：暖端(粉/品红) =
+// 爱/馋/怒等高唤醒，中段(紫/长春花) = 思考/窘/困/悲，冷端(青/薄荷) =
+// 平静/酷/喜悦族。勿手写十六进制——那会脱离渐变、破坏和谐。
+static constexpr float kMoodGradientT[] = {
+    kPiBrandGradientT,  // neutral：π 主视觉中段长春花蓝紫
+    0.99f,              // happy：薄荷（喜悦族冷端）
+    1.00f,              // laughing：薄荷末端，最亮
+    0.94f,              // funny：薄荷偏青
+    0.62f,              // sad：长春花偏青，区别于 neutral 品牌蓝紫
+    0.02f,              // angry：热粉起点，最暖最强
+    0.70f,              // crying：青蓝，区别于 sad 与 shocked
+    0.06f,              // loving：粉紫
+    0.22f,              // embarrassed：紫罗兰
+    0.76f,              // surprised：亮青
+    0.66f,              // shocked：青蓝，比 surprised 冷一档
+    0.32f,              // thinking：紫
+    0.90f,              // winking：青绿（喜悦族）
+    0.80f,              // cool：亮青
+    0.96f,              // relaxed：薄荷
+    0.10f,              // delicious：品红（暖端，馋）
+    0.04f,              // kissy：热粉偏紫
+    0.84f,              // confident：亮青
+    0.44f,              // sleepy：长春花偏紫
+    0.16f,              // silly：紫粉
+    0.36f,              // confused：紫偏长春花
 };
+// 面部点缀色同样取 π 渐变，不再手写十六进制：舌/腮红取暖端粉，泪取中段长春花，
+// 汗取冷端青，星芒取薄荷末端（最亮）。原值 0xFF7EB6/0x7FB3FF/0xBDF3FF/0xFFD60A
+// 里的暖黄星芒完全落在渐变外，是开机后最扎眼的不和谐点。
+static constexpr float kTongueGradientT = 0.03f;
+static constexpr float kBlushGradientT = 0.03f;
+static constexpr float kTearGradientT = 0.55f;
+static constexpr float kSweatGradientT = 0.75f;
+static constexpr float kSparkleGradientT = 0.99f;
 static const char* kNames[] = {
     "neutral", "happy",       "laughing",  "funny",     "sad",      "angry",   "crying",
     "loving",  "embarrassed", "surprised", "shocked",   "thinking", "winking", "cool",
@@ -94,30 +108,56 @@ static const char* kNames[] = {
 };
 static_assert(std::size(kMoods) == std::size(kNames));
 static_assert(std::size(kFacialMoods) == std::size(kNames));
-static_assert(std::size(kMoodColors) == std::size(kNames));
+static_assert(std::size(kMoodGradientT) == std::size(kNames));
 static constexpr size_t kMoodCount = std::size(kNames);
 static constexpr int kSleepyMoodIndex = 18;
 
-GrobotEyes::GrobotEyes(lv_color_t eyeColor, lv_color_t bgColor)
-    : eye_color_(eyeColor), bg_color_(bgColor), eye_color_default_(eyeColor) {
-    RecomputePalette(eyeColor);
+GrobotEyes::GrobotEyes(lv_color_t bgColor) : bg_color_(bgColor) {
+    RecomputePalette(kMoodGradientT[0]);
     curL_ = {0, 0, 0, kPupilRadius, kEyeRadius, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     curR_ = targetL_ = targetR_ = baseL_ = baseR_ = curL_;
     face_cur_ = face_target_ = kFacialMoods[0];
     last_frame_us_ = last_blink_us_ = esp_timer_get_time();
 }
+void GrobotEyes::RecomputePalette(float mood_t) {
+    // 相位 = 情绪 t 相对品牌中段的偏移 × kPiFacePhaseSwing（±0.15）：
+    // 情绪让整条彩虹轻微旋转，而不是换成另一个平色。
+    mood_base_phase_ = (mood_t - kPiBrandGradientT) * kPiFacePhaseSwing;
+    BuildShadeLut(mood_base_phase_, 0.0f, -1.0f);
+}
 
-void GrobotEyes::RecomputePalette(lv_color_t eye_color) {
-    eye_color_ = eye_color;
-    scan_color_ = lv_color_mix(eye_color_, bg_color_, 7);
-    glow_[0] = lv_color_mix(eye_color_, bg_color_, 38);
-    glow_[1] = lv_color_mix(eye_color_, bg_color_, 77);
-    glow_[2] = lv_color_mix(eye_color_, bg_color_, 128);
-    iris_[0] = lv_color_mix(eye_color_, bg_color_, 153);
-    iris_[1] = eye_color_;
-    iris_[2] = lv_color_mix(lv_color_white(), eye_color_, 77);
-    pupil_color_ = lv_color_mix(eye_color_, bg_color_, 25);
-    highlight_color_ = lv_color_mix(lv_color_white(), eye_color_, 180);
+void GrobotEyes::BuildShadeLut(float phase, float shine_strength, float shine_pos) {
+    // LUT 第 i 级 = 对角线 base=i/(steps-1) 叠加相位后的渐变取色，
+    // 再经上游 shine 合成白色高光——与 logo 动画同一公式。
+    // 相位映射用钳制而非绕回：绕回会在脸内留下薄荷|热粉硬边；钳制让潮汐
+    // 在两角形成连续的粉/薄荷「淤积」高原——暖情绪粉淤左下、冷情绪薄荷淤
+    // 右上，反而强化情绪语义，且全程无接缝。
+    const lv_color_t center_eye = lv_color_hex(PiGradientHex(PiWrap01(0.5f + phase)));
+    scan_color_ = lv_color_mix(center_eye, bg_color_, 7);
+    for (int i = 0; i < kFaceShadeSteps; i++) {
+        const float base = (float)i / (float)(kFaceShadeSteps - 1);
+        const float tc = std::clamp(base + phase, 0.0f, 1.0f);
+        uint8_t pr = 0, pg = 0, pb = 0;
+        PiGradientRgb(tc, shine_strength, shine_pos, &pr, &pg, &pb);
+        const lv_color_t eye = lv_color_make(pr, pg, pb);
+        const lv_color_t white = lv_color_white();
+        shade_lut_[kShadeGlow0][i] = lv_color_to_u16(lv_color_mix(eye, bg_color_, 38));
+        shade_lut_[kShadeGlow1][i] = lv_color_to_u16(lv_color_mix(eye, bg_color_, 77));
+        shade_lut_[kShadeGlow2][i] = lv_color_to_u16(lv_color_mix(eye, bg_color_, 128));
+        shade_lut_[kShadeIris0][i] = lv_color_to_u16(lv_color_mix(eye, bg_color_, 153));
+        shade_lut_[kShadeIris1][i] = lv_color_to_u16(eye);
+        shade_lut_[kShadeIris2][i] = lv_color_to_u16(lv_color_mix(white, eye, 77));
+        shade_lut_[kShadePupil][i] = lv_color_to_u16(lv_color_mix(eye, bg_color_, 25));
+        shade_lut_[kShadeHighlight][i] = lv_color_to_u16(lv_color_mix(white, eye, 180));
+        shade_lut_[kShadeEye][i] = lv_color_to_u16(eye);
+        shade_lut_[kShadeBrow][i] = lv_color_to_u16(lv_color_mix(eye, white, 55));
+        shade_lut_[kShadeNose][i] = lv_color_to_u16(lv_color_mix(eye, bg_color_, 145));
+        shade_lut_[kShadeNoseHi][i] = lv_color_to_u16(lv_color_mix(white, eye, 45));
+        shade_lut_[kShadeNoseShadow][i] = lv_color_to_u16(lv_color_mix(bg_color_, eye, 25));
+        const lv_color_t mouth = lv_color_mix(eye, white, 45);
+        shade_lut_[kShadeMouth][i] = lv_color_to_u16(mouth);
+        shade_lut_[kShadeMouthCorner][i] = lv_color_to_u16(lv_color_mix(mouth, bg_color_, 48));
+    }
 }
 
 GrobotEyes::~GrobotEyes() {
@@ -132,6 +172,9 @@ GrobotEyes::~GrobotEyes() {
 bool GrobotEyes::Init(lv_obj_t* parent, int w, int h) {
     w_ = w;
     h_ = h;
+    // 对角线 LUT 索引的定点标度：idx = (x + (h-1-y)) * scale >> 16。
+    // 分母 w+h-1 与 PiFaceGradientT 的 span 同源（+1 技巧，base 严格 < 1）。
+    shade_scale_q16_ = (int32_t)(((int64_t)(kFaceShadeSteps - 1) << 16) / (w_ + h_ - 1));
     layout_.scale = (float)h_ / kBaseH;
     layout_.centerY = h_ / 2;
     layout_.eyeRadius = (int)lroundf(kEyeRadius * layout_.scale);
@@ -214,13 +257,15 @@ void GrobotEyes::SetEmotion(const char* emotion) {
         emotion = "neutral";
     }
     MoodData left = kMoods[0], right = kMoods[0];
-    uint32_t color = 0;
+    // 未命中的情绪回落 neutral 的渐变位置，而不是主题强调色——后者不在 π 渐变上，
+    // 会在开机交接后跳色。
+    float mood_t = kMoodGradientT[0];
     mood_index_ = -1;
     for (int i = 0; i < kMoodCount; i++) {
         if (strcmp(emotion, kNames[i]) == 0) {
             mood_index_ = i;
             left = right = kMoods[i];
-            color = kMoodColors[i];
+            mood_t = kMoodGradientT[i];
             ApplyFacialData(kFacialMoods[i]);
             if (i == 11) {
                 right = {15, 20, 15, 25, 42, 0.45f, -0.40f};  // thinking 右眼稍眯同向看
@@ -243,7 +288,7 @@ void GrobotEyes::SetEmotion(const char* emotion) {
     };
     set(baseL_, targetL_, left);
     set(baseR_, targetR_, right);
-    RecomputePalette(color != 0 ? lv_color_hex(color) : eye_color_default_);
+    RecomputePalette(mood_t);
     last_blink_us_ = esp_timer_get_time();
 }
 
@@ -251,20 +296,19 @@ void GrobotEyes::SetSpeaking(bool on) { speaking_ = on; }
 
 void GrobotEyes::SetListening(bool on) { listening_ = on; }
 
-void GrobotEyes::BufHLine(int x0, int x1, int y, uint16_t cv) {
+void GrobotEyes::BufHLine(int x0, int x1, int y, FacePaint p) {
     if (y < 0 || y >= h_)
         return;
     int s = draw_buf_->header.stride / 2;
     for (int x = std::max(0, x0); x <= std::min(w_ - 1, x1); x++)
-        buf_[y * s + x] = cv;
+        buf_[y * s + x] = Resolve(p, x, y);
 }
 
-void GrobotEyes::BufFillRect(int x, int y, int w, int h, lv_color_t c) {
-    uint16_t cv = lv_color_to_u16(c);
+void GrobotEyes::BufFillRect(int x, int y, int w, int h, FacePaint p) {
     int s = draw_buf_->header.stride / 2;
     for (int r = std::max(0, y); r < std::min(h_, y + h); r++)
         for (int col = std::max(0, x); col < std::min(w_, x + w); col++)
-            buf_[r * s + col] = cv;
+            buf_[r * s + col] = Resolve(p, col, r);
 }
 
 uint16_t GrobotEyes::Blend565(uint16_t fg, uint16_t bg, uint8_t alpha) {
@@ -276,10 +320,9 @@ uint16_t GrobotEyes::Blend565(uint16_t fg, uint16_t bg, uint8_t alpha) {
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
-void GrobotEyes::BufFillCircle(int cx, int cy, int r, lv_color_t c) {
+void GrobotEyes::BufFillCircle(int cx, int cy, int r, FacePaint p) {
     if (r <= 0)
         return;
-    const uint16_t cv = lv_color_to_u16(c);
     const int s = draw_buf_->header.stride / 2;
     const float rf = (float)r;
     for (int row = std::max(0, cy - r); row <= std::min(h_ - 1, cy + r); row++) {
@@ -287,36 +330,35 @@ void GrobotEyes::BufFillCircle(int cx, int cy, int r, lv_color_t c) {
         const float dx_f = sqrtf(rf * rf - dy * dy);
         const int dx = (int)dx_f;
         for (int col = std::max(0, cx - dx); col <= std::min(w_ - 1, cx + dx); col++)
-            buf_[row * s + col] = cv;
+            buf_[row * s + col] = Resolve(p, col, row);
         // 边缘 1px 抗锯齿：按覆盖率分数与底层像素混合（不是背景色——圆会叠在
-        // 辉光环/眼白上，与底色混会出现脏边）。
+        // 辉光环/眼白上，与底色混会出现脏边）。渐变时两端各自取本地色。
         const uint8_t frac = (uint8_t)((dx_f - dx) * 255.0f);
         if (frac > 0) {
             const int cl = cx - dx - 1, cr = cx + dx + 1;
             if (cl >= 0)
-                buf_[row * s + cl] = Blend565(cv, buf_[row * s + cl], frac);
+                buf_[row * s + cl] = Blend565(Resolve(p, cl, row), buf_[row * s + cl], frac);
             if (cr < w_)
-                buf_[row * s + cr] = Blend565(cv, buf_[row * s + cr], frac);
+                buf_[row * s + cr] = Blend565(Resolve(p, cr, row), buf_[row * s + cr], frac);
         }
     }
 }
-void GrobotEyes::BufFillEllipse(int cx, int cy, int rx, int ry, lv_color_t c) {
+void GrobotEyes::BufFillEllipse(int cx, int cy, int rx, int ry, FacePaint p) {
     if (rx <= 0 || ry <= 0)
         return;
-    const uint16_t cv = lv_color_to_u16(c);
     for (int y = std::max(0, cy - ry); y <= std::min(h_ - 1, cy + ry); y++) {
         const float ny = (float)(y - cy) / ry;
         const int dx = (int)(rx * sqrtf(std::max(0.0f, 1.0f - ny * ny)));
-        BufHLine(cx - dx, cx + dx, y, cv);
+        BufHLine(cx - dx, cx + dx, y, p);
     }
 }
 
-void GrobotEyes::BufLine(int x0, int y0, int x1, int y1, lv_color_t c, int thickness) {
+void GrobotEyes::BufLine(int x0, int y0, int x1, int y1, FacePaint p, int thickness) {
     const int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     const int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
     while (true) {
-        BufFillCircle(x0, y0, std::max(1, thickness), c);
+        BufFillCircle(x0, y0, std::max(1, thickness), p);
         if (x0 == x1 && y0 == y1)
             break;
         const int e2 = err * 2;
@@ -341,7 +383,6 @@ void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
     const int browBaseOffset = eyeR / 10;
     const int browWeight = std::max(2, eyeR / 24);
     const int browGlowWeight = browWeight + 1;
-    const lv_color_t brow = lv_color_mix(eye_color_, lv_color_white(), 55);
     auto drawBrow = [&](int browCx, int browY, int tilt) {
         browY += browBaseOffset;
         int prevX = browCx - halfW;
@@ -351,8 +392,8 @@ void GrobotEyes::DrawEyebrows(int cx, int cy, int eyeR, int offset) {
             const int x = browCx - halfW + 2 * halfW * i / 12;
             const int slope = -tilt + 2 * tilt * i / 12;
             const int y = browY + slope - (int)(browArch * (1.0f - nx * nx));
-            BufLine(prevX, prevY + 2, x, y + 2, glow_[0], browGlowWeight);
-            BufLine(prevX, prevY, x, y, brow, browWeight);
+            BufLine(prevX, prevY + 2, x, y + 2, Shade(kShadeGlow0), browGlowWeight);
+            BufLine(prevX, prevY, x, y, Shade(kShadeBrow), browWeight);
             prevX = x;
             prevY = y;
         }
@@ -365,15 +406,12 @@ void GrobotEyes::DrawNose(int cx, int cy, int eyeR) {
     const int noseY = cy + eyeR / 2 + std::max(4, eyeR / 12);
     const int noseRx = std::max(14, eyeR / 3);
     const int noseRy = std::max(7, eyeR / 8);
-    const lv_color_t nose = lv_color_mix(eye_color_, bg_color_, 145);
-    const lv_color_t noseHighlight = lv_color_mix(lv_color_white(), eye_color_, 45);
-    const lv_color_t noseShadow = lv_color_mix(bg_color_, eye_color_, 25);
     // 实体圆角机器人鼻：比旧挖空短划更像完整五官，但仍弱于眼睛和嘴。
-    BufFillEllipse(cx, noseY, noseRx, noseRy, glow_[1]);
-    BufFillEllipse(cx, noseY + 3, noseRx - 1, noseRy, noseShadow);
-    BufFillEllipse(cx, noseY, noseRx - 2, noseRy - 2, nose);
-    BufLine(cx - noseRx / 2, noseY - noseRy / 2, cx + noseRx / 3, noseY - noseRy / 2, noseHighlight,
-            1);
+    BufFillEllipse(cx, noseY, noseRx, noseRy, Shade(kShadeGlow1));
+    BufFillEllipse(cx, noseY + 3, noseRx - 1, noseRy, Shade(kShadeNoseShadow));
+    BufFillEllipse(cx, noseY, noseRx - 2, noseRy - 2, Shade(kShadeNose));
+    BufLine(cx - noseRx / 2, noseY - noseRy / 2, cx + noseRx / 3, noseY - noseRy / 2,
+            Shade(kShadeNoseHi), 1);
 }
 
 void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
@@ -382,13 +420,11 @@ void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
     const int open = std::max(3, (int)(face_cur_.mouthOpen * eyeR / 2));
     const int lipGap = std::max(6, open / 2);
     const int mouthY = cy + eyeR + eyeR * 11 / 40;
-    const lv_color_t mouth = lv_color_mix(eye_color_, lv_color_white(), 45);
-    const lv_color_t mouthCorner = lv_color_mix(mouth, bg_color_, 48);
     const int upperLipWeight = std::max(2, eyeR / 20);
     const int lowerLipWeight = std::max(1, eyeR / 28);
     if (open > 5) {
-        const lv_color_t tongue = lv_color_hex(0xFF7EB6);
-        BufFillEllipse(cx, mouthY + curve / 4, width / 2, open, mouth);
+        const lv_color_t tongue = lv_color_hex(PiGradientHex(kTongueGradientT));
+        BufFillEllipse(cx, mouthY + curve / 4, width / 2, open, Shade(kShadeMouth));
         BufFillEllipse(cx, mouthY + curve / 4, width / 2 - 4, std::max(3, open - 4), bg_color_);
         BufFillEllipse(cx, mouthY + open / 2 + curve / 4, width / 3, std::max(3, open / 3), tongue);
         return;
@@ -404,19 +440,19 @@ void GrobotEyes::DrawMouth(int cx, int cy, int eyeR) {
         const int lipSeparation = lipGap - lipGap * iabs / 8;
         const int nextUpperY = mouthY + lipArc - lipSeparation / 2;
         const int nextLowerY = mouthY + lipArc + lipSeparation / 2;
-        BufLine(prevX, prevUpperY, x, nextUpperY, mouth, upperLipWeight);
-        BufLine(prevX, prevLowerY, x, nextLowerY, glow_[2], lowerLipWeight);
+        BufLine(prevX, prevUpperY, x, nextUpperY, Shade(kShadeMouth), upperLipWeight);
+        BufLine(prevX, prevLowerY, x, nextLowerY, Shade(kShadeGlow2), lowerLipWeight);
         prevX = x;
         prevUpperY = nextUpperY;
         prevLowerY = nextLowerY;
     }
-    BufFillCircle(cx - width / 2, mouthY, upperLipWeight + 1, mouthCorner);
-    BufFillCircle(cx + width / 2, mouthY, upperLipWeight + 1, mouthCorner);
+    BufFillCircle(cx - width / 2, mouthY, upperLipWeight + 1, Shade(kShadeMouthCorner));
+    BufFillCircle(cx + width / 2, mouthY, upperLipWeight + 1, Shade(kShadeMouthCorner));
 }
 void GrobotEyes::DrawFacialEffects(int cx, int cy, int eyeR, int offset) {
     const int blush = (int)(face_cur_.blush * 18);
     if (blush > 1) {
-        const lv_color_t blushColor = lv_color_hex(0xFF7EB6);
+        const lv_color_t blushColor = lv_color_hex(PiGradientHex(kBlushGradientT));
         BufFillEllipse(cx - offset - eyeR, cy + eyeR / 2, blush, std::max(2, blush / 3),
                        blushColor);
         BufFillEllipse(cx + offset + eyeR, cy + eyeR / 2, blush, std::max(2, blush / 3),
@@ -424,7 +460,7 @@ void GrobotEyes::DrawFacialEffects(int cx, int cy, int eyeR, int offset) {
     }
     const int tears = (int)(face_cur_.tears * 24);
     if (tears > 2) {
-        const lv_color_t tearColor = lv_color_hex(0x7FB3FF);
+        const lv_color_t tearColor = lv_color_hex(PiGradientHex(kTearGradientT));
         BufLine(cx - offset, cy + eyeR / 2, cx - offset - 3, cy + eyeR / 2 + tears, tearColor, 2);
         BufLine(cx + offset, cy + eyeR / 2, cx + offset + 3, cy + eyeR / 2 + tears, tearColor, 2);
         BufFillCircle(cx - offset - 3, cy + eyeR / 2 + tears, 4, tearColor);
@@ -432,7 +468,7 @@ void GrobotEyes::DrawFacialEffects(int cx, int cy, int eyeR, int offset) {
     }
     if (face_cur_.sweat > 0.08f) {
         const int drop = 7 + (int)(face_cur_.sweat * 10);
-        const lv_color_t sweatColor = lv_color_hex(0xBDF3FF);
+        const lv_color_t sweatColor = lv_color_hex(PiGradientHex(kSweatGradientT));
         BufFillCircle(cx + offset + eyeR + 12, cy - eyeR / 2, drop / 2, sweatColor);
         BufFillTriangle(cx + offset + eyeR + 12 - drop / 2, cy - eyeR / 2,
                         cx + offset + eyeR + 12 + drop / 2, cy - eyeR / 2, cx + offset + eyeR + 12,
@@ -441,7 +477,7 @@ void GrobotEyes::DrawFacialEffects(int cx, int cy, int eyeR, int offset) {
     if (face_cur_.sparkle > 0.08f) {
         const int r = 5 + (int)(face_cur_.sparkle * 7);
         const int sx = cx + offset + eyeR + 17, sy = cy - eyeR;
-        const lv_color_t sparkleColor = lv_color_hex(0xFFD60A);
+        const lv_color_t sparkleColor = lv_color_hex(PiGradientHex(kSparkleGradientT));
         BufLine(sx - r, sy, sx + r, sy, sparkleColor, 1);
         BufLine(sx, sy - r, sx, sy + r, sparkleColor, 1);
     }
@@ -463,16 +499,15 @@ void GrobotEyes::BufLidArc(int cx, int cy, int eyeR, int pad, int lidH, bool top
     }
 }
 
-void GrobotEyes::BufFillHeart(int cx, int cy, int r, lv_color_t c) {
+void GrobotEyes::BufFillHeart(int cx, int cy, int r, FacePaint p) {
     // 两圆一三角拼心形；r 是整体半宽。尺寸小（~12px），比例宁宽勿瘦才认得出。
     const int hr = std::max(2, r / 2);
-    BufFillCircle(cx - hr, cy - hr / 2, hr, c);
-    BufFillCircle(cx + hr, cy - hr / 2, hr, c);
-    BufFillTriangle(cx - 2 * hr, cy - hr / 2, cx + 2 * hr, cy - hr / 2, cx, cy + r, c);
+    BufFillCircle(cx - hr, cy - hr / 2, hr, p);
+    BufFillCircle(cx + hr, cy - hr / 2, hr, p);
+    BufFillTriangle(cx - 2 * hr, cy - hr / 2, cx + 2 * hr, cy - hr / 2, cx, cy + r, p);
 }
 
-void GrobotEyes::BufFillTriangle(int x0, int y0, int x1, int y1, int x2, int y2, lv_color_t c) {
-    uint16_t cv = lv_color_to_u16(c);
+void GrobotEyes::BufFillTriangle(int x0, int y0, int x1, int y1, int x2, int y2, FacePaint p) {
     if (y0 > y1) {
         std::swap(x0, x1);
         std::swap(y0, y1);
@@ -499,40 +534,39 @@ void GrobotEyes::BufFillTriangle(int x0, int y0, int x1, int y1, int x2, int y2,
             int seg = y2 - y1;
             xb = x1 + (seg ? (int)((x2 - x1) * (float)(y - y1) / seg) : (x2 - x1));
         }
-        BufHLine(std::min(xa, xb), std::max(xa, xb), y, cv);
+        BufHLine(std::min(xa, xb), std::max(xa, xb), y, p);
     }
 }
 
 void GrobotEyes::DrawBackground() {
     lv_canvas_fill_bg(canvas_, bg_color_, LV_OPA_COVER);
     buf_ = (uint16_t*)draw_buf_->data;
-    uint16_t sc = lv_color_to_u16(scan_color_);
     for (int y = 5; y < h_; y += 6)
-        BufHLine(0, w_ - 1, y, sc);
+        BufHLine(0, w_ - 1, y, scan_color_);
 }
 
 void GrobotEyes::DrawEye(int cx, int cy, int gazeX, int gazeY, int pR, int eyeR, int lidH, int botH,
                          int tilt, bool isLeft, bool heartPupil) {
     float phase = (float)(last_frame_us_ % 10000000) / 10000000.0f * 6.2832f;
     int pulse = mood_index_ == kSleepyMoodIndex ? 0 : (int)(1.0f * sinf(phase));
-    BufFillCircle(cx, cy, eyeR + 10 + pulse, glow_[0]);
+    BufFillCircle(cx, cy, eyeR + 10 + pulse, Shade(kShadeGlow0));
     BufFillCircle(cx, cy, eyeR + 9 + pulse, bg_color_);
-    BufFillCircle(cx, cy, eyeR + 7, glow_[0]);
-    BufFillCircle(cx, cy, eyeR + 4, glow_[1]);
-    BufFillCircle(cx, cy, eyeR + 2, glow_[2]);
-    BufFillCircle(cx, cy, eyeR, eye_color_);
+    BufFillCircle(cx, cy, eyeR + 7, Shade(kShadeGlow0));
+    BufFillCircle(cx, cy, eyeR + 4, Shade(kShadeGlow1));
+    BufFillCircle(cx, cy, eyeR + 2, Shade(kShadeGlow2));
+    BufFillCircle(cx, cy, eyeR, Shade(kShadeEye));
     // 眼球（虹膜+瞳+高光）随视线偏移；辉光环与眼睑遮罩保持原位，视线偏移上界
     // 在 Render 侧按 eyeR 比例限制，虹膜不会跑出眼白。
     int pcx = cx + gazeX, pcy = cy + gazeY;
     int ir = eyeR * 3 / 4;
-    BufFillCircle(pcx, pcy, ir, iris_[0]);
-    BufFillCircle(pcx, pcy, ir * 3 / 4, iris_[1]);
-    BufFillCircle(pcx, pcy, ir / 2, iris_[2]);
+    BufFillCircle(pcx, pcy, ir, Shade(kShadeIris0));
+    BufFillCircle(pcx, pcy, ir * 3 / 4, Shade(kShadeIris1));
+    BufFillCircle(pcx, pcy, ir / 2, Shade(kShadeIris2));
     if (heartPupil)
-        BufFillHeart(pcx, pcy, std::max(5, pR * 2 / 5 + 1), pupil_color_);
+        BufFillHeart(pcx, pcy, std::max(5, pR * 2 / 5 + 1), Shade(kShadePupil));
     else
-        BufFillCircle(pcx, pcy, std::max(3, pR * 2 / 5), pupil_color_);
-    BufFillCircle(pcx - eyeR / 4, pcy - eyeR / 4, std::max(2, eyeR / 8), highlight_color_);
+        BufFillCircle(pcx, pcy, std::max(3, pR * 2 / 5), Shade(kShadePupil));
+    BufFillCircle(pcx - eyeR / 4, pcy - eyeR / 4, std::max(2, eyeR / 8), Shade(kShadeHighlight));
     int pad = 16 + abs(pulse);
     if (lidH > 0)
         BufLidArc(cx, cy, eyeR, pad, lidH, true);
@@ -548,6 +582,24 @@ void GrobotEyes::DrawEye(int cx, int cy, int gazeX, int gazeY, int pR, int eyeR,
 
 void GrobotEyes::Render() {
     UpdateDeltaTime();
+    // 「活」的两层（都与 logo 同源）：
+    // 1) 色相潮汐：基底相位 5s 正弦 ±0.22 持续往复，整脸彩虹永不静止；
+    //    相位经钳制映射，极端相位只在两角形成渐变高原，无接缝。
+    // 2) 高光扫脸：上游 shine 公式。说话 1.5s/周连续强扫（0.90），
+    //    空闲每 6s 扫 2s（0.85，接近上游峰值的亮带），sleepy 全停。
+    float tide = 0.0f, shine_strength = 0.0f, shine_pos = -1.0f;
+    if (mood_index_ != kSleepyMoodIndex) {
+        tide = 0.22f * sinf((float)(last_frame_us_ % 5000000) / 5000000.0f * 6.2832f);
+        const int64_t period_us = speaking_ ? 1500000 : 6000000;
+        const float duty = speaking_ ? 1.0f : 0.34f;
+        const float t01 = (float)(last_frame_us_ % period_us) / (float)period_us;
+        if (t01 < duty) {
+            // 从 -半宽扫到 1+半宽，进出都无残影。
+            shine_pos = t01 / duty * (1.0f + 2.0f * kPiShineHalfWidth) - kPiShineHalfWidth;
+            shine_strength = speaking_ ? 0.90f : 0.85f;
+        }
+    }
+    BuildShadeLut(mood_base_phase_ + tide, shine_strength, shine_pos);
     DrawBackground();
     Blink();
     auto spring = [&](EyeState& c, EyeState& t) {

@@ -13,6 +13,9 @@
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
 class GrobotEyes;
 #endif
+#if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
+class HutujiPiSplash;
+#endif
 
 #define PREVIEW_IMAGE_DURATION_MS 5000
 
@@ -72,13 +75,13 @@ protected:
         lv_coord_t press_y = 0;
         bool dragging = false;
         std::function<void()>* action = nullptr;  // 非拥有指针，指向 LcdDisplay 成员的槽位
-        const char* nvs_prefix = nullptr;  // NVS「hutuji_ui」命名空间下的坐标键前缀
+        const char* nvs_prefix = nullptr;         // NVS「hutuji_ui」命名空间下的坐标键前缀
     };
     HomeButtonDrag voice_talk_drag_;
     HomeButtonDrag wifi_config_drag_;
     /** 给主页入口钮挂「按下跟随 + 24px 阈值 + 松手未拖才触发 + 落点写 NVS」行为。 */
-    void AttachHomeEntryButton(lv_obj_t* btn, HomeButtonDrag* state,
-                               std::function<void()>* action, const char* nvs_prefix);
+    void AttachHomeEntryButton(lv_obj_t* btn, HomeButtonDrag* state, std::function<void()>* action,
+                               const char* nvs_prefix);
     /** 布局记忆：写/读 NVS「hutuji_ui」中的按钮坐标；Load 越界返回 false。 */
     static void SaveHomeButtonPos(const char* prefix, lv_coord_t x, lv_coord_t y);
     static bool LoadHomeButtonPos(const char* prefix, lv_coord_t* x, lv_coord_t* y);
@@ -112,6 +115,15 @@ protected:
     bool machine_controls_configured_ = false;
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     std::unique_ptr<GrobotEyes> grobot_eyes_;
+#endif
+#if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
+    // 开机 π logo 启动画面；播完自行拆掉所有 LVGL 对象，仅析构时兜底。
+    std::unique_ptr<HutujiPiSplash> pi_splash_;
+#endif
+#if CONFIG_HUTUJI_GROBOT_FACE
+    // 主屏 accent 按钮呼吸定时器：π 品牌中段 ±0.06 漂移；安全语义色不参与。
+    lv_timer_t* accent_drift_timer_ = nullptr;
+    static void AccentDriftTimerCb(lv_timer_t* timer);
 #endif
 
     void InitializeLcdThemes();
