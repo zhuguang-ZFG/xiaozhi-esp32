@@ -105,12 +105,12 @@ inline bool ParseFiniteMPos(const std::string& status, float& x, float& y, float
 
 /**
  * 点动越界判定（2026-08-20 独立成 core）：机器无限位开关，新鲜 MPos + 本判定是
- * 点动的唯一防线；限幅与云端 protocol §5 同源（X≤190 / Y≤277mm），改云端必须
+ * 点动的唯一防线；限幅与云端 protocol §5 同源（X≤190 / Y≤190mm），改云端必须
  * 同步这里。任一输入非有限数一律 fail-closed 为 kStalePosition——`$10` 可持久化
  * 成 WPos、网络/固件异常可产生 NaN/Inf，都不得冒充「已知坐标」放行运动。
  */
 inline constexpr float kJogEnvelopeMaxXMm = 190.0f;
-inline constexpr float kJogEnvelopeMaxYMm = 277.0f;
+inline constexpr float kJogEnvelopeMaxYMm = 190.0f;  // 2026-08-21 收紧：Y 为物理宽边（210 行程），原 277 超行程
 /** 1mm 固定步进，逐字对齐奎享实测 `$J=G21G91X1.0Y0.0Z0.0F8000.0`。 */
 inline constexpr float kJogStepMm = 1.0f;
 
