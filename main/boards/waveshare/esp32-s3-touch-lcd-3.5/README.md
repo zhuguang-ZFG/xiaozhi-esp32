@@ -13,6 +13,8 @@
 - `hutuji.resume`
 - `hutuji.repeat`
 - `hutuji.pen_test`
+- `hutuji.confirm`（屏幕预览确认出图）
+- `hutuji.sing` / `hutuji.stop_song`（唱歌，与绘图解耦，只走 AudioService 播放泵；契约见枢纽 `docs/protocol.md` §10）
 
 G-code 仍只在云端生成；设备仅下载、校验并通过 Wi-Fi Telnet `:23` 转发到 Grbl。
 

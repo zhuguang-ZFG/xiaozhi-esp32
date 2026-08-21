@@ -112,6 +112,7 @@ Keep detailed or fast-changing information in those files, not here. Add a neste
 
 - **哑管道**：不在 S3 生成/编辑/预览 G-code；只下载 + 校验 + 严格逐行转发。
 - **板级行为不进核心**：工具挂在板级 `InitializeTools()`；参照既有 board MCP 工具模式。
+- **唱歌解耦**：`main/boards/lichuang-dev/hutuji_music.{h,cc}`（双板共用实现）只走 AudioService 播放泵，不碰写字机管道、不触发笔芯运动；双板（lichuang-dev / waveshare）工具描述逐字一致防漂移。契约真值在枢纽 `docs/protocol.md` §10。
 - **脚位**：以 `main/boards/lichuang-dev/config.h`（及板级 `.cc`）为准，默认禁止改 GPIO；文档只对照。
 - **出图中 status 只发 `?`**；禁止发 `[ESP901]` / `M704`（会吃 `ok`）。
 - **TCP keepalive** 必须设 `KEEPIDLE/KEEPINTVL/KEEPCNT`（见 protocol §1.2）；只开 `SO_KEEPALIVE` 无效。
