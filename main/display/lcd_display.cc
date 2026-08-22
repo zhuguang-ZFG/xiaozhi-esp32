@@ -36,6 +36,11 @@
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
 #include "boards/lichuang-dev/hutuji_pi_splash.h"
 #endif
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#include "boards/lichuang-dev/hutuji_job.h"
+#include "boards/lichuang-dev/hutuji_pipe.h"
+#include "boards/lichuang-dev/hutuji_recovery_core.h"
+#endif
 
 #define TAG "LcdDisplay"
 
@@ -1001,6 +1006,7 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_set_flex_grow(title, 1);
     lv_obj_set_style_text_color(title, theme->text_color(), 0);
     machine_state_label_ = lv_label_create(header);
+    lv_label_set_long_mode(machine_state_label_, LV_LABEL_LONG_MODE_DOTS);
     lv_label_set_text(machine_state_label_, "");
     lv_obj_set_style_bg_color(machine_state_label_, theme->assistant_bubble_color(), 0);
     lv_obj_set_style_bg_opa(machine_state_label_, LV_OPA_COVER, 0);
@@ -1009,6 +1015,8 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_set_style_pad_right(machine_state_label_, theme->spacing(3), 0);
     lv_obj_set_style_pad_top(machine_state_label_, theme->spacing(1), 0);
     lv_obj_set_style_pad_bottom(machine_state_label_, theme->spacing(1), 0);
+    // 只装短 locale（「空闲」「正在画」）。坐标 HUD 若塞进来会把标题行挤爆。
+    lv_obj_set_style_max_width(machine_state_label_, LV_HOR_RES / 4, 0);
     // 「点动·手动」与主操作区互斥切页：孩子看到的是创作面板，点动/复位等工具
     // 一键切过去，切回来一键回主页。不做同屏堆叠——堆叠必然溢出面板。
     machine_manual_toggle_btn_ =
@@ -1067,9 +1075,23 @@ void LcdDisplay::EnsureMachineControlUi() {
 
     // 动作不经 drawer 收起：点动/抬落笔需要连续操作。可用性统一由
     // ApplyMachineControlState 按 settled 态门控。
-    lv_obj_t* manual_label = lv_label_create(machine_manual_section_);
-    lv_label_set_text(manual_label, Lang::Strings::MACHINE_MANUAL_SECTION);
-    lv_obj_set_style_text_color(manual_label, theme->muted_text_color(), 0);
+    // 坐标条放手动页全宽，不进标题行：2026-08-22 实机截图里长串 HUD 把标题
+    // 挤爆后方向键变飘字、Y- 被裁、工具键重影。
+    machine_hud_label_ = lv_label_create(machine_manual_section_);
+    lv_label_set_text(machine_hud_label_, Lang::Strings::MACHINE_MANUAL_SECTION);
+    lv_label_set_long_mode(machine_hud_label_, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(machine_hud_label_, content_width);
+    lv_obj_set_style_text_align(machine_hud_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(machine_hud_label_, theme->text_color(), 0);
+    lv_obj_set_style_bg_color(machine_hud_label_, theme->assistant_bubble_color(), 0);
+    lv_obj_set_style_bg_opa(machine_hud_label_, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(machine_hud_label_, 12, 0);
+    lv_obj_set_style_pad_top(machine_hud_label_, theme->spacing(2), 0);
+    lv_obj_set_style_pad_bottom(machine_hud_label_, theme->spacing(2), 0);
+    lv_obj_set_style_pad_left(machine_hud_label_, theme->spacing(3), 0);
+    lv_obj_set_style_pad_right(machine_hud_label_, theme->spacing(3), 0);
+    lv_obj_set_style_border_width(machine_hud_label_, 1, 0);
+    lv_obj_set_style_border_color(machine_hud_label_, theme->border_color(), 0);
 
     // 双列容器：标题 24 + 间距 6 + 3 行 ×56 + 2 间距 ×8 = 214 ≤ 232 可用高。
     lv_obj_t* manual_body = lv_obj_create(machine_manual_section_);
@@ -1097,19 +1119,27 @@ void LcdDisplay::EnsureMachineControlUi() {
     auto make_manual = [&](lv_obj_t* parent, const char* text, lv_color_t color,
                            lv_color_t text_color, lv_coord_t width, const char* action) {
         lv_obj_t* btn = make_button(parent, text, color, text_color, width, safe_button_height);
+        // 描边把点动方键从纸面底色里抬出来；无描边时 bubble 贴表面只剩白字。
+        lv_obj_set_style_border_width(btn, 2, 0);
+        lv_obj_set_style_border_color(btn, theme->border_color(), 0);
+        lv_obj_set_style_border_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_user_data(btn, const_cast<char*>(action));
         machine_manual_buttons_.push_back(btn);
         return btn;
     };
 
-    // 点动十字（对齐奎享面板）：Y+ 居上，X-/回原点/X+ 居中行，Y- 居下。
+    // 点动十字：上排 1mm | Y+ | 10mm（列宽本就是 3×56，不增行高）。
     lv_obj_t* jog_col = make_col(jog_col_width);
     lv_obj_t* jog_up_row = make_row(jog_col);
     lv_obj_set_width(jog_up_row, jog_col_width);
-    lv_obj_set_flex_align(jog_up_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
+    machine_jog_step_1_btn_ =
+        make_manual(jog_up_row, Lang::Strings::MACHINE_JOG_STEP_1, theme->assistant_bubble_color(),
+                    theme->text_color(), jog_size, "jog_step_1");
     make_manual(jog_up_row, Lang::Strings::MACHINE_JOG_YP, theme->assistant_bubble_color(),
                 theme->text_color(), jog_size, "jog_y+");
+    machine_jog_step_10_btn_ =
+        make_manual(jog_up_row, Lang::Strings::MACHINE_JOG_STEP_10, theme->assistant_bubble_color(),
+                    theme->text_color(), jog_size, "jog_step_10");
     lv_obj_t* jog_mid_row = make_row(jog_col);
     lv_obj_set_width(jog_mid_row, jog_col_width);
     make_manual(jog_mid_row, Lang::Strings::MACHINE_JOG_XM, theme->assistant_bubble_color(),
@@ -1148,6 +1178,21 @@ void LcdDisplay::EnsureMachineControlUi() {
     make_manual(power_row, Lang::Strings::MACHINE_RESET, theme->danger_color(), lv_color_white(),
                 tool_width, "reset");
     SetMachineManualSectionVisible(false);
+
+    // 抽屉盖住主屏状态栏，断连/失败通知必须画在遮罩上面，否则点 XY 像没反应。
+    machine_notice_label_ = lv_label_create(machine_control_root_);
+    lv_label_set_text(machine_notice_label_, "");
+    lv_label_set_long_mode(machine_notice_label_, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(machine_notice_label_, panel_width - theme->spacing(8));
+    lv_obj_set_style_text_align(machine_notice_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(machine_notice_label_, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(machine_notice_label_, theme->danger_color(), 0);
+    lv_obj_set_style_bg_opa(machine_notice_label_, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(machine_notice_label_, 12, 0);
+    lv_obj_set_style_pad_all(machine_notice_label_, theme->spacing(3), 0);
+    lv_obj_align(machine_notice_label_, LV_ALIGN_BOTTOM_MID, 0, -theme->spacing(2));
+    lv_obj_add_flag(machine_notice_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(machine_notice_label_, LV_OBJ_FLAG_CLICKABLE);
 
     // 触发钮用“按下触点 + 按下时按钮位置”计算绝对位移：不累积采样误差，
     // 也不吞掉越过点按阈值前的位移。松手总位移不超过阈值才打开抽屉。
@@ -1310,6 +1355,10 @@ void LcdDisplay::EnsureMachineControlUi() {
             LV_EVENT_CLICKED, this);
     }
 
+    if (machine_hud_timer_ == nullptr) {
+        machine_hud_timer_ = lv_timer_create(MachineHudTimerCb, 400, this);
+    }
+
     lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);
     ApplyMachineControlState();
 }
@@ -1337,6 +1386,19 @@ void LcdDisplay::SetMachineManualSectionVisible(bool visible) {
     // 全程峰值余量）：证据化 12288 抬栈后手动页是否仍贴底，防止它静默回压穿。
     ESP_LOGI(TAG, "machine manual section %s, lvgl stack hwm %u",
              visible ? "expanded" : "collapsed", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    if (!visible && machine_notice_label_ != nullptr) {
+        lv_obj_add_flag(machine_notice_label_, LV_OBJ_FLAG_HIDDEN);
+        machine_notice_hide_us_ = 0;
+    }
+}
+
+void LcdDisplay::MachineHudTimerCb(lv_timer_t* timer) {
+    auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
+    if (self == nullptr || self->machine_control_root_ == nullptr ||
+        lv_obj_has_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    self->ApplyMachineControlState();
 }
 
 void LcdDisplay::ApplyMachineControlState() {
@@ -1404,6 +1466,48 @@ void LcdDisplay::ApplyMachineControlState() {
         lv_obj_set_style_text_color(machine_state_label_, state_color, 0);
         lv_obj_set_style_bg_color(machine_state_label_, theme->assistant_bubble_color(), 0);
     }
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+    if (machine_hud_label_ != nullptr) {
+        auto* hud_theme = static_cast<LvglTheme*>(current_theme_);
+        auto& hud_pipe = hutuji::Pipe::GetInstance();
+        if (!hud_pipe.IsConnected()) {
+            lv_label_set_text(machine_hud_label_, Lang::Strings::MACHINE_PLOTTER_OFFLINE);
+            lv_obj_set_style_text_color(machine_hud_label_, hud_theme->danger_color(), 0);
+        } else if (!hud_pipe.IsReady() || !hud_pipe.IsAuthorized()) {
+            lv_label_set_text(machine_hud_label_, Lang::Strings::MACHINE_PLOTTER_NOT_READY);
+            lv_obj_set_style_text_color(machine_hud_label_, hud_theme->warning_color(), 0);
+        } else {
+            float hud_x = 0, hud_y = 0, hud_z = 0;
+            hud_pipe.GetMachinePos(hud_x, hud_y, hud_z);
+            char hud[64];
+            hutuji::FormatMachineHud(hud, sizeof(hud),
+                                     hutuji::Pipe::GrblStateName(hud_pipe.GetGrblState()), hud_x,
+                                     hud_y, hud_z);
+            lv_label_set_text(machine_hud_label_, hud);
+            lv_obj_set_style_text_color(machine_hud_label_, hud_theme->text_color(), 0);
+        }
+    }
+    if (machine_notice_label_ != nullptr &&
+        !lv_obj_has_flag(machine_notice_label_, LV_OBJ_FLAG_HIDDEN) &&
+        machine_notice_hide_us_ > 0 && esp_timer_get_time() >= machine_notice_hide_us_) {
+        lv_obj_add_flag(machine_notice_label_, LV_OBJ_FLAG_HIDDEN);
+        machine_notice_hide_us_ = 0;
+    }
+    if (machine_jog_step_1_btn_ != nullptr && machine_jog_step_10_btn_ != nullptr) {
+        auto* theme = static_cast<LvglTheme*>(current_theme_);
+        const bool coarse = hutuji::Job::GetInstance().GetJogStepMm() >= hutuji::kJogStepMmCoarse;
+        lv_obj_set_style_bg_color(machine_jog_step_1_btn_,
+                                  coarse ? theme->assistant_bubble_color() : theme->accent_color(),
+                                  0);
+        lv_obj_set_style_bg_color(machine_jog_step_10_btn_,
+                                  coarse ? theme->accent_color() : theme->assistant_bubble_color(),
+                                  0);
+        lv_obj_set_style_text_color(lv_obj_get_child(machine_jog_step_1_btn_, 0),
+                                    coarse ? theme->text_color() : theme->accent_text_color(), 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(machine_jog_step_10_btn_, 0),
+                                    coarse ? theme->accent_text_color() : theme->text_color(), 0);
+    }
+#endif
 }
 
 void LcdDisplay::ConfigureMachineControls(std::function<void()> on_pause,
@@ -1542,6 +1646,32 @@ void LcdDisplay::UpdateMachineControlState(const std::string& state) {
     ApplyMachineControlState();
 }
 
+void LcdDisplay::ShowNotification(const char* notification, int duration_ms) {
+    LvglDisplay::ShowNotification(notification, duration_ms);
+    if (notification == nullptr || machine_notice_label_ == nullptr ||
+        machine_control_root_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    if (lv_obj_has_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    lv_label_set_text(machine_notice_label_, notification);
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    const bool ok = strcmp(notification, Lang::Strings::MACHINE_ACTION_SENT) == 0 ||
+                    strcmp(notification, Lang::Strings::MACHINE_ACTION_STARTED) == 0;
+    if (theme != nullptr) {
+        lv_obj_set_style_bg_color(machine_notice_label_,
+                                  ok ? theme->accent_color() : theme->danger_color(), 0);
+        lv_obj_set_style_text_color(machine_notice_label_,
+                                    ok ? theme->accent_text_color() : lv_color_white(), 0);
+    }
+    lv_obj_remove_flag(machine_notice_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(machine_notice_label_);
+    const int ms = duration_ms > 0 ? duration_ms : 3000;
+    machine_notice_hide_us_ = esp_timer_get_time() + static_cast<int64_t>(ms) * 1000;
+}
+
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
 #if CONFIG_HUTUJI_GROBOT_FACE
@@ -1550,6 +1680,10 @@ LcdDisplay::~LcdDisplay() {
         accent_drift_timer_ = nullptr;
     }
 #endif
+    if (machine_hud_timer_ != nullptr) {
+        lv_timer_delete(machine_hud_timer_);
+        machine_hud_timer_ = nullptr;
+    }
 
     // Clean up GIF controller
     if (gif_controller_) {
@@ -1578,6 +1712,11 @@ LcdDisplay::~LcdDisplay() {
         machine_pen_test_btn_ = nullptr;
         machine_close_btn_ = nullptr;
         machine_state_label_ = nullptr;
+        machine_hud_label_ = nullptr;
+        machine_notice_label_ = nullptr;
+        machine_notice_hide_us_ = 0;
+        machine_jog_step_1_btn_ = nullptr;
+        machine_jog_step_10_btn_ = nullptr;
     }
     if (machine_control_trigger_btn_ != nullptr) {
         lv_obj_del(machine_control_trigger_btn_);

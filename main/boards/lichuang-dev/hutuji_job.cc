@@ -2,14 +2,15 @@
 
 #include "hutuji_pipe.h"
 
-#include "assets/lang_config.h"
 #include "application.h"
-#include "board.h"
+#include "assets/lang_config.h"
 #include "audio_codec.h"
+#include "board.h"
 #include "display.h"
 #include "http.h"
 #include "lvgl_display.h"
 #include "lvgl_image.h"
+#include "settings.h"
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -117,7 +118,6 @@ void Job::SetState(const char* state) {
     }
 }
 
-
 namespace {
 // app 侧是否仍需要 PERFORMANCE：音频通道开时设备处于 listening/speaking。
 // Application 不直接暴露 IsAudioChannelOpened（在私有 protocol_ 上），用设备态等价。
@@ -146,8 +146,7 @@ void Job::StartPerformanceHold() {
     // 立即重申一次（不等首个周期），尽快退出 MAX_MODEM。
     ReassertPerformance();
     if (performance_timer_ != nullptr) {
-        const uint32_t period_ms =
-            hutuji::PerformanceReassertPeriodMs(kJogFreshStateTimeoutMs);
+        const uint32_t period_ms = hutuji::PerformanceReassertPeriodMs(kJogFreshStateTimeoutMs);
         esp_timer_start_periodic(performance_timer_, (uint64_t)period_ms * 1000ULL);
     }
 }
@@ -162,9 +161,8 @@ void Job::StopPerformanceHold() {
     }
     // 交还控制权给 app：语音音频通道仍开时 app 需要 PERFORMANCE，否则回到 LOW_POWER
     // （与 application.cc 的就绪/音频关回调同口径）。此调用本身幂等。
-    Board::GetInstance().SetPowerSaveLevel(AppNeedsPerformance()
-                                               ? PowerSaveLevel::PERFORMANCE
-                                               : PowerSaveLevel::LOW_POWER);
+    Board::GetInstance().SetPowerSaveLevel(AppNeedsPerformance() ? PowerSaveLevel::PERFORMANCE
+                                                                 : PowerSaveLevel::LOW_POWER);
 }
 
 void Job::ReassertPerformance() {
@@ -204,7 +202,6 @@ void Job::ReleaseBuffer() {
     }
     buffer_len_ = 0;
 }
-
 
 bool Job::LooksLikePaperLine(const std::string& line) {
     // 匹配现役换纸相关命令字；不解析参数语义。词边界匹配（S3-P3d）：
@@ -796,8 +793,8 @@ std::string Job::RequestPenTest() {
 std::string Job::RequestManualControl(const std::string& action) {
     // 动作集合即奎享面板的 S3 化映射（2026-08-18 用户实测串口序列后决策全量开放）。
     static const char* const kActions[] = {
-        "pen_up", "pen_down", "jog_x+", "jog_x-", "jog_y+", "jog_y-",
-        "home", "set_origin", "unlock", "motor_off", "reset"};
+        "pen_up",     "pen_down", "jog_x+",    "jog_x-", "jog_y+",     "jog_y-",     "home",
+        "set_origin", "unlock",   "motor_off", "reset",  "jog_step_1", "jog_step_10"};
     bool known = false;
     for (const char* candidate : kActions) {
         if (action == candidate) {
@@ -807,6 +804,21 @@ std::string Job::RequestManualControl(const std::string& action) {
     }
     if (!known) {
         return "{\"error\":\"未知的手动控制动作\"}";
+    }
+    if (action == "jog_step_1" || action == "jog_step_10") {
+        std::string state;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            state = state_;
+        }
+        if (state != "idle" && state != "done" && state != "error" && state != "aborted") {
+            return "{\"error\":\"当前任务状态不允许手动控制\"}";
+        }
+        SetJogStepMm(action == "jog_step_1" ? hutuji::kJogStepMmFine : hutuji::kJogStepMmCoarse);
+        if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
+            display->UpdateMachineControlState(state);
+        }
+        return JsonString("ok");
     }
     auto& pipe = Pipe::GetInstance();
     {
@@ -840,6 +852,29 @@ std::string Job::RequestManualControl(const std::string& action) {
         return "{\"error\":\"无法创建手动控制任务\"}";
     }
     return JsonString("started");
+}
+
+void Job::EnsureJogStepLoaded() {
+    if (jog_step_loaded_) {
+        return;
+    }
+    Settings settings("hutuji_ui");
+    const int32_t stored =
+        settings.GetInt("jog_step_mm", static_cast<int32_t>(hutuji::kJogStepMmDefault));
+    jog_step_mm_ = hutuji::ClampJogStepMm(static_cast<float>(stored));
+    jog_step_loaded_ = true;
+}
+
+float Job::GetJogStepMm() {
+    EnsureJogStepLoaded();
+    return jog_step_mm_;
+}
+
+void Job::SetJogStepMm(float step) {
+    jog_step_mm_ = hutuji::ClampJogStepMm(step);
+    jog_step_loaded_ = true;
+    Settings settings("hutuji_ui", true);
+    settings.SetInt("jog_step_mm", static_cast<int32_t>(jog_step_mm_ + 0.5f));
 }
 
 void Job::ManualTaskEntry(void* arg) {
@@ -880,10 +915,9 @@ void Job::ManualTask() {
              WaitForIdle(false, kPenOriginIdleTimeoutMs);
     } else if (action == "jog_x+" || action == "jog_x-" || action == "jog_y+" ||
                action == "jog_y-") {
-        const float dx = action == "jog_x+" ? hutuji::kJogStepMm
-                                            : (action == "jog_x-" ? -hutuji::kJogStepMm : 0.0f);
-        const float dy = action == "jog_y+" ? hutuji::kJogStepMm
-                                            : (action == "jog_y-" ? -hutuji::kJogStepMm : 0.0f);
+        const float step = GetJogStepMm();
+        const float dx = action == "jog_x+" ? step : (action == "jog_x-" ? -step : 0.0f);
+        const float dy = action == "jog_y+" ? step : (action == "jog_y-" ? -step : 0.0f);
         // 机器无限位开关，新鲜 MPos + 越界判定是点动的唯一防线（限幅与云端 §5 同源）。
         // 缓存坐标先经 `?` 新鲜读确认：$10=WPos/断连期的旧坐标不得放行运动（fail closed）。
         float mx = 0, my = 0, mz = 0;
@@ -900,7 +934,7 @@ void Job::ManualTask() {
                 ok = false;
                 failed_step = "点动越界";
             } else {
-                // 逐字对齐奎享实测 `$J=G21G91X1.0Y0.0Z0.0F8000.0`（1mm 固定步进）。
+                // 格式逐字对齐奎享 `$J=G21G91X…Y…Z0.0F8000.0`；步进由 1/10mm 档决定。
                 char line[48];
                 snprintf(line, sizeof(line), "$J=G21G91X%.1fY%.1fZ0.0F8000.0", dx, dy);
                 ok = send_ok(line, "点动") && WaitForIdle(false, kPenOriginIdleTimeoutMs);
@@ -917,7 +951,7 @@ void Job::ManualTask() {
     } else if (action == "unlock") {
         ok = send_ok("$X", "解除警报");
     } else if (action == "motor_off") {
-        ok = send_ok("$SLP", "关闭电机");
+        ok = send_ok(hutuji::kMotorDisableLine, "关闭电机");
     } else if (action == "reset") {
         const uint32_t banner_before = pipe.GetResetBannerSequence();
         if (!pipe.SendRealtime(0x18)) {
@@ -1143,8 +1177,7 @@ void Job::PrefetchGcode() {
     if (ok) {
         std::lock_guard<std::mutex> lock(prefetch_mutex_);
         // epoch 变了说明新任务已开始或本任务被作废：产物不得发布。
-        if (!prefetch_cancel_.load() &&
-            prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
+        if (!prefetch_cancel_.load() && prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
             prefetch_buffer_ = buf;
             prefetch_len_ = len;
             prefetch_crc_ = crc;
@@ -1264,8 +1297,7 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
         total += static_cast<size_t>(n);
     }
     http->Close();
-    if (aborted || total != content_length ||
-        !Crc32Matches(expected_crc, Crc32Ieee(data, total))) {
+    if (aborted || total != content_length || !Crc32Matches(expected_crc, Crc32Ieee(data, total))) {
         heap_caps_free(data);
         return false;
     }

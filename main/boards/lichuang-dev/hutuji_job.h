@@ -3,12 +3,12 @@
 
 #include "hutuji_recovery_core.h"
 
+#include <esp_timer.h>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <esp_timer.h>
 #include <vector>
 
 namespace hutuji {
@@ -47,10 +47,14 @@ public:
 
     /**
      * 触屏手动调试统一入口（2026-08-18 用户决策全量开放，命令逐字对齐奎享实测）。
-     * action ∈ pen_up/pen_down/jog_x±/jog_y±/home/set_origin/unlock/motor_off/reset。
-     * 仅 settled 态（idle/done/error/aborted）可用；独立任务执行，不阻塞调用方。
+     * action ∈ pen_up/pen_down/jog_x±/jog_y±/home/set_origin/unlock/motor_off/reset
+     * /jog_step_1/jog_step_10。仅 settled 态（idle/done/error/aborted）可用；
+     * 点动/工具走独立任务，步进切换不占 busy。
      */
     std::string RequestManualControl(const std::string& action);
+
+    /** 当前点动步进（1 或 10mm，默认 10）。 */
+    float GetJogStepMm();
 
     /** status JSON：connected/ready/authorized/state/last_line */
     std::string StatusJson() const;
@@ -176,8 +180,13 @@ private:
         return std::string_view(reinterpret_cast<const char*>(buffer_) + s.offset, s.len);
     }
 
+    void SetJogStepMm(float step);
+    void EnsureJogStepLoaded();
+
     /** 手动控制动作载荷：RequestManualControl 写入、ManualTask 消费（busy_ 保护）。 */
     std::string pending_manual_action_;
+    float jog_step_mm_ = kJogStepMmDefault;
+    bool jog_step_loaded_ = false;
     std::string url_;
     std::string preview_url_;
     // G-code 预取：预览待确认期间后台下载，确认时直接复用。

@@ -643,6 +643,76 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         self._compile_and_run(compiler, source, stem="hutuji_auth_probe_retry_test")
 
+    def test_auth_probe_stall_distinguishes_suspend_from_lost_probe(self):
+        """R22-PIPE-02：`$I` 无应答必须可判定，且挂起期一律不重发。
+
+        实测源码面：`protocol_exec_rt_suspend()`（Grbl_Esp32/src/Protocol.cpp:880）
+        的 `while (sys.suspend.value)` 循环内没有 `protocol_poll_client()` 调用，
+        该函数 5 个调用点全在 `protocol_main_loop` 侧。于是 Hold/Door/Sleep 期行
+        命令只被收进 client_buffer 排队，`$I` 既不回 `ok` 也不回 `error`——连
+        `error:8`（idleOrAlarm 门）都到不了，纯错误驱动的 R10-PIPE-01 重试永不
+        触发；而实时 `?` 照常应答，silent_polls 每拍被状态行清零、keepalive 也
+        不触发。结果是 WaitingBuildInfoOk 无声挂死，连接活着但永不 ready。
+
+        修复口径：按 recv 超时拍数判无声超时。挂起 → ParkSuspended（只播报并冻结，
+        不重发：重发会在 client_buffer 里堆积，解除后一次性回出多个 `ok` 与后续
+        M5/G53 阶段错配）；未挂起 → Reprobe（`$I` 真丢了，走有界重试）。
+        挂起解除后只重置无声计数让排队的 `$I` 走完窗口，绝不补发。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+
+            int main() {
+                using hutuji::AuthProbeStall;
+                using hutuji::DecideAuthProbeStall;
+                using hutuji::GrblSuspendBlocksLines;
+                using hutuji::ShouldRearmStalledProbe;
+
+                // 挂起谓词：Hold/Door/Sleep 都阻塞行命令；Idle/Run/Alarm 不阻塞。
+                assert(GrblSuspendBlocksLines(true, false, false));
+                assert(GrblSuspendBlocksLines(false, true, false));
+                assert(GrblSuspendBlocksLines(false, false, true));
+                assert(!GrblSuspendBlocksLines(false, false, false));
+
+                // 未到上限：无论挂起与否都继续等（`$I` 正常是毫秒级应答）。
+                assert(DecideAuthProbeStall(0, 4, true) == AuthProbeStall::KeepWaiting);
+                assert(DecideAuthProbeStall(3, 4, true) == AuthProbeStall::KeepWaiting);
+                assert(DecideAuthProbeStall(3, 4, false) == AuthProbeStall::KeepWaiting);
+
+                // 到上限 + 挂起：停等播报，绝不重发（buffer 堆积 → 多 ok 错配）。
+                assert(DecideAuthProbeStall(4, 4, true) == AuthProbeStall::ParkSuspended);
+                assert(DecideAuthProbeStall(9, 4, true) == AuthProbeStall::ParkSuspended);
+
+                // 到上限 + 未挂起：`$I` 真丢了，按 R10-PIPE-01 有界重试重探。
+                assert(DecideAuthProbeStall(4, 4, false) == AuthProbeStall::Reprobe);
+                assert(DecideAuthProbeStall(99, 4, false) == AuthProbeStall::Reprobe);
+
+                // 上限 0 = 立即判定（保守配置也必须成立，且仍分两路）。
+                assert(DecideAuthProbeStall(0, 0, true) == AuthProbeStall::ParkSuspended);
+                assert(DecideAuthProbeStall(0, 0, false) == AuthProbeStall::Reprobe);
+
+                // 自愈只在「仍等 $I」且「挂起刚解除」这一个边沿上触发。
+                assert(ShouldRearmStalledProbe(true, true, false));
+                // 仍挂起 / 本来就没挂起 / 已不在等 $I：都不是自愈边沿。
+                assert(!ShouldRearmStalledProbe(true, true, true));
+                assert(!ShouldRearmStalledProbe(true, false, false));
+                assert(!ShouldRearmStalledProbe(false, true, false));
+                // 进入挂起（false -> true）不是自愈边沿。
+                assert(!ShouldRearmStalledProbe(true, false, true));
+                return 0;
+            }
+            """
+        )
+
+        self._compile_and_run(compiler, source, stem="hutuji_auth_probe_stall_test")
+
     def test_gcode_command_prefix_requires_word_boundary(self):
         """S3-P3d：换纸行匹配必须按命令字边界，`M30` 不得命中 `M300`。
 
@@ -2213,8 +2283,26 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("const lv_coord_t jog_size = safe_button_height", ui_body)
         self.assertIn("jog_size * 3 + theme->spacing(4) * 2", ui_body)
         self.assertIn("content_width - jog_col_width - theme->spacing(4)", ui_body)
-        for action in ("jog_y+", "jog_x-", "home", "jog_x+", "jog_y-"):
+        for action in ("jog_step_1", "jog_y+", "jog_step_10", "jog_x-", "home", "jog_x+", "jog_y-"):
             self.assertIn(f'"{action}"', ui_body)
+        self.assertIn("FormatMachineHud", lcd_cc)
+        self.assertIn("machine_hud_timer_", lcd_h)
+        self.assertIn("lv_timer_create(MachineHudTimerCb, 400", lcd_cc)
+        # 2026-08-22 实机截图：HUD 塞进标题胶囊后长串把 432px 行挤爆，方向键变飘字、
+        # Y- 被裁、抬笔/落笔重影。坐标条必须在手动页全宽，标题行只走短 locale。
+        self.assertIn("machine_hud_label_", lcd_h)
+        self.assertIn("lv_obj_set_width(machine_hud_label_, content_width)", lcd_cc)
+        self.assertIn("lv_label_set_text(machine_state_label_, state_text)", lcd_cc)
+        self.assertIn("lv_label_set_text(machine_hud_label_, hud)", lcd_cc)
+        self.assertNotIn("lv_label_set_text(machine_state_label_, hud)", lcd_cc)
+        # 点动键描边：assistant_bubble 贴表面色时只剩白字，截图里 1mm/Y+/X± 像飘字。
+        self.assertIn("lv_obj_set_style_border_width(btn, 2, 0)", ui_body)
+        # 断连不得假装 Idle：状态栏通知在抽屉遮罩下面，用户点 XY 会以为没反应。
+        self.assertIn("Lang::Strings::MACHINE_PLOTTER_OFFLINE", lcd_cc)
+        self.assertIn("hud_pipe.IsConnected()", lcd_cc)
+        self.assertIn("machine_notice_label_", lcd_h)
+        self.assertIn("void LcdDisplay::ShowNotification", lcd_cc)
+        self.assertIn("using LvglDisplay::ShowNotification", lcd_h)
         # 页切换钮进标题行：独占一行会吃掉 64px，主页就装不下 64+56+56 三行。
         # 只钉「父对象是 header」这一语义，不钉 clang-format 的换行位置。
         toggle_start = ui_body.index("machine_manual_toggle_btn_ =")
@@ -2290,6 +2378,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             "MACHINE_JOG_XM",
             "MACHINE_JOG_YP",
             "MACHINE_JOG_YM",
+            "MACHINE_JOG_STEP_1",
+            "MACHINE_JOG_STEP_10",
+            "MACHINE_PLOTTER_OFFLINE",
+            "MACHINE_PLOTTER_NOT_READY",
             "MACHINE_HOME",
             "MACHINE_SET_ORIGIN",
             "MACHINE_UNLOCK",
@@ -2330,7 +2422,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                        job_cc.index("void Job::ManualTaskEntry")]
         # 白名单：11 个动作，未知 action 直接拒绝。
         for action in ("pen_up", "pen_down", "jog_x+", "jog_x-", "jog_y+", "jog_y-",
-                       "home", "set_origin", "unlock", "motor_off", "reset"):
+                       "home", "set_origin", "unlock", "motor_off", "reset",
+                       "jog_step_1", "jog_step_10"):
             self.assertIn(f'"{action}"', entry)
         # 门控：仅 settled 态可用；busy 抢占失败即拒。
         self.assertIn('"idle"', entry)
@@ -2339,8 +2432,14 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn('"aborted"', entry)
         self.assertIn("busy_.exchange(true)", entry)
         self.assertIn("xTaskCreate(ManualTaskEntry", entry)
+        # 1/10mm 步进切换只改 NVS，不占 busy、不进 ManualTask（否则点一下就
+        # PERFORMANCE + 「手动控制中」，和「迈得开」相反）。
+        self.assertIn("SetJogStepMm", entry)
+        self.assertIn("GetJogStepMm", job_h)
 
         task = job_cc[job_cc.index("void Job::ManualTask()"):job_cc.index("std::string Job::StatusJson")]
+        self.assertNotIn("jog_step_1", task)
+        self.assertNotIn("jog_step_10", task)
         # 落笔对齐奎享：先 G92 Z0 声明，再 Z5 落笔；抬笔 Z0。
         self.assertLess(task.index('"G92 Z0"'), task.index('"G1G90 Z5.0F10000"'))
         self.assertIn('"G1G90 Z0.0F10000"', task)
@@ -2365,13 +2464,18 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("kJogEnvelopeMaxXMm = 190.0f", core)
         self.assertIn("kJogEnvelopeMaxYMm = 190.0f", core)
         self.assertIn("kJogStepMm = 1.0f", core)
+        self.assertIn("kJogStepMmFine = 1.0f", core)
+        self.assertIn("kJogStepMmCoarse = 10.0f", core)
+        self.assertIn("kJogStepMmDefault = kJogStepMmCoarse", core)
+        self.assertIn("kMotorDisableLine", core)
         # 回原点和设原点：G1 归位（不触发换纸），G92 三轴声明对齐奎享。
         self.assertIn('"G1G90 X0Y0F8000"', task)
         self.assertIn('"G92 X0.0 Y0.0 Z0"', task)
         self.assertNotIn('"$H"', task)
         self.assertNotIn('SendLine("G90G0 X0Y0")', task)
         self.assertIn('"$X"', task)
-        self.assertIn('"$SLP"', task)
+        self.assertIn("kMotorDisableLine", task)
+        self.assertNotIn('"$SLP"', task)
         self.assertIn("SendRealtime(0x18)", task)
         self.assertIn("GetResetBannerSequence()", task)
         # 收尾：释放 busy 并回 idle，结果走通知。
@@ -2522,7 +2626,26 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 // 包线与步进常量逐值钉死，与云端 §5 / 奎享 `$J=` 序列同源。
                 static_assert(kJogEnvelopeMaxXMm == 190.0f, "X envelope drifted from cloud S5");
                 static_assert(kJogEnvelopeMaxYMm == 190.0f, "Y envelope drifted from cloud S5");
-                static_assert(kJogStepMm == 1.0f, "jog step drifted from kx sequence");
+                static_assert(kJogStepMm == 1.0f, "fine jog step drifted from kx sequence");
+                static_assert(kJogStepMmFine == 1.0f, "fine step must stay 1mm");
+                static_assert(kJogStepMmCoarse == 10.0f, "coarse step must stay 10mm");
+                static_assert(kJogStepMmDefault == kJogStepMmCoarse, "default step must be 10mm");
+                assert(std::string(kMotorDisableLine) == "$MD");
+
+                // 10mm 默认步进：恰贴包线放行，越出拒绝。
+                assert(DecideJog(180.0f, 0.0f, kJogStepMmCoarse, 0.0f) == JogVerdict::kOk);
+                assert(DecideJog(181.0f, 0.0f, kJogStepMmCoarse, 0.0f) == JogVerdict::kOutOfBounds);
+                assert(ClampJogStepMm(1.0f) == kJogStepMmFine);
+                assert(ClampJogStepMm(10.0f) == kJogStepMmCoarse);
+                assert(ClampJogStepMm(7.0f) == kJogStepMmCoarse);
+                assert(ClampJogStepMm(0.0f) == kJogStepMmFine);
+
+                char hud[64];
+                FormatMachineHud(hud, sizeof(hud), "Idle", 1.0f, 2.0f, 15.0f);
+                assert(std::string(hud) == "Idle X1.0 Y2.0 Z15.0");
+                FormatMachineHud(hud, sizeof(hud), "Sleep",
+                                 std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f);
+                assert(std::string(hud) == "Sleep X--- Y0.0 Z0.0");
                 return 0;
             }
             """
@@ -2612,6 +2735,100 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             if "ESP_LOG" in line:
                 self.assertNotIn("payload->code", line)
                 self.assertNotIn("body", line)
+
+    def test_discover_miss_retries_cache_instead_of_skipping_plotter(self):
+        """刷机/复位后 Telnet 槽位忙时不得扫网跳过缓存 IP（2026-08-22）。
+
+        社区对照：FluidNC #189（硬复位客户端不发 TCP 关闭，服务端仍占唯一会话）；
+        上游 Grbl_Esp32 / ESP3D 槽位满则拒绝新连接。我方旧路径在 ClosedBeforeBanner
+        后扫 /24 并 `continue` 掉缓存 IP，把 ~19s keepalive 放大成分钟级。
+        决策：槽位忙只 1s 重试缓存、不扫网、不指数退避；扫网只跳过已验明非 Grbl
+        的缓存；扫描超时 ≥200ms 盖住首包 modem-sleep。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+
+            int main() {
+                using hutuji::DiscoverMiss;
+                using hutuji::DiscoverRetryDelayMs;
+                using hutuji::RetryCachedIpAfterScan;
+                using hutuji::ShouldAdvanceDiscoverBackoff;
+                using hutuji::ShouldScanSubnet;
+                using hutuji::SkipCachedIpDuringScan;
+                using hutuji::kPipeCachedTimeoutMs;
+                using hutuji::kPipeScanTimeoutMs;
+                using hutuji::kSlotBusyRetryDelayMs;
+                using hutuji::kWaitingIpRetryDelayMs;
+
+                static_assert(kPipeScanTimeoutMs >= 200, "scan timeout shorter than first-hop PS delay");
+                static_assert(kPipeCachedTimeoutMs == 2000, "cached connect timeout drifted");
+                static_assert(kSlotBusyRetryDelayMs == 1000, "slot-busy delay drifted");
+                static_assert(kWaitingIpRetryDelayMs == 1000, "waiting-ip delay drifted");
+
+                // 只有「连上了但不是写字机」才在扫网时跳过该 IP。
+                assert(!SkipCachedIpDuringScan(DiscoverMiss::WaitingIp));
+                assert(!SkipCachedIpDuringScan(DiscoverMiss::SlotBusy));
+                assert(!SkipCachedIpDuringScan(DiscoverMiss::CacheUnreachable));
+                assert(SkipCachedIpDuringScan(DiscoverMiss::CacheNotGrbl));
+                assert(!SkipCachedIpDuringScan(DiscoverMiss::ScanEmpty));
+
+                // 槽位忙 / 还没 IP：禁止扫网（会跳过或漏掉真机）。
+                assert(!ShouldScanSubnet(DiscoverMiss::WaitingIp));
+                assert(!ShouldScanSubnet(DiscoverMiss::SlotBusy));
+                assert(ShouldScanSubnet(DiscoverMiss::CacheUnreachable));
+                assert(ShouldScanSubnet(DiscoverMiss::CacheNotGrbl));
+                assert(ShouldScanSubnet(DiscoverMiss::ScanEmpty));
+
+                // 扫网漏检时，对「TCP 没连上」的缓存再用 2s 打一次；非 Grbl 不打。
+                assert(RetryCachedIpAfterScan(DiscoverMiss::CacheUnreachable, false));
+                assert(!RetryCachedIpAfterScan(DiscoverMiss::CacheUnreachable, true));
+                assert(!RetryCachedIpAfterScan(DiscoverMiss::CacheNotGrbl, false));
+                assert(!RetryCachedIpAfterScan(DiscoverMiss::SlotBusy, false));
+                assert(!RetryCachedIpAfterScan(DiscoverMiss::ScanEmpty, false));
+
+                // 槽位忙 / 等 IP：固定 1s，不走 1→2→4→8→16→30。
+                assert(DiscoverRetryDelayMs(DiscoverMiss::SlotBusy, 16000) == 1000);
+                assert(DiscoverRetryDelayMs(DiscoverMiss::WaitingIp, 30000) == 1000);
+                assert(DiscoverRetryDelayMs(DiscoverMiss::ScanEmpty, 8000) == 8000);
+                assert(DiscoverRetryDelayMs(DiscoverMiss::CacheUnreachable, 4000) == 4000);
+                assert(!ShouldAdvanceDiscoverBackoff(DiscoverMiss::SlotBusy));
+                assert(!ShouldAdvanceDiscoverBackoff(DiscoverMiss::WaitingIp));
+                assert(ShouldAdvanceDiscoverBackoff(DiscoverMiss::ScanEmpty));
+                assert(ShouldAdvanceDiscoverBackoff(DiscoverMiss::CacheUnreachable));
+                assert(ShouldAdvanceDiscoverBackoff(DiscoverMiss::CacheNotGrbl));
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_discover_miss_test")
+
+        pipe = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("#define HUTUJI_PIPE_SCAN_TIMEOUT_MS 50", pipe)
+        self.assertIn("kPipeScanTimeoutMs", pipe)
+        self.assertIn("SkipCachedIpDuringScan", pipe)
+        self.assertIn("ShouldScanSubnet", pipe)
+        self.assertIn("RetryCachedIpAfterScan", pipe)
+        self.assertIn("DiscoverRetryDelayMs", pipe)
+        self.assertIn("ShouldAdvanceDiscoverBackoff", pipe)
+        connect = pipe[
+            pipe.index("bool Pipe::ConnectOnce()") : pipe.index("void Pipe::CloseSocket()")
+        ]
+        self.assertIn("SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE)", connect)
+        close = pipe[
+            pipe.index("void Pipe::CloseSocketLocked()") : pipe.index(
+                "void Pipe::ShutdownSocket"
+            )
+        ]
+        self.assertIn("shutdown(sock_, SHUT_RDWR)", close)
 
 if __name__ == "__main__":
     unittest.main()

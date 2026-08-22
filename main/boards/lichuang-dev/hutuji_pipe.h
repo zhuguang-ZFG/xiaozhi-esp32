@@ -266,6 +266,13 @@ private:
     // 连接建立与 reset banner 处清零（新机器状态另起额度）；RetryWait→重探不清。
     int auth_probe_retries_ = 0;
     uint32_t auth_probe_retry_due_tick_ = 0;
+    // R22-PIPE-02：WaitingBuildInfoOk 的无声超时计数（recv 超时拍为单位）。
+    // 挂起态（Hold/Door/Sleep）下 Grbl 不消费行命令，`$I` 既不回 ok 也不回
+    // error，纯错误驱动的 R10-PIPE-01 重试永不触发；靠本计数把「无应答」也
+    // 变成可判定事件。仅 PipeTask 读写。
+    int auth_probe_silent_ticks_ = 0;
+    // 挂起态解释只播报一次（每次挂起进入/连接重建重新武装），避免每 3s 一条。
+    bool auth_probe_suspend_notified_ = false;
 
     TaskHandle_t pipe_task_ = nullptr;
 
@@ -309,8 +316,9 @@ private:
 
     char resolved_ip_[16] = {};
     // Grbl 仅允许一个 Telnet 客户端。S3 重启后旧半开连接尚未回收时，
-    // 新连接会 TCP 成功后立即关闭；这不是缓存 IP 失真，先快速重试再回落扫描。
+    // 新连接会 TCP 成功后立即关闭；这不是缓存 IP 失真，固定 1s 重试缓存、不扫网。
     uint8_t cached_slot_busy_count_ = 0;
+    DiscoverMiss last_discover_miss_ = DiscoverMiss::ScanEmpty;
 };
 
 }  // namespace hutuji

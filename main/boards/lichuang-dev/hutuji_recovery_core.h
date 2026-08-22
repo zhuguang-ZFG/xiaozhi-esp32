@@ -110,9 +110,59 @@ inline bool ParseFiniteMPos(const std::string& status, float& x, float& y, float
  * 成 WPos、网络/固件异常可产生 NaN/Inf，都不得冒充「已知坐标」放行运动。
  */
 inline constexpr float kJogEnvelopeMaxXMm = 190.0f;
-inline constexpr float kJogEnvelopeMaxYMm = 190.0f;  // 2026-08-21 收紧：Y 为物理宽边（210 行程），原 277 超行程
-/** 1mm 固定步进，逐字对齐奎享实测 `$J=G21G91X1.0Y0.0Z0.0F8000.0`。 */
+// 2026-08-21 收紧：Y 为物理宽边（210 行程），原 277 超行程。
+inline constexpr float kJogEnvelopeMaxYMm = 190.0f;
+/** 1mm 细步进，逐字对齐奎享实测 `$J=G21G91X1.0Y0.0Z0.0F8000.0`（R17 交叉钉）。 */
 inline constexpr float kJogStepMm = 1.0f;
+inline constexpr float kJogStepMmFine = 1.0f;
+inline constexpr float kJogStepMmCoarse = 10.0f;
+inline constexpr float kJogStepMmDefault = kJogStepMmCoarse;
+
+/**
+ * 只承认 1mm / 10mm 两档。脏 NVS、NaN、以及「看起来像中间值」一律塌到最近档：
+ * 小于 5 → 1mm，其余 → 10mm。禁止把任意毫米数送进 `$J=`。
+ */
+inline float ClampJogStepMm(float step) {
+    if (!std::isfinite(step) || step < 5.0f) {
+        return kJogStepMmFine;
+    }
+    return kJogStepMmCoarse;
+}
+
+/**
+ * 控制页状态胶囊：Grbl 态 + 三轴。坐标非有限时打 `---`，避免把 NaN 画到屏上。
+ * 例：`Idle X1.0 Y2.0 Z15.0` / `Sleep X--- Y0.0 Z0.0`。
+ */
+inline void FormatMachineHud(char* out, size_t n, const char* grbl_state, float x, float y,
+                             float z) {
+    if (out == nullptr || n == 0) {
+        return;
+    }
+    auto fmt_axis = [](char* buf, size_t cap, float v) {
+        if (!std::isfinite(v)) {
+            std::snprintf(buf, cap, "---");
+        } else {
+            std::snprintf(buf, cap, "%.1f", v);
+        }
+    };
+    char xs[32];
+    char ys[32];
+    char zs[32];
+    fmt_axis(xs, sizeof(xs), x);
+    fmt_axis(ys, sizeof(ys), y);
+    fmt_axis(zs, sizeof(zs), z);
+    const char* st = (grbl_state != nullptr && grbl_state[0] != '\0') ? grbl_state : "?";
+    char stbuf[12];
+    std::snprintf(stbuf, sizeof(stbuf), "%s", st);
+    // 宽度上限让 GCC -Wformat-truncation 看得到写入上界（胶囊本身也装不下更长串）。
+    std::snprintf(out, n, "%.11s X%.7s Y%.7s Z%.7s", stbuf, xs, ys, zs);
+}
+
+/**
+ * 关电机：FluidNC/Grbl_Esp32 `$MD`（Motor/Disable）。下一动自动使能。
+ * 禁止 `$SLP`——Sleep 挂起期不 poll client，后续行命令只进 buffer，面板假死。
+ */
+inline constexpr char kMotorDisableLine[] = "$MD";
 
 enum class JogVerdict { kOk, kStalePosition, kOutOfBounds };
 
@@ -139,15 +189,20 @@ inline JogVerdict DecideJog(float mx, float my, float dx, float dy) {
 inline constexpr bool JobHoldsPerformance(const char* state) {
     // 与 lcd_display.cc ApplyMachineControlState 的 active 谓词同源，单独实现以免
     // 显示层与任务层互相 include；两侧任一改动须同步（已有 host 断言钉死该清单）。
-    const char* const kActive[] = {"streaming",   "paused",       "previewing",
-                                   "awaiting_confirmation",       "downloading",
-                                   "verifying",   "reconnecting", "paper_change",
-                                   "pen_test"};
+    const char* const kActive[] = {
+        "streaming",   "paused",    "previewing",   "awaiting_confirmation",
+        "downloading", "verifying", "reconnecting", "paper_change",
+        "pen_test"};
     for (const char* s : kActive) {
         const char* a = state;
         const char* b = s;
-        while (*a != '\0' && *a == *b) { ++a; ++b; }
-        if (*a == '\0' && *b == '\0') { return true; }
+        while (*a != '\0' && *a == *b) {
+            ++a;
+            ++b;
+        }
+        if (*a == '\0' && *b == '\0') {
+            return true;
+        }
     }
     return false;
 }
@@ -346,7 +401,8 @@ inline bool IsValidDrawCapabilityUrl(const std::string& url, const std::string& 
     const size_t query = url.find('?', slash);
     const size_t path_end = query == std::string::npos ? url.size() : query;
     if (expected_suffix.empty() || path_end < expected_suffix.size() ||
-        url.compare(path_end - expected_suffix.size(), expected_suffix.size(), expected_suffix) != 0) {
+        url.compare(path_end - expected_suffix.size(), expected_suffix.size(), expected_suffix) !=
+            0) {
         return false;
     }
     const std::string authority = url.substr(authority_begin, slash - authority_begin);
@@ -596,6 +652,101 @@ inline constexpr AuthProbeFailure DecideAuthProbeFailure(int retries_done, int m
 /** 重试到期判定：now >= due 即到期；RFC 1982 风格半区间比较，容忍 tick 回绕。 */
 inline constexpr bool AuthProbeRetryDue(uint32_t now_tick, uint32_t due_tick) {
     return static_cast<uint32_t>(now_tick - due_tick) < (uint32_t{1} << 31);
+}
+
+/**
+ * R22-PIPE-02：Grbl 处于挂起态（Hold/Door/Sleep）时行命令根本不会被消费。
+ * 实测源码面：`protocol_exec_rt_suspend()`（Grbl_Esp32/src/Protocol.cpp:880）
+ * 的 `while (sys.suspend.value)` 循环内没有任何 `protocol_poll_client()` 调用，
+ * 该函数的 5 个调用点全在 `protocol_main_loop` 侧；行字符只被 `clientCheckTask`
+ * 收进 client_buffer 排队，不解析、不应答。而实时字符（`?`/`~`/`!`）走中断读
+ * 路径的 `execute_realtime_command()`，挂起期照常应答。
+ *
+ * 后果：挂起期发出的 `$I` 既不回 `ok` 也不回 `error`——`error:8` 那条 idleOrAlarm
+ * 门在挂起期压根到不了。于是 WaitingBuildInfoOk 无声挂死：`?` 有应答 →
+ * silent-poll 不判死、keepalive 不触发、错误驱动的有界重试（R10-PIPE-01）也
+ * 不被触发，连接活着就永不 ready。
+ */
+inline constexpr bool GrblSuspendBlocksLines(bool hold, bool door, bool sleep) {
+    return hold || door || sleep;
+}
+
+/** 探测等应答无声超时的处置。 */
+enum class AuthProbeStall : uint8_t {
+    KeepWaiting = 0,  // 未到判定拍数：继续等
+    ParkSuspended,    // 已超时且对端挂起：不重发（会在 client_buffer 里堆积），等挂起解除
+    Reprobe,          // 已超时且对端未挂起：`$I` 确实丢了，按有界重试重探
+};
+
+/**
+ * 无声超时判定。由 recv 超时拍（EAGAIN 分支，kPollIntervalSec 一拍）驱动，不引
+ * 入额外定时器。挂起态一律 ParkSuspended：重发 `$I` 只会在对端 client_buffer 里
+ * 排队，挂起解除后一次性全部执行并回出多个 `ok`，与后续探测阶段的应答错配。
+ * 亦不代发 `~`（未经用户同意恢复运动）或 `0x18`（毁状态），两者均已否决。
+ */
+inline constexpr AuthProbeStall DecideAuthProbeStall(int silent_ticks, int stall_limit,
+                                                     bool suspend_blocks_lines) {
+    if (silent_ticks < stall_limit) {
+        return AuthProbeStall::KeepWaiting;
+    }
+    return suspend_blocks_lines ? AuthProbeStall::ParkSuspended : AuthProbeStall::Reprobe;
+}
+
+/**
+ * 写字机发现失败分类（2026-08-22）。刷机/掉电后 Grbl `MAX_TLNT_CLIENTS=1`
+ * 仍占旧半开连接时，新 TCP 会被立刻踢掉（上游 TelnetServer 拒绝新客户端；
+ * FluidNC #189：硬复位客户端不发关闭）。旧实现随后扫 /24 并跳过缓存 IP，
+ * 把 ~19s keepalive 放大成分钟级。
+ */
+enum class DiscoverMiss : uint8_t {
+    WaitingIp = 0,     // STA 还没拿到地址
+    SlotBusy,          // 缓存 IP 连上后立刻被关（唯一槽位被半开占用）
+    CacheUnreachable,  // 缓存 IP TCP 超时/拒绝
+    CacheNotGrbl,      // 连上了但 banner 不是写字机
+    ScanEmpty,         // 无缓存或扫网未找到
+};
+
+inline constexpr int kPipeScanTimeoutMs = 200;     // 盖住首包 modem-sleep（实机 ping 199ms）
+inline constexpr int kPipeCachedTimeoutMs = 2000;  // 缓存命中容忍短暂不可达
+inline constexpr uint32_t kSlotBusyRetryDelayMs = 1000;
+inline constexpr uint32_t kWaitingIpRetryDelayMs = 1000;
+
+/** 扫网时是否跳过缓存 IP：只有验明「不是写字机」才跳过。 */
+inline constexpr bool SkipCachedIpDuringScan(DiscoverMiss miss) {
+    return miss == DiscoverMiss::CacheNotGrbl;
+}
+
+/** 槽位忙或还没 IP 时禁止扫网。 */
+inline constexpr bool ShouldScanSubnet(DiscoverMiss miss) {
+    return miss != DiscoverMiss::WaitingIp && miss != DiscoverMiss::SlotBusy;
+}
+
+/** 扫网可能用短超时漏掉真机时，再用缓存超时打一次。 */
+inline constexpr bool RetryCachedIpAfterScan(DiscoverMiss miss, bool found) {
+    return !found && miss == DiscoverMiss::CacheUnreachable;
+}
+
+inline constexpr uint32_t DiscoverRetryDelayMs(DiscoverMiss miss, uint32_t exponential_backoff_ms) {
+    if (miss == DiscoverMiss::SlotBusy) {
+        return kSlotBusyRetryDelayMs;
+    }
+    if (miss == DiscoverMiss::WaitingIp) {
+        return kWaitingIpRetryDelayMs;
+    }
+    return exponential_backoff_ms;
+}
+
+inline constexpr bool ShouldAdvanceDiscoverBackoff(DiscoverMiss miss) {
+    return miss != DiscoverMiss::SlotBusy && miss != DiscoverMiss::WaitingIp;
+}
+
+/**
+ * 挂起解除后的自愈判定：仍在等 `$I` 应答且挂起刚解除 → 排队中的 `$I` 即将被
+ * 消费，只需清零无声计数给它一个完整窗口，不得重发（重发即多一个 `ok`）。
+ */
+inline constexpr bool ShouldRearmStalledProbe(bool waiting_build_info, bool was_suspended,
+                                              bool now_suspended) {
+    return waiting_build_info && was_suspended && !now_suspended;
 }
 
 /**

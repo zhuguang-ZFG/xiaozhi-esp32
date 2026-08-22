@@ -11,13 +11,12 @@
 #include <nvs_flash.h>
 
 #include "application.h"
+#include "board.h"
 #include "lwip/sockets.h"
 
 #define TAG "HutujiPipe"
 
 #define HUTUJI_PIPE_PORT 23
-#define HUTUJI_PIPE_SCAN_TIMEOUT_MS 50
-#define HUTUJI_PIPE_CACHED_TIMEOUT_MS 2000
 
 #define HUTUJI_NVS_NS "hutuji_pipe"
 #define HUTUJI_NVS_KEY_IP "grbl_ip"
@@ -53,7 +52,6 @@ constexpr int kSilentPollLimit = 7;
 // 缓存命中与子网扫描共用此校验。非写字机的 :23 主机每台最多付一次此超时。
 constexpr int kVerifyTimeoutMs = 1500;
 constexpr char kGrblBanner[] = "Grbl ";
-constexpr uint8_t kCachedBusyRetriesBeforeScan = 5;
 
 // R10-PIPE-01：裸连接授权探测可重试失败的有界重试。残留 Hold 时 `$I` 撞
 // idleOrAlarm 门回 error:8；一击置 Failed 且唯一清除点是连接重建的话，Hold 期
@@ -62,6 +60,12 @@ constexpr uint8_t kCachedBusyRetriesBeforeScan = 5;
 // Hold 耗尽后仍 fail closed，绝不代替用户复位（0x18 已否决，与换纸保护冲突）。
 constexpr int kAuthProbeMaxRetries = 8;
 constexpr uint32_t kAuthProbeRetryDelayMs = 5000;
+
+// R22-PIPE-02：`$I` 发出后等应答的无声拍数上限（recv 超时拍 = kPollIntervalSec）。
+// 4 拍 ≈ 12s。裸 `$I` 在 Idle 下是毫秒级应答，12s 足够宽；取这么宽是因为超时后
+// 的动作分两路：对端挂起 → 只播报并冻结（不重发，避免在 client_buffer 里堆积），
+// 对端未挂起 → 认定 `$I` 真丢了并按 R10-PIPE-01 有界重试重探。
+constexpr int kAuthProbeSilentTickLimit = 4;
 
 uint32_t LoadCachedIp() {
     nvs_handle_t h;
@@ -115,9 +119,12 @@ void Pipe::PipeTask() {
     uint32_t backoff_ms = kBackoffInitMs;
     while (true) {
         if (!ConnectOnce()) {
-            ESP_LOGW(TAG, "连接写字机失败，%ums 后重试", (unsigned)backoff_ms);
-            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-            backoff_ms = (backoff_ms * 2 > kBackoffMaxMs) ? kBackoffMaxMs : backoff_ms * 2;
+            const uint32_t delay_ms = DiscoverRetryDelayMs(last_discover_miss_, backoff_ms);
+            ESP_LOGW(TAG, "连接写字机失败，%ums 后重试", (unsigned)delay_ms);
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            if (ShouldAdvanceDiscoverBackoff(last_discover_miss_)) {
+                backoff_ms = (backoff_ms * 2 > kBackoffMaxMs) ? kBackoffMaxMs : backoff_ms * 2;
+            }
             continue;
         }
         backoff_ms = kBackoffInitMs;
@@ -134,8 +141,10 @@ void Pipe::PipeTask() {
         } else {
             auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
         }
-        // 新连接另起重试额度（R10-PIPE-01）。
+        // 新连接另起重试额度（R10-PIPE-01）与无声超时计数（R22-PIPE-02）。
         auth_probe_retries_ = 0;
+        auth_probe_silent_ticks_ = 0;
+        auth_probe_suspend_notified_ = false;
 
         // 新连接重建时先关闭「对端正长阻塞」标记：当前仅凭 banner 不能判定是否换纸。
         // 若 Job 随后 `[ESP901]` 查到 Changing=On，会显式打开，避免换纸期 silent-poll
@@ -182,15 +191,53 @@ void Pipe::PipeTask() {
                     // 接收任务内恢复标准探测，避免跨任务并发修改 auth_probe_stage_。
                     // RetryWait 到期的重探也走这里（R10-PIPE-01）——同一驱动点，
                     // 保持 auth_probe_stage_ 单任务修改。
-                    if (!task_session_active_.load() && !ready_.load() &&
+                    const GrblState gs = grbl_state_.load();
+                    // R22-PIPE-02：挂起态下行命令不会被消费，此时发 `$I` 只会在对端
+                    // client_buffer 里排队，解除后一次性回出多个 `ok` 与后续阶段错配。
+                    // 因此挂起期一律不武装/不重探，等挂起解除再发。
+                    const bool suspend_blocks_lines = GrblSuspendBlocksLines(
+                        gs == GrblState::Hold, gs == GrblState::Door, gs == GrblState::Sleep);
+                    if (!task_session_active_.load() && !ready_.load() && !suspend_blocks_lines &&
                         (auth_probe_stage_ == AuthProbeStage::Idle ||
                          (auth_probe_stage_ == AuthProbeStage::RetryWait &&
                           AuthProbeRetryDue(xTaskGetTickCount(), auth_probe_retry_due_tick_)))) {
                         auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
+                        auth_probe_silent_ticks_ = 0;
                         std::lock_guard<std::mutex> wlock(write_mutex_);
                         SendRawLocked("$I\n", 3);
                         silent_polls = 0;
                         continue;
+                    }
+                    // R22-PIPE-02：`$I` 已发但无声挂死的判定。挂起期 `?` 照常有应答，
+                    // 所以 silent_polls 恒被状态行清零、keepalive 也不触发——不自己
+                    // 数拍就永远停在 WaitingBuildInfoOk。
+                    if (auth_probe_stage_ == AuthProbeStage::WaitingBuildInfoOk &&
+                        !task_session_active_.load()) {
+                        ++auth_probe_silent_ticks_;
+                        switch (DecideAuthProbeStall(auth_probe_silent_ticks_,
+                                                     kAuthProbeSilentTickLimit,
+                                                     suspend_blocks_lines)) {
+                            case AuthProbeStall::ParkSuspended:
+                                // 冻结在上限，等挂起解除后由 ParseStatusReport 自愈重置。
+                                auth_probe_silent_ticks_ = kAuthProbeSilentTickLimit;
+                                if (!auth_probe_suspend_notified_) {
+                                    auth_probe_suspend_notified_ = true;
+                                    ESP_LOGW(TAG,
+                                             "授权探测停等：对端处于 %s（挂起态不消费行命令），"
+                                             "等待用户在写字机侧恢复",
+                                             GrblStateName(gs));
+                                    NotifyCloud("写字机停在暂停状态，请在写字机上恢复运行后重试");
+                                }
+                                break;
+                            case AuthProbeStall::Reprobe:
+                                // 未挂起却 12s 无应答：`$I` 真丢了（缓冲溢出/丢包），
+                                // 按有界重试重探，耗尽仍 fail closed。
+                                auth_probe_silent_ticks_ = 0;
+                                ScheduleAuthProbeRetryOrFail("$I 探活", -1);
+                                break;
+                            case AuthProbeStall::KeepWaiting:
+                                break;
+                        }
                     }
                     // recv 超时：发 ? 轮询 Grbl 状态。
                     // TCP keepalive 只能发现「TCP 层死了」；若对端协议栈活着而 Grbl
@@ -331,22 +378,26 @@ bool Pipe::TryConnect(uint32_t ip_addr, int timeout_ms) {
 }
 
 bool Pipe::ConnectOnce() {
+    // 发现期钉 PERFORMANCE：LOW_POWER(MAX_MODEM) 下首包可到 ~200ms，50ms 扫网会漏检。
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+
     // 等 DHCP 拿到 IP 再尝试（避免 WiFi 连接前的无效重试）
     esp_netif_ip_info_t ip_info = {};
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!netif || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+        last_discover_miss_ = DiscoverMiss::WaitingIp;
         return false;
     }
 
     bool found = false;
-    bool cached_suspect = false;    // 缓存 IP 连上了但验证不是写字机（可能被 DHCP 改号顶替）
-    bool cached_slot_busy = false;  // 旧半开 Telnet 连接仍占唯一槽位，不是缓存失真
+    bool cached_suspect = false;  // 缓存 IP 连上了但验证不是写字机（可能被 DHCP 改号顶替）
     uint32_t cached_ip = LoadCachedIp();
+    last_discover_miss_ = cached_ip == 0 ? DiscoverMiss::ScanEmpty : DiscoverMiss::CacheUnreachable;
 
     // 0) NVS 缓存（上次发现的写字机，2s 超时容忍短暂不可达）
     if (cached_ip != 0) {
         std::lock_guard<std::mutex> lock(sock_mutex_);
-        if (TryConnect(cached_ip, HUTUJI_PIPE_CACHED_TIMEOUT_MS)) {
+        if (TryConnect(cached_ip, kPipeCachedTimeoutMs)) {
             // 缓存命中也要验明正身：若 DHCP 把该 IP 分给了别的设备（可能开 :23），
             // 不能把它当写字机连上。真正无效才清缓存；槽位忙保留并重试。
             PeerCheck check = VerifyGrblPeer(sock_, kVerifyTimeoutMs);
@@ -355,33 +406,27 @@ bool Pipe::ConnectOnce() {
                 cached_slot_busy_count_ = 0;
                 found = true;
             } else if (check == PeerCheck::ClosedBeforeBanner) {
-                cached_slot_busy = true;
-                if (cached_slot_busy_count_ < kCachedBusyRetriesBeforeScan) {
-                    ++cached_slot_busy_count_;
-                }
-                ESP_LOGW(TAG, "缓存 IP %s 的 Telnet 槽位忙（%u/%u），保留缓存", resolved_ip_,
-                         static_cast<unsigned>(cached_slot_busy_count_),
-                         static_cast<unsigned>(kCachedBusyRetriesBeforeScan));
+                last_discover_miss_ = DiscoverMiss::SlotBusy;
+                ++cached_slot_busy_count_;
+                ESP_LOGW(TAG, "缓存 IP %s 的 Telnet 槽位忙（第 %u 次），1s 后重试缓存",
+                         resolved_ip_, static_cast<unsigned>(cached_slot_busy_count_));
                 close(sock_);
                 sock_ = -1;
             } else {
                 ESP_LOGW(TAG, "缓存 IP %s 验证失败（非写字机），清除缓存并回落扫描", resolved_ip_);
+                last_discover_miss_ = DiscoverMiss::CacheNotGrbl;
                 cached_suspect = true;
                 cached_slot_busy_count_ = 0;
                 close(sock_);
                 sock_ = -1;
             }
+        } else {
+            last_discover_miss_ = DiscoverMiss::CacheUnreachable;
         }
     }
 
-    // 槽位忙通常来自 S3 刚重启、Grbl 尚未通过 keepalive 回收旧半开连接。
-    // 前几次只重试缓存，避免每次都付出整段 /24 扫描；多次仍忙才扫描旁路。
-    if (cached_slot_busy && cached_slot_busy_count_ < kCachedBusyRetriesBeforeScan) {
-        return false;
-    }
-
-    // 1) 子网扫描 Telnet:23（.1 ~ .254，50ms/地址 + 命中的逐台等 banner）
-    if (!found) {
+    // 槽位忙：只重试缓存。扫网会跳过/漏掉真机，把 Grbl keepalive ~19s 放大成分钟级。
+    if (!found && ShouldScanSubnet(last_discover_miss_)) {
         uint32_t base = ip_info.ip.addr & ip_info.netmask.addr;
         uint32_t self = ip_info.ip.addr;
         ESP_LOGI(TAG, "扫描子网寻找写字机 Telnet:23...");
@@ -390,9 +435,9 @@ bool Pipe::ConnectOnce() {
             uint32_t target = base | htonl(host);
             if (target == self)
                 continue;
-            if (target == cached_ip)
+            if (target == cached_ip && SkipCachedIpDuringScan(last_discover_miss_))
                 continue;
-            if (TryConnect(target, HUTUJI_PIPE_SCAN_TIMEOUT_MS)) {
+            if (TryConnect(target, kPipeScanTimeoutMs)) {
                 // 只认真写字机：banner 校验不过就关掉继续扫，
                 // 否则路由器/打印机等开 :23 的主机会被当成写字机顶替（A）。
                 if (VerifyGrblPeer(sock_, kVerifyTimeoutMs) == PeerCheck::Valid) {
@@ -401,6 +446,17 @@ bool Pipe::ConnectOnce() {
                     found = true;
                     break;
                 }
+                close(sock_);
+                sock_ = -1;
+            }
+        }
+        if (!found && cached_ip != 0 && RetryCachedIpAfterScan(last_discover_miss_, found)) {
+            if (TryConnect(cached_ip, kPipeCachedTimeoutMs) &&
+                VerifyGrblPeer(sock_, kVerifyTimeoutMs) == PeerCheck::Valid) {
+                ESP_LOGI(TAG, "扫网后缓存 IP 命中: %s", resolved_ip_);
+                cached_slot_busy_count_ = 0;
+                found = true;
+            } else if (sock_ >= 0) {
                 close(sock_);
                 sock_ = -1;
             }
@@ -417,6 +473,12 @@ bool Pipe::ConnectOnce() {
                 nvs_commit(h);
                 nvs_close(h);
             }
+        }
+        if (last_discover_miss_ != DiscoverMiss::SlotBusy &&
+            last_discover_miss_ != DiscoverMiss::WaitingIp &&
+            last_discover_miss_ != DiscoverMiss::CacheNotGrbl &&
+            last_discover_miss_ != DiscoverMiss::CacheUnreachable) {
+            last_discover_miss_ = DiscoverMiss::ScanEmpty;
         }
         return false;
     }
@@ -468,6 +530,8 @@ void Pipe::CloseSocketLocked() {
     authorized_.store(false);
     std::lock_guard<std::mutex> sock_lock(sock_mutex_);
     if (sock_ >= 0) {
+        // FluidNC #189 / ESP3D：客户端须 stop/shutdown，服务端才能放掉唯一槽位。
+        shutdown(sock_, SHUT_RDWR);
         close(sock_);
         sock_ = -1;
     }
@@ -662,8 +726,12 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
         } else {
             auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
         }
-        // 对端已复位 = 全新机器状态，重试额度另起（R10-PIPE-01）。
+        // 对端已复位 = 全新机器状态，重试额度另起（R10-PIPE-01）；复位也清掉挂起
+        // 期的无声计数与播报闸（R22-PIPE-02）——复位后 client_buffer 已空，排队的
+        // `$I` 不复存在，上面刚重发的那条是唯一在途探针。
         auth_probe_retries_ = 0;
+        auth_probe_silent_ticks_ = 0;
+        auth_probe_suspend_notified_ = false;
         // 对端软复位会丢弃其内部排队状态，我方遗留应答全部失效。
         DrainResponses();
         {
@@ -775,6 +843,23 @@ void Pipe::ParseStatusReport(const std::string& line) {
                 NotifyCloud("写字机已暂停");
             }
         }
+
+        // R22-PIPE-02：挂起解除的自愈点。挂起期排队在对端 client_buffer 里的 `$I`
+        // 会在 `protocol_poll_client()` 恢复调用后被消费并回应答，所以这里只清零
+        // 无声计数（给它一个完整的判定窗口）与播报闸，绝不重发——重发会多出一个
+        // `ok`，与后续 M5/G53 阶段的应答错配。若排队的 `$I` 真丢了，下一轮无声
+        // 超时会走 Reprobe 分支按有界重试重发。
+        if (ShouldRearmStalledProbe(
+                auth_probe_stage_ == AuthProbeStage::WaitingBuildInfoOk,
+                GrblSuspendBlocksLines(prev == GrblState::Hold, prev == GrblState::Door,
+                                       prev == GrblState::Sleep),
+                GrblSuspendBlocksLines(gs == GrblState::Hold, gs == GrblState::Door,
+                                       gs == GrblState::Sleep))) {
+            auth_probe_silent_ticks_ = 0;
+            auth_probe_suspend_notified_ = false;
+            ESP_LOGI(TAG, "挂起解除（%s -> %s），授权探测恢复等待 $I 应答", GrblStateName(prev),
+                     GrblStateName(gs));
+        }
     }
 
     // MPos：只把完整有限三轴作为新位置证据。$10 可持久化为 WPos；网络/固件异常
@@ -792,6 +877,7 @@ void Pipe::ParseStatusReport(const std::string& line) {
             // Z 抬笔行的 ok 只表示进入 planner；实机上紧接着发 $I 会在 Run 态
             // 收到 error:8。等新状态确认 Idle 后再继续探活。
             auth_probe_stage_ = AuthProbeStage::WaitingBuildInfoOk;
+            auth_probe_silent_ticks_ = 0;
             if (!SendLine("$I")) {
                 auth_probe_stage_ = AuthProbeStage::Failed;
                 ESP_LOGE(TAG, "abort 复位后探活发送失败");
@@ -899,17 +985,25 @@ bool Pipe::HandleAuthProbeResponse(WaitResult result, int error_code) {
 }
 
 void Pipe::ScheduleAuthProbeRetryOrFail(const char* what, int error_code) {
+    // error_code < 0 = 无 error 行的失败（R22-PIPE-02 的无声超时）；此时打
+    // "error:-1" 会误导排障，单独成文案。
+    char reason[24];
+    if (error_code < 0) {
+        std::snprintf(reason, sizeof(reason), "超时无应答");
+    } else {
+        std::snprintf(reason, sizeof(reason), "error:%d", error_code);
+    }
     if (DecideAuthProbeFailure(auth_probe_retries_, kAuthProbeMaxRetries) ==
         AuthProbeFailure::RetryLater) {
         ++auth_probe_retries_;
         auth_probe_stage_ = AuthProbeStage::RetryWait;
         auth_probe_retry_due_tick_ = xTaskGetTickCount() + pdMS_TO_TICKS(kAuthProbeRetryDelayMs);
-        ESP_LOGW(TAG, "%s失败: error:%d，%ums 后重探（第 %d/%d 次）", what, error_code,
+        ESP_LOGW(TAG, "%s失败: %s，%ums 后重探（第 %d/%d 次）", what, reason,
                  (unsigned)kAuthProbeRetryDelayMs, auth_probe_retries_, kAuthProbeMaxRetries);
         return;
     }
     auth_probe_stage_ = AuthProbeStage::Failed;
-    ESP_LOGE(TAG, "%s失败: error:%d，重试额度已耗尽，等待连接重建", what, error_code);
+    ESP_LOGE(TAG, "%s失败: %s，重试额度已耗尽，等待连接重建", what, reason);
     // 用户可感知的死角：连接活着但永不 ready。给云端一条可读解释。
     NotifyCloud("写字机授权探测多次失败（可能停在暂停/保持状态），请检查写字机后重试");
 }

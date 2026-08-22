@@ -97,6 +97,13 @@ protected:
     lv_obj_t* machine_pen_test_btn_ = nullptr;
     lv_obj_t* machine_close_btn_ = nullptr;
     lv_obj_t* machine_state_label_ = nullptr;
+    lv_obj_t* machine_hud_label_ = nullptr;
+    lv_obj_t* machine_notice_label_ = nullptr;
+    int64_t machine_notice_hide_us_ = 0;
+    lv_obj_t* machine_jog_step_1_btn_ = nullptr;
+    lv_obj_t* machine_jog_step_10_btn_ = nullptr;
+    lv_timer_t* machine_hud_timer_ = nullptr;
+    static void MachineHudTimerCb(lv_timer_t* timer);
     lv_obj_t* machine_manual_section_ = nullptr;
     lv_obj_t* machine_manual_toggle_btn_ = nullptr;
     lv_obj_t* machine_manual_toggle_label_ = nullptr;
@@ -162,6 +169,8 @@ public:
     /** 配网二维码「关闭」回调：调用方负责退出配网模式（如 StopConfigAp）。 */
     void SetProvisioningCancelHandler(std::function<void()> on_cancel);
     virtual void UpdateMachineControlState(const std::string& state) override;
+    using LvglDisplay::ShowNotification;
+    virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
