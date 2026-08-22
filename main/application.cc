@@ -744,7 +744,11 @@ void Application::HandleToggleChatEvent() {
         }
         SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
+        // Toggle is the on-screen talk button. Abort and clear buffered TTS before
+        // entering listening, otherwise auto mode waits for playback to drain.
         AbortSpeaking(kAbortReasonNone);
+        audio_service_.ResetDecoder();
+        SetListeningMode(GetDefaultListeningMode());
     } else if (state == kDeviceStateListening) {
         protocol_->CloseAudioChannel();
     }
