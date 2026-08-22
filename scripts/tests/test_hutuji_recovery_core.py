@@ -1040,15 +1040,56 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         speaking = handler[speaking_start:handler.index("} else if (state == kDeviceStateListening)", speaking_start)]
         self.assertIn("AbortSpeaking(kAbortReasonNone);", speaking)
         self.assertIn("audio_service_.ResetDecoder();", speaking)
-        self.assertIn("SetListeningMode(GetDefaultListeningMode());", speaking)
+        self.assertIn("SetListeningMode(mode);", speaking)
+        # 通道已关时必须先重开再进监听（2026-08-22 HIL：无 UDP 上行永久卡死）。
+        self.assertIn("protocol_->IsAudioChannelOpened()", speaking)
+        self.assertIn("ContinueOpenAudioChannel(mode);", speaking)
+        # speaking→connecting 非合法边，重开路径必须经 idle 中转。
+        self.assertIn("SetDeviceState(kDeviceStateIdle);", speaking)
+        self.assertIn("SetDeviceState(kDeviceStateConnecting);", speaking)
         self.assertLess(
             speaking.index("AbortSpeaking(kAbortReasonNone);"),
             speaking.index("audio_service_.ResetDecoder();"),
         )
         self.assertLess(
             speaking.index("audio_service_.ResetDecoder();"),
-            speaking.index("SetListeningMode(GetDefaultListeningMode());"),
+            speaking.index("SetListeningMode(mode);"),
         )
+
+    def test_mqtt_session_goodbye_and_stale_hello_guards(self):
+        """goodbye 排队关闭须复核会话；空通道关闭无副作用；迟到 hello 被丢弃。
+
+        2026-08-22 HIL 坐实：WiFi 抖动后用户点「说话」，新会话开启 160ms 即被
+        排队的旧 goodbye 关闭掐断；超时放弃后的迟到 hello 还会污染下一次开启。
+        """
+        mqtt_cc = (ROOT / "main/protocols/mqtt_protocol.cc").read_text(encoding="utf-8")
+        mqtt_h = (ROOT / "main/protocols/mqtt_protocol.h").read_text(encoding="utf-8")
+
+        goodbye = mqtt_cc[mqtt_cc.index('strcmp(type->valuestring, "goodbye")'):]
+        goodbye = goodbye[: goodbye.index("} else if (on_incoming_json_")]
+        self.assertIn("std::string goodbye_session = session_id->valuestring;", goodbye)
+        self.assertIn("session_id_ == goodbye_session", goodbye)
+
+        close_fn = mqtt_cc[mqtt_cc.index("void MqttProtocol::CloseAudioChannel"):]
+        close_fn = close_fn[: close_fn.index("bool MqttProtocol::OpenAudioChannel")]
+        self.assertIn("if (udp == nullptr) {", close_fn)
+        self.assertLess(close_fn.index("if (udp == nullptr) {"),
+                        close_fn.index("if (send_goodbye) {"))
+
+        open_fn = mqtt_cc[mqtt_cc.index("bool MqttProtocol::OpenAudioChannel"):]
+        open_fn = open_fn[: open_fn.index("std::string MqttProtocol::GetHelloMessage")]
+        self.assertIn("hello_pending_ = true;", open_fn)
+        self.assertLess(open_fn.index("hello_pending_ = true;"),
+                        open_fn.index("SendText(message)"))
+        self.assertLess(open_fn.index("xEventGroupWaitBits"),
+                        open_fn.rindex("hello_pending_ = false;"))
+
+        parse_fn = mqtt_cc[mqtt_cc.index("void MqttProtocol::ParseServerHello"):]
+        parse_fn = parse_fn[: parse_fn.index("bool MqttProtocol::CryptAesCtr")]
+        self.assertIn("if (!hello_pending_) {", parse_fn)
+        self.assertLess(parse_fn.index("if (!hello_pending_) {"),
+                        parse_fn.index('cJSON_GetObjectItem(root, "transport")'))
+        self.assertIn("std::atomic<bool> hello_pending_", mqtt_h)
 
     def test_waveshare_boot_button_wakes_power_save(self):
         """省电后按 BOOT 必须先恢复背光和正常电源状态，再切换聊天。"""

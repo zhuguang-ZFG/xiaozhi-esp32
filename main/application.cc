@@ -748,7 +748,17 @@ void Application::HandleToggleChatEvent() {
         // entering listening, otherwise auto mode waits for playback to drain.
         AbortSpeaking(kAbortReasonNone);
         audio_service_.ResetDecoder();
-        SetListeningMode(GetDefaultListeningMode());
+        ListeningMode mode = GetDefaultListeningMode();
+        if (!protocol_->IsAudioChannelOpened()) {
+            // 2026-08-22 HIL：通道已被上一轮关闭时直接进监听会无 UDP 上行，
+            // 编码队列永远满丢帧、服务器收不到音频（用户感知「卡死」）。重开。
+            // 状态机无 speaking→connecting 合法边，经 idle 中转（两步皆合法边）。
+            SetDeviceState(kDeviceStateIdle);
+            SetDeviceState(kDeviceStateConnecting);
+            Schedule([this, mode]() { ContinueOpenAudioChannel(mode); });
+            return;
+        }
+        SetListeningMode(mode);
     } else if (state == kDeviceStateListening) {
         protocol_->CloseAudioChannel();
     }
