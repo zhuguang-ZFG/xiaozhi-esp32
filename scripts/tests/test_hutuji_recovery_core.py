@@ -1029,6 +1029,27 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("WaitForAudioOutputIdle();", gcode_fn)
         self.assertLess(gcode_fn.index("WaitForAudioOutputIdle();"),
                         gcode_fn.index("CreateHttp"))
+
+    def test_toggle_chat_interrupts_speaking_into_default_listening(self):
+        """点击切换钮打断播报后必须直接进入默认监听模式，而不是只静音。"""
+        app = (ROOT / "main/application.cc").read_text(encoding="utf-8")
+        start = app.index("void Application::HandleToggleChatEvent()")
+        end = app.index("void Application::ContinueOpenAudioChannel", start)
+        handler = app[start:end]
+        speaking_start = handler.index("} else if (state == kDeviceStateSpeaking)")
+        speaking = handler[speaking_start:handler.index("} else if (state == kDeviceStateListening)", speaking_start)]
+        self.assertIn("AbortSpeaking(kAbortReasonNone);", speaking)
+        self.assertIn("audio_service_.ResetDecoder();", speaking)
+        self.assertIn("SetListeningMode(GetDefaultListeningMode());", speaking)
+        self.assertLess(
+            speaking.index("AbortSpeaking(kAbortReasonNone);"),
+            speaking.index("audio_service_.ResetDecoder();"),
+        )
+        self.assertLess(
+            speaking.index("audio_service_.ResetDecoder();"),
+            speaking.index("SetListeningMode(GetDefaultListeningMode());"),
+        )
+
     def test_waveshare_boot_button_wakes_power_save(self):
         """省电后按 BOOT 必须先恢复背光和正常电源状态，再切换聊天。"""
         board = (
