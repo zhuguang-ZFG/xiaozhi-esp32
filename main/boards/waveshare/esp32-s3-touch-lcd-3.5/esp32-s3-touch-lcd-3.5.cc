@@ -790,6 +790,13 @@ public:
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        // 出图活跃窗口内拒绝 LOW_POWER 回落：音频通道关闭（application.cc
+        // OnAudioChannelClosed）等路径每几秒无条件踩回，与 ReassertPerformance
+        // 互踩造成 Telnet RTT 尖峰（实测 ok 间隔 200-290ms，笔运动肉眼卡顿）。
+        if (level == PowerSaveLevel::LOW_POWER &&
+            hutuji::Job::GetInstance().HoldsPerformanceForRadio()) {
+            return;
+        }
         if (level != PowerSaveLevel::LOW_POWER) {
             power_save_timer_->WakeUp();
         }

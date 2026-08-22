@@ -56,6 +56,11 @@ public:
     std::string StatusJson() const;
 
     bool IsPaperActive() const { return paper_active_.load(); }
+    /** WiFi 省电门：活跃窗口内板级 SetPowerSaveLevel 拒绝 LOW_POWER 回落。 */
+    bool HoldsPerformanceForRadio() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return JobHoldsPerformance(state_.c_str());
+    }
 
 private:
     Job() = default;
@@ -83,6 +88,17 @@ private:
 
     bool DownloadToPsram(const std::string& url);
     bool DownloadAndShowPreview(const std::string& url);
+    /**
+     * 预览就绪后后台预取 G-code 到 PSRAM 并校验：用户确认即画，跳过下载段。
+     * 预取失败一律静默回落正常下载；取消/新任务通过 epoch + cancel 标志拒绝旧发布。
+     */
+    static void PrefetchTaskEntry(void* arg);
+    void PrefetchGcode();
+    /** 确认路径接管预取产物；仍在跑则等其收敛（abort 立即放行）。 */
+    bool AdoptPrefetch();
+    /** 作废旧预取：推进 epoch、置 cancel、释放已发布的缓冲。 */
+    void CancelPrefetch();
+
     void ClearPreview();
     bool VerifyCrc();
     bool StreamToGrbl();
@@ -164,6 +180,18 @@ private:
     std::string pending_manual_action_;
     std::string url_;
     std::string preview_url_;
+    // G-code 预取：预览待确认期间后台下载，确认时直接复用。
+    enum class PrefetchState { Idle, Running, Ready };
+    std::atomic<PrefetchState> prefetch_state_{PrefetchState::Idle};
+    std::atomic<bool> prefetch_cancel_{false};
+    // 每次 StartDraw/作废递增：预取任务只在自己的 epoch 内发布产物。
+    std::atomic<uint32_t> prefetch_epoch_{0};
+    // 保护 prefetch_buffer_ 的发布/接管/释放三方的互斥。
+    std::mutex prefetch_mutex_;
+    uint8_t* prefetch_buffer_ = nullptr;
+    size_t prefetch_len_ = 0;
+    uint32_t prefetch_crc_ = 0;
+    std::string prefetch_url_;
     uint8_t* buffer_ = nullptr;
     size_t buffer_len_ = 0;
     uint32_t expect_crc_ = 0;

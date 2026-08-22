@@ -660,6 +660,46 @@ void LcdDisplay::EnsureDrawPreviewUi() {
     lv_obj_add_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN);
 }
 
+void LcdDisplay::ShowDrawPreviewLoading() {
+    DisplayLockGuard lock(this);
+    EnsureDrawPreviewUi();
+    if (draw_preview_root_ == nullptr) {
+        return;
+    }
+    // 图未落地先上卡片：空纸面 + 提示语 + 禁用确认，避免用户面对空屏等待。
+    if (draw_preview_image_ != nullptr) {
+        lv_image_set_src(draw_preview_image_, nullptr);
+        lv_obj_set_size(draw_preview_image_, 220, 160);
+    }
+    draw_preview_cached_.reset();
+    if (draw_preview_hint_ != nullptr) {
+        lv_label_set_text(draw_preview_hint_, "预览生成中，马上好…");
+    }
+    if (draw_preview_confirm_btn_ != nullptr) {
+        lv_obj_add_state(draw_preview_confirm_btn_, LV_STATE_DISABLED);
+    }
+    draw_preview_on_confirm_ = nullptr;
+    draw_preview_on_cancel_ = nullptr;
+    if (machine_control_trigger_btn_ != nullptr) {
+        lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (voice_talk_btn_ != nullptr) {
+        lv_obj_add_flag(voice_talk_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (wifi_config_btn_ != nullptr) {
+        lv_obj_add_flag(wifi_config_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (machine_control_root_ != nullptr) {
+        lv_obj_add_flag(machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_move_foreground(draw_preview_root_);
+    lv_obj_remove_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN);
+    if (provisioning_qr_root_ != nullptr &&
+        !lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_move_foreground(provisioning_qr_root_);
+    }
+}
+
 void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::string& hint,
                                  std::function<void()> on_confirm,
                                  std::function<void()> on_cancel) {
@@ -699,6 +739,10 @@ void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::st
     }
 
     lv_label_set_text(draw_preview_hint_, hint.c_str());
+    // 占位卡阶段确认键禁用；图落地后才允许确认。
+    if (draw_preview_confirm_btn_ != nullptr) {
+        lv_obj_clear_state(draw_preview_confirm_btn_, LV_STATE_DISABLED);
+    }
     draw_preview_on_confirm_ = std::move(on_confirm);
     draw_preview_on_cancel_ = std::move(on_cancel);
     if (machine_control_trigger_btn_ != nullptr) {

@@ -316,6 +316,8 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     url_ = url;
     preview_url_ = preview_url;
     last_error_.clear();
+    // 新任务作废旧预取：上一个任务的预取可能仍在跑，epoch 推进后其发布会被拒绝。
+    CancelPrefetch();
     SetState("previewing");
     BaseType_t ok = xTaskCreate(PreviewTaskEntry, "hutuji_preview", 6144, this, 4, nullptr);
     if (ok != pdTRUE) {
@@ -359,12 +361,14 @@ std::string Job::RequestAbort() {
         }
         if (awaiting_confirmation_.exchange(false)) {
             ClearPreview();
+            prefetch_cancel_.store(true);
             abort_requested_.store(false);
             busy_.store(false, std::memory_order_release);
             SetState("aborted");
             return JsonString("预览已取消");
         }
         abort_requested_.store(true);
+        prefetch_cancel_.store(true);
         stream_control_epoch_.store(
             NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
             std::memory_order_release);
@@ -996,6 +1000,10 @@ void Job::PreviewTaskEntry(void* arg) {
 }
 
 void Job::Preview() {
+    // 占位卡先上屏：不用等 PNG 落地，用户立刻知道「在准备预览」。
+    if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
+        display->ShowDrawPreviewLoading();
+    }
     if (!DownloadAndShowPreview(preview_url_)) {
         // 预览取消也走这条路（下载中收到 abort）：区分处置，避免误报错误。
         if (abort_requested_.load()) {
@@ -1026,12 +1034,154 @@ void Job::Preview() {
         SetState("awaiting_confirmation");
     }
     Notify("预览已出来啦，喜欢就说「开始画」，不喜欢就说「取消」");
+    // 预览上屏后后台预取 G-code：确认时 Run() 直接复用，省掉整段下载/校验等待。
+    prefetch_cancel_.store(false);
+    prefetch_state_.store(PrefetchState::Running, std::memory_order_release);
+    if (xTaskCreate(PrefetchTaskEntry, "hutuji_prefetch", 6144, this, 4, nullptr) != pdTRUE) {
+        prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
+    }
 }
 
 void Job::ClearPreview() {
     if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
         display->HideDrawPreview();
     }
+}
+
+void Job::PrefetchTaskEntry(void* arg) {
+    static_cast<Job*>(arg)->PrefetchGcode();
+    vTaskDelete(nullptr);
+}
+
+void Job::CancelPrefetch() {
+    prefetch_cancel_.store(true);
+    prefetch_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    if (prefetch_buffer_ != nullptr) {
+        heap_caps_free(prefetch_buffer_);
+        prefetch_buffer_ = nullptr;
+    }
+    prefetch_len_ = 0;
+    prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
+}
+
+void Job::PrefetchGcode() {
+    const uint32_t epoch = prefetch_epoch_.load(std::memory_order_acquire);
+    std::string url;
+    {
+        // url_ 由 StartDraw 在 stream_mutex_ 内写入；拷贝一份避免读到下一个任务的值。
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        url = url_;
+    }
+    WaitForAudioOutputIdle();
+    // 预取失败永远静默回落：确认时 Run() 走正常下载，用户无感知。
+    uint8_t* buf = nullptr;
+    size_t len = 0;
+    uint32_t crc = 0;
+    bool ok = false;
+    do {
+        if (prefetch_cancel_.load() || abort_requested_.load()) {
+            break;
+        }
+        auto network = Board::GetInstance().GetNetwork();
+        if (!network) {
+            break;
+        }
+        auto http = network->CreateHttp(3);
+        if (!http) {
+            break;
+        }
+        http->SetTimeout(60000);
+        if (!http->Open("GET", url)) {
+            break;
+        }
+        if (http->GetStatusCode() != 200) {
+            http->Close();
+            break;
+        }
+        const size_t content_length = http->GetBodyLength();
+        if (content_length == 0 || content_length > kMaxGcodeBytes) {
+            http->Close();
+            break;
+        }
+        std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
+        if (crc_hdr.empty()) {
+            crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
+        }
+        if (!ParseCrc32Header(crc_hdr, crc)) {
+            http->Close();
+            break;
+        }
+        // 与 DownloadToPsram 同策：只用 PSRAM，不饿死内部堆。
+        buf = static_cast<uint8_t*>(
+            heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (buf == nullptr) {
+            http->Close();
+            break;
+        }
+        size_t total = 0;
+        while (total < content_length) {
+            if (prefetch_cancel_.load() || abort_requested_.load()) {
+                break;
+            }
+            int n = http->Read(reinterpret_cast<char*>(buf + total), content_length - total);
+            if (n <= 0) {
+                break;
+            }
+            total += static_cast<size_t>(n);
+        }
+        http->Close();
+        if (total != content_length) {
+            break;
+        }
+        if (!Crc32Matches(crc, Crc32Ieee(buf, total))) {
+            break;
+        }
+        len = total;
+        ok = true;
+    } while (false);
+    if (ok) {
+        std::lock_guard<std::mutex> lock(prefetch_mutex_);
+        // epoch 变了说明新任务已开始或本任务被作废：产物不得发布。
+        if (!prefetch_cancel_.load() &&
+            prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
+            prefetch_buffer_ = buf;
+            prefetch_len_ = len;
+            prefetch_crc_ = crc;
+            prefetch_url_ = url;
+            prefetch_state_.store(PrefetchState::Ready, std::memory_order_release);
+            ESP_LOGI(TAG, "G-code 预取完成 %zu 字节，确认即画", len);
+            return;
+        }
+    }
+    if (buf != nullptr) {
+        heap_caps_free(buf);
+    }
+    if (prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
+        prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
+    }
+}
+
+bool Job::AdoptPrefetch() {
+    // 用户秒确认时预取可能仍在跑：等它收敛（通常只剩 CRC 尾段），abort 立即放行。
+    while (prefetch_state_.load(std::memory_order_acquire) == PrefetchState::Running) {
+        if (abort_requested_.load()) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    if (prefetch_state_.load() != PrefetchState::Ready || prefetch_url_ != url_) {
+        return false;
+    }
+    buffer_ = prefetch_buffer_;
+    buffer_len_ = prefetch_len_;
+    expect_crc_ = prefetch_crc_;
+    prefetch_buffer_ = nullptr;
+    prefetch_len_ = 0;
+    prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
+    ESP_LOGI(TAG, "确认即画：复用预取 G-code %zu 字节", buffer_len_);
+    return true;
 }
 
 void Job::WaitForAudioOutputIdle() {
@@ -1169,7 +1319,13 @@ void Job::Run() {
             SetState("downloading");
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("下载中...");
-            if (!DownloadToPsram(url_)) {
+            // 预取命中则跳过整段下载/校验：确认即画；未命中回落原路径。
+            const bool adopted = AdoptPrefetch();
+            if (adopted) {
+                if (auto* d = Board::GetInstance().GetDisplay())
+                    d->SetStatus("马上开画");
+            }
+            if (!adopted && !DownloadToPsram(url_)) {
                 if (abort_requested_.load()) {
                     SetState("aborted");
                     if (auto* d = Board::GetInstance().GetDisplay())
@@ -1183,18 +1339,20 @@ void Job::Run() {
                 }
                 break;
             }
-            if (abort_requested_.load()) {
-                SetState("aborted");
-                break;
-            }
-            SetState("verifying");
-            if (auto* d = Board::GetInstance().GetDisplay())
-                d->SetStatus("校验中...");
-            if (!VerifyCrc()) {
-                SetState("error");
-                ESP_LOGW(TAG, "校验失败: %s", last_error_.c_str());
-                Notify(hutuji::DescribeTransferFailure(last_error_));
-                break;
+            if (!adopted) {
+                if (abort_requested_.load()) {
+                    SetState("aborted");
+                    break;
+                }
+                SetState("verifying");
+                if (auto* d = Board::GetInstance().GetDisplay())
+                    d->SetStatus("校验中...");
+                if (!VerifyCrc()) {
+                    SetState("error");
+                    ESP_LOGW(TAG, "校验失败: %s", last_error_.c_str());
+                    Notify(hutuji::DescribeTransferFailure(last_error_));
+                    break;
+                }
             }
         }
         auto& pipe = Pipe::GetInstance();

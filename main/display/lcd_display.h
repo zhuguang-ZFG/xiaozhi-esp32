@@ -151,6 +151,7 @@ public:
     virtual void ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::string& hint,
                                  std::function<void()> on_confirm,
                                  std::function<void()> on_cancel) override;
+    void ShowDrawPreviewLoading() override;
     virtual void HideDrawPreview() override;
     void ConfigureMachineControls(std::function<void()> on_pause, std::function<void()> on_resume,
                                   std::function<void()> on_abort, std::function<void()> on_repeat,

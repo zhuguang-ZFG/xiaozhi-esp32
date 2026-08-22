@@ -32,6 +32,8 @@ public:
     virtual void ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::string& hint,
                                  std::function<void()> on_confirm,
                                  std::function<void()> on_cancel);
+    /** 预览占位卡：PNG 未落地前先把卡片推上屏，避免用户面对空屏等待。 */
+    virtual void ShowDrawPreviewLoading() {}
     virtual void HideDrawPreview();
     virtual void UpdateMachineControlState(const std::string& state);
 
