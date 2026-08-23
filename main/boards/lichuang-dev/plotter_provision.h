@@ -7,6 +7,7 @@
 #include <esp_event.h>
 #include <esp_netif.h>
 #include <esp_timer.h>
+#include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 
@@ -71,10 +72,13 @@ private:
     void FinishWith(bool manual, bool ok, provision::ProvisionFailure failure, int attempt);
 
     static void JumpEventHandler(void* arg, esp_event_base_t base, int32_t id, void* data);
+    /** 混杂模式嗅探回调（wifi 任务上下文）：只解析置旗，不日志不分配。 */
+    static void SniffRxCallback(void* buf, wifi_promiscuous_pkt_type_t type);
 
     std::atomic<bool> task_active_{false};
     std::atomic<bool> busy_{false};
     std::atomic<bool> pending_manual_{false};
+    std::atomic<bool> sniff_match_{false};  // 嗅探通道：空口收到出厂 AP 帧即置位
     esp_timer_handle_t patrol_timer_ = nullptr;
     esp_timer_handle_t retry_timer_ = nullptr;
     esp_netif_t* jump_netif_ = nullptr;  // 仅 ProvisionTask 读写

@@ -307,6 +307,103 @@ class PlotterProvisionCoreTest(unittest.TestCase):
         )
         self._compile_and_run(compiler, source, "pp_retry")
 
+    def test_scan_filtered_probe_with_promiscuous_fallback(self):
+        """2026-08-23 三轮 HIL 钉死的扫描形态：
+        ①wifi_scan_config_t.ssid 是指针不是数组——只能赋值，禁 memcpy（jump1
+        Core 0 StoreProhibited 崩溃循环）；②全量扫描的结果集会被 esp-wifi-connect
+        的 WifiStation 截胡（它无条件重连户网清掉结果，jump4 可见 0 个），必须用
+        SSID 过滤扫描让结果集不含户网 AP；③连接态过滤扫描的结果集可能漏收
+        （jump2 命中 0 个），必须并行开混杂模式嗅探 beacon/probe response 兜底。"""
+        cc = (ROOT / "main/boards/lichuang-dev/plotter_provision.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("memcpy(cfg.ssid", cc, "cfg.ssid 是指针：禁 memcpy（jump1 崩溃）")
+        self.assertIn("cfg.ssid =", cc, "过滤扫描让结果集不含户网 AP，防 WifiStation 截胡")
+        self.assertIn("esp_wifi_set_promiscuous(true)", cc, "嗅探是过滤扫描漏收的兜底")
+        self.assertIn("esp_wifi_set_promiscuous(false)", cc)
+        self.assertIn("esp_wifi_set_promiscuous_rx_cb(nullptr)", cc, "回调必须配对摘除")
+        self.assertIn("ProbeFrameMatchesSsid", cc)
+
+    def test_probe_frame_ssid_parsing(self):
+        """802.11 beacon/probe response 的 SSID IE 解析：合法帧命中、畸形帧安全拒绝。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/plotter_provision_core.h"
+            #include <cassert>
+            #include <cstring>
+            #include <vector>
+
+            using hutuji::provision::ProbeFrameMatchesSsid;
+
+            // 构造管理帧：fc0 + fc1(0) + 22B 头余量 + 12B fixed + IE 链。
+            static std::vector<uint8_t> BuildFrame(uint8_t fc0, uint8_t fc1,
+                                                   const std::vector<uint8_t>& ies) {
+                std::vector<uint8_t> f;
+                f.push_back(fc0);
+                f.push_back(fc1);
+                for (int i = 0; i < 34; ++i) f.push_back(0);  // 头余量 22 + fixed 12
+                f.insert(f.end(), ies.begin(), ies.end());
+                return f;
+            }
+            static std::vector<uint8_t> SsidIe(const char* ssid) {
+                std::vector<uint8_t> ie = {0, static_cast<uint8_t>(strlen(ssid))};
+                ie.insert(ie.end(), ssid, ssid + strlen(ssid));
+                return ie;
+            }
+
+            int main() {
+                // beacon / probe response 携带 GRBL_ESP → 命中
+                for (uint8_t fc0 : {0x80, 0x50}) {
+                    auto f = BuildFrame(fc0, 0, SsidIe("GRBL_ESP"));
+                    assert(ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP"));
+                    assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "OTHER"));
+                    // 前缀不等价：长度必须也相等
+                    assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL"));
+                    assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP2"));
+                }
+                // SSID IE 不在链首也找得到
+                {
+                    std::vector<uint8_t> ies = {3, 1, 6};  // DS param channel=6
+                    auto tail = SsidIe("GRBL_ESP");
+                    ies.insert(ies.end(), tail.begin(), tail.end());
+                    auto f = BuildFrame(0x80, 0, ies);
+                    assert(ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP"));
+                }
+                // 别的 SSID → 不命中
+                {
+                    auto f = BuildFrame(0x80, 0, SsidIe("ChinaNet-jJmz"));
+                    assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP"));
+                }
+                // data 帧（fc0=0x08）、probe request（0x40）→ 不认
+                for (uint8_t fc0 : {0x08, 0x40, 0xB0}) {
+                    auto f = BuildFrame(fc0, 0, SsidIe("GRBL_ESP"));
+                    assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP"));
+                }
+                // toDS/fromDS 置位 → 头布局不同，不认
+                {
+                    auto f = BuildFrame(0x80, 0x01, SsidIe("GRBL_ESP"));
+                    assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP"));
+                }
+                // 畸形与截断：短帧 / IE 声明长度越界 / 空 IE 链
+                {
+                    std::vector<uint8_t> shorty(20, 0);
+                    assert(!ProbeFrameMatchesSsid(shorty.data(), shorty.size(), "GRBL_ESP"));
+                    std::vector<uint8_t> bad = {0, 40, 'G', 'R'};  // 声明 40 实际 2
+                    auto f = BuildFrame(0x80, 0, bad);
+                    assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP"));
+                    auto empty = BuildFrame(0x80, 0, {});
+                    assert(!ProbeFrameMatchesSsid(empty.data(), empty.size(), "GRBL_ESP"));
+                    assert(!ProbeFrameMatchesSsid(nullptr, 64, "GRBL_ESP"));
+                }
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, "pp_sniff")
+
 
 if __name__ == "__main__":
     unittest.main()

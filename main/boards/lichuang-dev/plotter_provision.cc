@@ -148,24 +148,74 @@ void PlotterProvision::ProvisionTaskEntry(void* arg) {
 }
 
 bool PlotterProvision::IsFactoryApVisible() {
+    // 双通道在场判定（2026-08-23 三轮 HIL 实测收敛）：
+    // (1) 全量扫描的结果集会被 esp-wifi-connect 的 WifiStation 截胡——它处理任何
+    //     一次扫描完成并无条件 esp_wifi_connect 户网（已连接也重连），连接动作
+    //     把扫描结果清掉，阻塞扫描醒来后 esp_wifi_scan_get_ap_num 恒 0（jump4：
+    //     29602 Found AP → 29612 disconnect/connect → 29632 可见 0 个）。managed_
+    //     components 不入库不可改；SSID 过滤扫描的结果集不含户网 AP，WifiStation
+    //     匹配不到就不 connect，结果集得以保留。
+    // (2) cfg.ssid 是指针不是数组：只能赋值（IDF 扫描时拷贝），零初始化后 memcpy
+    //     即空指针写（jump1 Core 0 StoreProhibited 崩溃循环）。
+    // (3) 连接态过滤扫描的结果集本身也可能漏收（jump2 命中 0 个，同刻写字机串口
+    //     自证 Visible:Yes），故并行开混杂模式嗅探 beacon/probe response 兜底：
+    //     AP 每 ~100ms 发 beacon、directed probe 必换 response，收到一帧即铁证。
+    //     嗅探不经过扫描结果集，与 WifiStation 零交互。
+    sniff_match_.store(false);
+    const wifi_promiscuous_filter_t filter = {.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT};
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(&PlotterProvision::SniffRxCallback);
+    esp_wifi_set_promiscuous(true);
+
     wifi_scan_config_t cfg = {};
-    std::memcpy(cfg.ssid, provision::kPlotterApSsid, sizeof(provision::kPlotterApSsid));
+    cfg.ssid = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(provision::kPlotterApSsid));
     cfg.show_hidden = false;
     cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-    // 户网连接态扫描会短暂离台；与别的扫描撞车（WifiStation 周期扫描）时
+    cfg.scan_time.active.min = 100;
+    cfg.scan_time.active.max = 300;
+    bool found = false;
+    // 户网连接态扫描会短暂离台；与别的扫描撞车（如 WifiStation 掉线重连扫描）时
     // 退 1s 再来，三轮仍起不来本轮按「不在场」处理，不阻塞巡检。
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3 && !found; ++i) {
         const esp_err_t err = esp_wifi_scan_start(&cfg, true);
         if (err == ESP_OK) {
             uint16_t num = 0;
             esp_wifi_scan_get_ap_num(&num);
-            ESP_LOGI(TAG, "出厂热点扫描完成，命中 %u 个", (unsigned)num);
-            return num > 0;
+            const uint16_t total = num;
+            wifi_ap_record_t record;
+            while (num-- > 0 && esp_wifi_scan_get_ap_record(&record) == ESP_OK) {
+                if (strcmp(reinterpret_cast<const char*>(record.ssid), provision::kPlotterApSsid) ==
+                    0) {
+                    found = true;
+                }
+            }
+            ESP_LOGI(TAG, "出厂热点扫描完成，结果集 %u 命中=%d，嗅探=%d（第 %d 轮）",
+                     (unsigned)total, (int)found, (int)sniff_match_.load(), i + 1);
+            if (found || sniff_match_.load()) {
+                break;
+            }
+        } else {
+            ESP_LOGW(TAG, "扫描启动失败 %s，1s 后重试（%d/3）", esp_err_to_name(err), i + 1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-        ESP_LOGW(TAG, "扫描启动失败 %s，1s 后重试（%d/3）", esp_err_to_name(err), i + 1);
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    return false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    found = found || sniff_match_.load();
+    ESP_LOGI(TAG, "出厂热点在场判定：结果集/嗅探命中=%d", (int)found);
+    return found;
+}
+
+void PlotterProvision::SniffRxCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+    // wifi 任务上下文：只解析置旗，不日志不分配。
+    if (type != WIFI_PKT_MGMT || buf == nullptr) {
+        return;
+    }
+    const auto* pkt = static_cast<const wifi_promiscuous_pkt_t*>(buf);
+    if (provision::ProbeFrameMatchesSsid(pkt->payload, pkt->rx_ctrl.sig_len,
+                                         provision::kPlotterApSsid)) {
+        GetInstance().sniff_match_.store(true);
+    }
 }
 
 bool PlotterProvision::JumpToFactoryAp() {

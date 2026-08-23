@@ -21,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace hutuji {
@@ -173,6 +174,48 @@ inline EspCmdResult ClassifyEspResponse(int http_status, const std::string& body
 /** ESP444 的应答可能因对端立即重启而永远发不出：传输失败按「已发出」处理。 */
 inline bool IsRestartOutcomeAcceptable(EspCmdResult result) {
     return result == EspCmdResult::Ok || result == EspCmdResult::TransportError;
+}
+
+/**
+ * 空口嗅探帧判定：payload 是 beacon(0x80) 或 probe response(0x50) 且其 SSID IE
+ * 与 target 逐字节相等（长度也相等，防 "GRBL_ESP2" 这类前缀误中）。
+ * 802.11 管理帧布局：MAC 头 24B（frame control 2B 起，toDS/fromDS 必须为 0——
+ * 置位则头为 30B，布局不同，直接不认）+ fixed params 12B（timestamp 8 +
+ * interval 2 + capability 2），IE 链自 offset 36 起，SSID 为 tag 0、长度 0..32。
+ * 存在理由：2026-08-23 HIL 实测 esp-wifi-connect 的 WifiStation 会处理任何一次
+ * 扫描完成并无条件 esp_wifi_connect 户网，连接动作清掉扫描结果；且连接态过滤
+ * 扫描的结果集本身也可能漏收。混杂模式嗅探 beacon/probe response 不经过扫描
+ * 结果集，收到一帧即为在场铁证。混杂回调跑在 wifi 任务上下文，只调本函数。
+ */
+inline bool ProbeFrameMatchesSsid(const uint8_t* payload, size_t len, const char* target) {
+    if (payload == nullptr || target == nullptr || len < 38) {
+        return false;
+    }
+    const uint8_t fc0 = payload[0];
+    if (fc0 != 0x80 && fc0 != 0x50) {  // beacon / probe response（type mgmt）
+        return false;
+    }
+    if ((payload[1] & 0x03) != 0) {  // toDS/fromDS 置位的帧头布局不同，不认
+        return false;
+    }
+    const size_t target_len = std::strlen(target);
+    if (target_len > 32) {
+        return false;
+    }
+    size_t pos = 36;  // IE 链起点
+    while (pos + 2 <= len) {
+        const uint8_t tag = payload[pos];
+        const uint8_t ie_len = payload[pos + 1];
+        if (pos + 2 + ie_len > len) {
+            return false;  // IE 声明长度越界 = 帧截断/畸形，停
+        }
+        if (tag == 0) {
+            return ie_len == target_len &&
+                   std::memcmp(payload + pos + 2, target, ie_len) == 0;
+        }
+        pos += 2 + ie_len;
+    }
+    return false;
 }
 
 /** 配网失败原因（用户话术分类，技术细节走 ESP 日志）。 */
