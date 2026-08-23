@@ -801,16 +801,22 @@ public:
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
-        // 出图活跃窗口内拒绝 LOW_POWER 回落：音频通道关闭（application.cc
+        // 稳态 LOW_POWER(MAX_MODEM) 降为 BALANCED(MIN_MODEM)：MAX_MODEM 长睡眠是
+        // 写字机断联（WiFi reason 3 AP 去关联 + errno=113）与慢发现（首包 ~200ms）
+        // 的头号嫌疑（2026-08-23 取证，troubleshooting RTT 实测）。插电为主场景。
+        if (level == PowerSaveLevel::LOW_POWER) {
+            level = PowerSaveLevel::BALANCED;
+        }
+        // 出图活跃窗口内拒绝任何省电回落：音频通道关闭（application.cc
         // OnAudioChannelClosed）等路径每几秒无条件踩回，与 ReassertPerformance
         // 互踩造成 Telnet RTT 尖峰（实测 ok 间隔 200-290ms，笔运动肉眼卡顿）。
-        if (level == PowerSaveLevel::LOW_POWER &&
+        // 映射后须连 BALANCED 一起拦，故拦一切非 PERFORMANCE。
+        if (level != PowerSaveLevel::PERFORMANCE &&
             hutuji::Job::GetInstance().HoldsPerformanceForRadio()) {
             return;
         }
-        if (level != PowerSaveLevel::LOW_POWER) {
-            power_save_timer_->WakeUp();
-        }
+        // 省电定时器只在「真实空闲」时不重置；映射后 LOW_POWER 已不存在于此路径。
+        power_save_timer_->WakeUp();
         WifiBoard::SetPowerSaveLevel(level);
     }
 

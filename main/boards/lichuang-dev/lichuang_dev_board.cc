@@ -541,6 +541,24 @@ public:
     }
 
     virtual Camera* GetCamera() override { return camera_; }
+
+    // 与 waveshare 板同款（esp32-s3-touch-lcd-3.5.cc SetPowerSaveLevel）：
+    // ①出图活跃窗口内拒绝任何省电回落——音频通道关闭（application.cc
+    //   OnAudioChannelClosed）每几秒无条件踩回，与 Job 的 PERFORMANCE 持有互踩
+    //   造成 Telnet RTT 尖峰（实测 ok 间隔 200-290ms，笔运动肉眼卡顿）。
+    // ②稳态 LOW_POWER(MAX_MODEM) 降为 BALANCED(MIN_MODEM)：MAX_MODEM 长睡眠是
+    //   写字机断联（WiFi reason 3 AP 去关联 + errno=113，8 份日志）与慢发现
+    //   （首包 ~200ms、RTT p50 117-134ms）的头号嫌疑（2026-08-23 取证）。
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level == PowerSaveLevel::LOW_POWER) {
+            level = PowerSaveLevel::BALANCED;
+        }
+        if (level != PowerSaveLevel::PERFORMANCE &&
+            hutuji::Job::GetInstance().HoldsPerformanceForRadio()) {
+            return;
+        }
+        WifiBoard::SetPowerSaveLevel(level);
+    }
 };
 
 DECLARE_BOARD(LichuangDevBoard);

@@ -118,17 +118,19 @@ void Pipe::PipeTask() {
     ESP_LOGI(TAG, "网络接口就绪，开始连接写字机");
 
     uint32_t backoff_ms = kBackoffInitMs;
+    int miss_attempts = 0;  // 连续「真失败」次数（SlotBusy/WaitingIp 不计入）
     while (true) {
         if (!ConnectOnce()) {
             const uint32_t delay_ms = DiscoverRetryDelayMs(last_discover_miss_, backoff_ms);
             ESP_LOGW(TAG, "连接写字机失败，%ums 后重试", (unsigned)delay_ms);
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
             if (ShouldAdvanceDiscoverBackoff(last_discover_miss_)) {
-                backoff_ms = (backoff_ms * 2 > kBackoffMaxMs) ? kBackoffMaxMs : backoff_ms * 2;
+                backoff_ms = NextDiscoverBackoffMs(++miss_attempts, backoff_ms, kBackoffMaxMs);
             }
             continue;
         }
         backoff_ms = kBackoffInitMs;
+        miss_attempts = 0;
         paper_changing_.store(PaperChangingState::Unknown);
         ready_.store(false);
         authorized_.store(false);

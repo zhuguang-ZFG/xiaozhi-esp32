@@ -1068,23 +1068,20 @@ void Job::Preview() {
         SetState("awaiting_confirmation");
     }
     Notify("预览已出来啦，喜欢就说「开始画」，不喜欢就说「取消」");
-    // 预览上屏后后台预取 G-code：确认时 Run() 直接复用，省掉整段下载/校验等待。
+    // 预览上屏后后台预取 G-code：确认时 Run() 经 AdoptPrefetch 复用，省掉整段下载/校验等待。
+    // 就地复用预览任务（栈 6144 已验证可跑 TLS），不再另建任务——2026-08-23 HIL 实测
+    // xTaskCreate 在内存低谷静默失败（ minimal sram 5335），预取从未真正跑过；
+    // 内联后峰值内存还省一个任务栈。取消/确认竞态与原设计一致：
+    // 预取循环轮询 prefetch_cancel_/abort_requested_，AdoptPrefetch 会等 Running 收敛。
     prefetch_cancel_.store(false);
     prefetch_state_.store(PrefetchState::Running, std::memory_order_release);
-    if (xTaskCreate(PrefetchTaskEntry, "hutuji_prefetch", 6144, this, 4, nullptr) != pdTRUE) {
-        prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
-    }
+    PrefetchGcode();
 }
 
 void Job::ClearPreview() {
     if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
         display->HideDrawPreview();
     }
-}
-
-void Job::PrefetchTaskEntry(void* arg) {
-    static_cast<Job*>(arg)->PrefetchGcode();
-    vTaskDelete(nullptr);
 }
 
 void Job::CancelPrefetch() {
@@ -1218,14 +1215,18 @@ bool Job::AdoptPrefetch() {
 }
 
 void Job::WaitForAudioOutputIdle() {
-    auto* codec = Board::GetInstance().GetAudioCodec();
-    if (codec == nullptr || !codec->output_enabled()) {
+    if (Application::GetInstance().GetDeviceState() != kDeviceStateSpeaking) {
         return;
     }
     // 功放 + Wi-Fi 下载是无电池 VSYS 的最大组合负载；等播报结束再开始下载。
+    // 等「真在播」（speaking 态）而不是 codec 的 output_enabled 标志：双工 codec
+    // 监听期间为保 RX 时钟永不关输出（audio_service 刻意设计），后者让本等待恒吃满
+    // 30s 上限（2026-08-23 HIL 实测预览与 G-code 两段下载各白等 30s）。
     // 上限 30s 防止异常状态死等；abort 立即放行，由下载循环的 abort 检查收敛。
     ESP_LOGI(TAG, "等待播报结束再下载（功放/WiFi 错峰）");
-    for (int i = 0; i < 300 && codec->output_enabled(); ++i) {
+    for (int i = 0;
+         i < 300 && Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking;
+         ++i) {
         if (abort_requested_.load()) {
             return;
         }

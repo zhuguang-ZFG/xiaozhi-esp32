@@ -740,6 +740,20 @@ inline constexpr bool ShouldAdvanceDiscoverBackoff(DiscoverMiss miss) {
     return miss != DiscoverMiss::SlotBusy && miss != DiscoverMiss::WaitingIp;
 }
 
+// 写字机重连退避前段：前 N 次「真失败」（会推进退避的 miss）保持 1s 间隔，
+// 之后才指数翻倍至 30s 封顶。断联多由 WiFi 瞬断/对端重启引起，前段密集重试
+// 把「断联感知时长」从最坏 30s 压到秒级；真关机场景指数段仍在，不构成风暴。
+inline constexpr int kDiscoverFastRetryAttempts = 5;
+
+/** 第 attempt 次（1 起）连续真失败后的下一档退避：前段不涨，过后翻倍封顶。 */
+inline constexpr uint32_t NextDiscoverBackoffMs(int attempt, uint32_t current_ms,
+                                                uint32_t max_ms) {
+    if (attempt <= kDiscoverFastRetryAttempts) {
+        return current_ms;
+    }
+    return current_ms * 2 > max_ms ? max_ms : current_ms * 2;
+}
+
 /**
  * 挂起解除后的自愈判定：仍在等 `$I` 应答且挂起刚解除 → 排队中的 `$I` 即将被
  * 消费，只需清零无声计数给它一个完整窗口，不得重发（重发即多一个 `ok`）。

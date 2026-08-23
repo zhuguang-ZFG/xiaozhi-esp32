@@ -60,7 +60,7 @@ public:
     std::string StatusJson() const;
 
     bool IsPaperActive() const { return paper_active_.load(); }
-    /** WiFi 省电门：活跃窗口内板级 SetPowerSaveLevel 拒绝 LOW_POWER 回落。 */
+    /** WiFi 省电门：活跃窗口内板级 SetPowerSaveLevel 拒绝一切非 PERFORMANCE 档位回落。 */
     bool HoldsPerformanceForRadio() const {
         std::lock_guard<std::mutex> lock(state_mutex_);
         return JobHoldsPerformance(state_.c_str());
@@ -95,8 +95,8 @@ private:
     /**
      * 预览就绪后后台预取 G-code 到 PSRAM 并校验：用户确认即画，跳过下载段。
      * 预取失败一律静默回落正常下载；取消/新任务通过 epoch + cancel 标志拒绝旧发布。
+     * 在预览任务尾部内联运行（复用其 TLS 栈），不单建任务。
      */
-    static void PrefetchTaskEntry(void* arg);
     void PrefetchGcode();
     /** 确认路径接管预取产物；仍在跑则等其收敛（abort 立即放行）。 */
     bool AdoptPrefetch();

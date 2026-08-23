@@ -1080,13 +1080,18 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("WifiBoard::StartNetwork();", board)
         self.assertIn("esp_wifi_set_max_tx_power(40)", board)
     def test_hutuji_downloads_wait_for_audio_output_idle(self):
-        """播报+HTTPS 下载并发是 VSYS 最大组合负载；下载前必须等音频输出空闲。"""
+        """播报+HTTPS 下载并发是 VSYS 最大组合负载；下载前必须等播报结束。
+        等待信号必须是「真在播」（speaking 态）：双工 codec 监听期间为保 RX 时钟
+        永不关 output（audio_service 刻意设计），等 output_enabled() 会恒吃满 30s
+        上限（2026-08-23 HIL 实测预览/G-code 两段下载各白等 30s）。"""
         job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
         job_h = (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(encoding="utf-8")
         self.assertIn("void WaitForAudioOutputIdle();", job_h)
-        wait_fn = job_cc[job_cc.index("void Job::WaitForAudioOutputIdle()"):
-                         job_cc.index("bool Job::DownloadToPsram")]
-        self.assertIn("output_enabled()", wait_fn)
+        start = job_cc.index("void Job::WaitForAudioOutputIdle()")
+        wait_fn = job_cc[start:job_cc.index("\n}\n", start)]
+        self.assertIn("kDeviceStateSpeaking", wait_fn)
+        self.assertNotIn("output_enabled()", wait_fn)
+        self.assertNotIn("GetAudioCodec()", wait_fn)
         self.assertIn("pdMS_TO_TICKS(100)", wait_fn)
         self.assertIn("abort_requested_", wait_fn)
         preview_fn = job_cc[job_cc.index("bool Job::DownloadAndShowPreview"):
@@ -2845,6 +2850,70 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             )
         ]
         self.assertIn("shutdown(sock_, SHUT_RDWR)", close)
+
+    def test_discover_backoff_fast_retry_prefix(self):
+        """写字机重连退避前段收敛（2026-08-23 断联取证）：前 5 次真失败保持 1s
+        （WiFi 瞬断/对端重启场景秒级恢复），之后翻倍至 30s 封顶；SlotBusy/
+        WaitingIp 不计入推进（由 ShouldAdvanceDiscoverBackoff 既有语义保证）。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <cstdint>
+
+            int main() {
+                using namespace hutuji;
+                static_assert(kDiscoverFastRetryAttempts == 5);
+                // 前段不涨：attempt 1..5 都保持 1000ms
+                uint32_t backoff = 1000;
+                for (int attempt = 1; attempt <= 5; ++attempt) {
+                    backoff = NextDiscoverBackoffMs(attempt, backoff, 30000);
+                    assert(backoff == 1000);
+                }
+                // 第 6 次起翻倍：1000 → 2000 → 4000 → ... → 30000 封顶
+                backoff = NextDiscoverBackoffMs(6, backoff, 30000);
+                assert(backoff == 2000);
+                backoff = NextDiscoverBackoffMs(7, backoff, 30000);
+                assert(backoff == 4000);
+                backoff = NextDiscoverBackoffMs(8, backoff, 30000);
+                assert(backoff == 8000);
+                backoff = NextDiscoverBackoffMs(9, backoff, 30000);
+                assert(backoff == 16000);
+                backoff = NextDiscoverBackoffMs(10, backoff, 30000);
+                assert(backoff == 30000);
+                backoff = NextDiscoverBackoffMs(11, backoff, 30000);
+                assert(backoff == 30000);
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_backoff_fast_retry_test")
+
+        pipe = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("NextDiscoverBackoffMs(++miss_attempts", pipe)
+        self.assertIn("miss_attempts = 0", pipe, "连上后必须清零快速重试计数")
+
+    def test_power_save_gate_and_balanced_floor_both_boards(self):
+        """双板同口径（2026-08-23 卡顿/断联取证，平衡档）：
+        ①出图活跃期拒绝一切非 PERFORMANCE 回落（门控 HoldsPerformanceForRadio）；
+        ②稳态 LOW_POWER(MAX_MODEM) 映射为 BALANCED(MIN_MODEM)——MAX_MODEM 长睡眠
+        是写字机断联（reason 3 / errno=113）与慢发现（首包 ~200ms）的头号嫌疑。"""
+        for rel in (
+            "main/boards/lichuang-dev/lichuang_dev_board.cc",
+            "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc",
+        ):
+            board = (ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn("SetPowerSaveLevel(PowerSaveLevel level) override", board, rel)
+            self.assertIn("level = PowerSaveLevel::BALANCED", board, rel)
+            self.assertIn("HoldsPerformanceForRadio", board, rel)
+            self.assertIn("level != PowerSaveLevel::PERFORMANCE", board, rel)
+
 
 if __name__ == "__main__":
     unittest.main()
