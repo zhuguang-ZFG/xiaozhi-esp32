@@ -296,6 +296,13 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     }
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
+        // P1-3 同参数幂等重入：服务端链式调用已成功在预览，云端第二步以同
+        // url/preview_url 重入时回 previewing（等价「你要的这张已在等确认」），
+        // 避免用户看到预览却听到「写字机正忙」。参数不同或未在等确认才判 busy。
+        if (IsDuplicatePreviewReentry(awaiting_confirmation_.load(),
+                                      url_ == url && preview_url_ == preview_url)) {
+            return JsonString("previewing");
+        }
         return JsonString("写字机正忙，请稍候再试");
     }
     if (!ResetAbortResetState()) {
@@ -986,6 +993,10 @@ std::string Job::StatusJson() const {
     if (pipe.IsConnected()) {
         pipe.SendRealtime('?');
     }
+    // P1-1（协议 §4 status 分级）：本函数只读缓存——[ESP901] 是普通命令会吃 ok，
+    // 发而不消费会在响应队列留下孤儿 ok，下个窗口化出图的在途计数因此漂移（实锤：
+    // 窗口下队列应答即在途凭据）。遥测刷新统一走 Preview() 与出图前预检里
+    // 「发 + WaitResponse 消费」的路径，status 永远只报最近一次已消费应答的值。
 
     std::string state;
     {
@@ -1008,6 +1019,14 @@ std::string Job::StatusJson() const {
         cJSON_AddNumberToObject(root, "alarm_code", pipe.GetAlarmCode());
     }
     cJSON_AddStringToObject(root, "last_line", pipe.GetLastLine().c_str());
+    // P1-1：遥测三字段 + Changing 态随 status 上云（值来自最近一次 [ESP901] 应答解析）。
+    cJSON_AddStringToObject(root, "paper", PaperPresentStateName(pipe.GetPaperPresentState()));
+    cJSON_AddStringToObject(root, "motor_en", MotorEnStateName(pipe.GetMotorEnState()));
+    cJSON_AddStringToObject(root, "panel_hold", PanelHoldStateName(pipe.GetPanelHoldState()));
+    cJSON_AddStringToObject(root, "paper_changing",
+                            pipe.GetPaperChangingState() == PaperChangingState::On    ? "on"
+                            : pipe.GetPaperChangingState() == PaperChangingState::Off ? "off"
+                                                                                      : "unknown");
     // 净作画时长与 ETA（对齐奎享 f.java:j()/h()）。仅 streaming/paused/paper_change
     // 有意义；下载/校验/idle 不报，避免误导。
     if (draw_start_tick_ != 0 && lines_total_ > 0) {
@@ -1037,6 +1056,18 @@ void Job::Preview() {
     // 占位卡先上屏：不用等 PNG 落地，用户立刻知道「在准备预览」。
     if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
         display->ShowDrawPreviewLoading();
+    }
+    // P1-1 遥测刷新（消费式）：预览期用户最可能问「还有纸吗」——此刻必为 idle，
+    // 发 [ESP901] 并在本任务内 WaitResponse 收掉 ok（普通命令的应答绝不留队，
+    // 见 StatusJson 只读注释）；失败/超时静默——刷新只是尽力而为，不挡预览。
+    {
+        auto& pipe = Pipe::GetInstance();
+        if (pipe.IsConnected() && pipe.GetPaperChangingState() != PaperChangingState::On) {
+            if (pipe.SendLine("[ESP901]")) {
+                int refresh_err = -1;
+                (void)pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &refresh_err);
+            }
+        }
     }
     if (!DownloadAndShowPreview(preview_url_)) {
         // 预览取消也走这条路（下载中收到 abort）：区分处置，避免误报错误。
@@ -1224,8 +1255,7 @@ void Job::WaitForAudioOutputIdle() {
     // 30s 上限（2026-08-23 HIL 实测预览与 G-code 两段下载各白等 30s）。
     // 上限 30s 防止异常状态死等；abort 立即放行，由下载循环的 abort 检查收敛。
     ESP_LOGI(TAG, "等待播报结束再下载（功放/WiFi 错峰）");
-    for (int i = 0;
-         i < 300 && Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking;
+    for (int i = 0; i < 300 && Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking;
          ++i) {
         if (abort_requested_.load()) {
             return;
@@ -1413,6 +1443,29 @@ void Job::Run() {
             break;
         }
         stream_connection_seq_ = session_seq;
+        // P1-2 出图前缺纸预检：此刻必为 idle（尚未 G92/灌流），允许发普通命令 [ESP901]。
+        // 三重判据（序号+新鲜度+Ok）：确证 Paper=No 才早退；超时/序号未推进/发送失败
+        // 一律按 Unknown 放行（fail-open）；Changing=On 不预检（§3 单写者，正常路径不可达）。
+        {
+            const uint32_t paper_before = pipe.GetPaperStatusSequence();
+            bool paper_confirmed_out = false;
+            if (pipe.GetPaperChangingState() != PaperChangingState::On &&
+                pipe.SendLine("[ESP901]")) {
+                int paper_err = -1;
+                if (pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &paper_err) ==
+                        WaitResult::Ok &&
+                    pipe.GetPaperStatusSequence() != paper_before) {
+                    paper_confirmed_out = DecidePaperPrecheck(pipe.GetPaperPresentState()) ==
+                                          PaperPrecheckDecision::AbortNoPaper;
+                }
+            }
+            if (paper_confirmed_out) {
+                last_error_ = "没纸了，请先放纸";
+                SetState("error");
+                Notify(last_error_);
+                break;
+            }
+        }
         // 授权探测已在 Pipe 建链时完成；未授权任务在这里停止，绘图载荷零字节下发。
         // 下载/校验期间就被暂停时，不能把状态改回 streaming——否则 status 谎报
         // 正在画，实际转发循环一进去就卡在暂停门上。
@@ -2172,6 +2225,7 @@ bool Job::ChangePaperAfterDraw() {
     WaitResult wr = WaitResult::Timeout;
     int err = -1;
     uint32_t waited = 0;
+    TickType_t last_wait_notify = xTaskGetTickCount();
     constexpr uint32_t kSliceMs = 1000;
     while (waited < kPaperOkTimeoutMs) {
         if (!pipe.IsConnected() || !pipe.IsReady()) {
@@ -2192,6 +2246,11 @@ bool Job::ChangePaperAfterDraw() {
             break;
         }
         waited += step;
+        // P2-1：90s 等待只播一次会被误当卡死；每 30s 续播一次（对齐 R21-F06 重连模式）。
+        if ((xTaskGetTickCount() - last_wait_notify) >= pdMS_TO_TICKS(30000)) {
+            last_wait_notify = xTaskGetTickCount();
+            Notify("还在换纸，请稍候");
+        }
     }
 
     if (wr != WaitResult::Ok) {
@@ -2418,6 +2477,7 @@ bool Job::StreamToGrbl() {
                 WaitResult wr = WaitResult::Timeout;
                 int err = -1;
                 uint32_t waited = 0;
+                TickType_t last_wait_notify = xTaskGetTickCount();
                 const uint32_t slice = 1000;
                 while (waited < kPaperOkTimeoutMs) {
                     if (!WaitWhilePaused()) {
@@ -2450,6 +2510,11 @@ bool Job::StreamToGrbl() {
                         break;
                     }
                     waited += step;
+                    // P2-1：每 30s 续播一次换纸进展（对齐 R21-F06 重连模式）。
+                    if ((xTaskGetTickCount() - last_wait_notify) >= pdMS_TO_TICKS(30000)) {
+                        last_wait_notify = xTaskGetTickCount();
+                        Notify("还在换纸，请稍候");
+                    }
                 }
 
                 if (wr == WaitResult::Ok) {

@@ -2914,6 +2914,161 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             self.assertIn("HoldsPerformanceForRadio", board, rel)
             self.assertIn("level != PowerSaveLevel::PERFORMANCE", board, rel)
 
+    def test_parse_paper_status_fields_full_and_partial(self):
+        """[ESP901] 遥测三字段解析（2026-08-24 P1-1）：协议 §4 status 分级承诺空闲期
+        Paper/MotorEn/PanelHold 遥测，实现缺。解析必须与 Changing 同一守卫——
+        「Paper= 与 Changing= 同现」才认行，防止把其他含 Paper= 的日志误当遥测；
+        部分字段缺席保持 Unknown，不得整行作废。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <cstring>
+
+            int main() {
+                using namespace hutuji;
+                PaperPresentState paper = PaperPresentState::Unknown;
+                MotorEnState motor = MotorEnState::Unknown;
+                PanelHoldState panel = PanelHoldState::Unknown;
+
+                // 全字段：Paper=OK / MotorEn=On / PanelHold=Off
+                assert(ParsePaperStatusFields(
+                    "Paper=OK MotorEn=On PanelHold=Off Changing=Off", paper, motor, panel));
+                assert(paper == PaperPresentState::Yes);
+                assert(motor == MotorEnState::On);
+                assert(panel == PanelHoldState::Off);
+
+                // 全字段另一组值：Paper=No / MotorEn=Off / PanelHold=On
+                paper = PaperPresentState::Unknown;
+                motor = MotorEnState::Unknown;
+                panel = PanelHoldState::Unknown;
+                assert(ParsePaperStatusFields(
+                    "Paper=No MotorEn=Off PanelHold=On Changing=On", paper, motor, panel));
+                assert(paper == PaperPresentState::No);
+                assert(motor == MotorEnState::Off);
+                assert(panel == PanelHoldState::On);
+
+                // 守卫：缺 Changing= 的行不认（字段必须保持 Unknown 且返回 false）
+                paper = PaperPresentState::Unknown;
+                motor = MotorEnState::Unknown;
+                panel = PanelHoldState::Unknown;
+                assert(!ParsePaperStatusFields(
+                    "Paper=OK MotorEn=On PanelHold=Off", paper, motor, panel));
+                assert(paper == PaperPresentState::Unknown);
+                assert(motor == MotorEnState::Unknown);
+                assert(panel == PanelHoldState::Unknown);
+
+                // 部分字段：只有 Paper=，其余保持 Unknown，行仍算遥测行
+                paper = PaperPresentState::Unknown;
+                motor = MotorEnState::Unknown;
+                panel = PanelHoldState::Unknown;
+                assert(ParsePaperStatusFields("Paper=OK Changing=Off", paper, motor, panel));
+                assert(paper == PaperPresentState::Yes);
+                assert(motor == MotorEnState::Unknown);
+                assert(panel == PanelHoldState::Unknown);
+
+                // 命名函数供 StatusJson 序列化
+                assert(std::strcmp(PaperPresentStateName(PaperPresentState::Yes), "yes") == 0);
+                assert(std::strcmp(PaperPresentStateName(PaperPresentState::No), "no") == 0);
+                assert(std::strcmp(PaperPresentStateName(PaperPresentState::Unknown), "unknown") == 0);
+                assert(std::strcmp(MotorEnStateName(MotorEnState::On), "on") == 0);
+                assert(std::strcmp(PanelHoldStateName(PanelHoldState::Off), "off") == 0);
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_paper_status_fields_test")
+
+    def test_decide_paper_precheck_fail_open(self):
+        """出图前缺纸预检决策（2026-08-24 P1-2）：Paper=No 才早退；
+        Yes 与 Unknown 一律放行（fail-open——Telnet 抖动/序号未推进读到 Unknown，
+        不得把有纸的正常出图误拒，那比页尾 error:90 更糟）。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+
+            int main() {
+                using namespace hutuji;
+                static_assert(DecidePaperPrecheck(PaperPresentState::No) ==
+                                  PaperPrecheckDecision::AbortNoPaper,
+                              "Paper=No 必须早退");
+                static_assert(DecidePaperPrecheck(PaperPresentState::Yes) ==
+                                  PaperPrecheckDecision::Proceed,
+                              "Paper=Yes 放行");
+                static_assert(DecidePaperPrecheck(PaperPresentState::Unknown) ==
+                                  PaperPrecheckDecision::Proceed,
+                              "Unknown 必须 fail-open 放行");
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_paper_precheck_test")
+
+
+    def test_status_json_never_sends_commands(self):
+        """StatusJson 只读禁令（2026-08-24 实锤回归）：[ESP901] 是普通命令会吃 ok，
+        StatusJson 发而不消费会在响应队列留孤儿 ok——下个窗口化出图把队列应答当
+        在途凭据，计数凭空多一格（提前多发一行、ok 配对错位）。遥测刷新只许走
+        Preview() 与出图前预检的「发 + WaitResponse 消费」路径。"""
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(
+            encoding="utf-8"
+        )
+        start = job.index("std::string Job::StatusJson() const {")
+        end = job.index("void Job::PreviewTaskEntry", start)
+        body = job[start:end]
+        self.assertNotIn("SendLine(", body, "StatusJson 体内不得发任何普通命令")
+        self.assertIn("SendRealtime('?')", body, "实时 ? 旁路保留")
+        preview = job[job.index("void Job::Preview() {"):]
+        self.assertIn('SendLine("[ESP901]")', preview, "遥测刷新应落在预览任务内")
+        self.assertIn("WaitResponse(kPaperStatusTimeoutMs", preview, "刷新必须消费 ok")
+
+    def test_duplicate_preview_reentry_idempotent(self):
+        """预览重入幂等（2026-08-24 P1-3 配套，实锤隐患）：服务端链式调用成功在预览后，
+        云端 LLM 第二步会以同 url/preview_url 重入 StartDraw——busy 命中时若回
+        「写字机正忙」，用户眼前有预览却听到失败文案（比漏调更难解释）。
+        同参数重入必须回 previewing；参数不同或未在等确认才判 busy。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+
+            int main() {
+                using namespace hutuji;
+                static_assert(IsDuplicatePreviewReentry(true, true),
+                              "等确认 + 同参数 = 幂等重入");
+                static_assert(!IsDuplicatePreviewReentry(true, false),
+                              "等确认但参数不同 = busy");
+                static_assert(!IsDuplicatePreviewReentry(false, true),
+                              "未在等确认（出图中）= busy");
+                static_assert(!IsDuplicatePreviewReentry(false, false),
+                              "未在等确认且参数不同 = busy");
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_preview_reentry_test")
+
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(
+            encoding="utf-8"
+        )
+        start = job.index("std::string Job::StartDraw(")
+        end = job.index("std::string Job::RequestConfirm", start)
+        body = job[start:end]
+        self.assertIn("IsDuplicatePreviewReentry", body, "StartDraw 必须走幂等重入判定")
+        self.assertIn('return JsonString("previewing")', body, "幂等重入须回 previewing")
 
 if __name__ == "__main__":
     unittest.main()

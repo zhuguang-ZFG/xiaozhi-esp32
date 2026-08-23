@@ -120,6 +120,9 @@ public:
     uint32_t GetPaperStatusSequence() const { return paper_status_seq_.load(); }
     uint32_t GetResetReceiveEpoch() const { return reset_receive_epoch_.load(); }
     PaperChangingState GetPaperChangingState() const { return paper_changing_.load(); }
+    PaperPresentState GetPaperPresentState() const { return paper_present_.load(); }
+    MotorEnState GetMotorEnState() const { return motor_en_.load(); }
+    PanelHoldState GetPanelHoldState() const { return panel_hold_.load(); }
     /** 当前连接已验明 Grbl，可执行受限 reset；仅断连恢复可显式使用未 ready 会话。 */
     bool IsResetSessionReady(uint32_t expected_connection_sequence,
                              bool allow_unready_reconnect = false) const {
@@ -245,6 +248,11 @@ private:
     std::atomic<uint32_t> reset_banner_seq_{0};
     std::atomic<uint32_t> paper_status_seq_{0};
     std::atomic<PaperChangingState> paper_changing_{PaperChangingState::Unknown};
+    // 换纸遥测三字段（2026-08-24 P1-1）：与 Changing 同一份 [ESP901] 应答解析；
+    // Unknown 为 fail-open 默认态，缺席/超时不得解释为缺纸。
+    std::atomic<PaperPresentState> paper_present_{PaperPresentState::Unknown};
+    std::atomic<MotorEnState> motor_en_{MotorEnState::Unknown};
+    std::atomic<PanelHoldState> panel_hold_{PanelHoldState::Unknown};
     // R21-F04：状态转移播报 10s 去抖（页尾归位会确定性连触发 Run→Idle 两次）；
     // 仅 PipeTask 单线程读写，无需 atomic。
     uint32_t last_transition_notify_tick_ = 0;

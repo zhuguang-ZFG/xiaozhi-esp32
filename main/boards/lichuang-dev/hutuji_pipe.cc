@@ -704,6 +704,14 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
     }
 
     if (line.find("Paper=") != std::string::npos && line.find("Changing=") != std::string::npos) {
+        // P1-1：同一份应答顺带解析三字段（与 Changing 同一守卫，缺席保持 Unknown）。
+        PaperPresentState paper = PaperPresentState::Unknown;
+        MotorEnState motor = MotorEnState::Unknown;
+        PanelHoldState panel = PanelHoldState::Unknown;
+        ParsePaperStatusFields(line, paper, motor, panel);
+        paper_present_.store(paper);
+        motor_en_.store(motor);
+        panel_hold_.store(panel);
         if (line.find("Changing=On") != std::string::npos) {
             paper_changing_.store(PaperChangingState::On);
         } else if (line.find("Changing=Off") != std::string::npos) {

@@ -746,8 +746,7 @@ inline constexpr bool ShouldAdvanceDiscoverBackoff(DiscoverMiss miss) {
 inline constexpr int kDiscoverFastRetryAttempts = 5;
 
 /** 第 attempt 次（1 起）连续真失败后的下一档退避：前段不涨，过后翻倍封顶。 */
-inline constexpr uint32_t NextDiscoverBackoffMs(int attempt, uint32_t current_ms,
-                                                uint32_t max_ms) {
+inline constexpr uint32_t NextDiscoverBackoffMs(int attempt, uint32_t current_ms, uint32_t max_ms) {
     if (attempt <= kDiscoverFastRetryAttempts) {
         return current_ms;
     }
@@ -774,6 +773,96 @@ inline bool HasGcodeCommandPrefix(const std::string& line, const char* word) {
         return false;
     }
     return line.size() == n || line[n] < '0' || line[n] > '9';
+}
+
+/**
+ * 换纸遥测三态：Unknown 是 fail-open 默认态——超时/序号未推进/字段缺席都不得
+ * 被解释成「缺纸」，否则一次 Telnet 抖动就会误拒有纸的正常出图（比页尾 error:90 更糟）。
+ */
+enum class PaperPresentState : uint8_t { Unknown = 0, Yes, No };
+enum class MotorEnState : uint8_t { Unknown = 0, On, Off };
+enum class PanelHoldState : uint8_t { Unknown = 0, On, Off };
+
+inline const char* PaperPresentStateName(PaperPresentState state) {
+    switch (state) {
+        case PaperPresentState::Yes:
+            return "yes";
+        case PaperPresentState::No:
+            return "no";
+        default:
+            return "unknown";
+    }
+}
+inline const char* MotorEnStateName(MotorEnState state) {
+    switch (state) {
+        case MotorEnState::On:
+            return "on";
+        case MotorEnState::Off:
+            return "off";
+        default:
+            return "unknown";
+    }
+}
+inline const char* PanelHoldStateName(PanelHoldState state) {
+    switch (state) {
+        case PanelHoldState::On:
+            return "on";
+        case PanelHoldState::Off:
+            return "off";
+        default:
+            return "unknown";
+    }
+}
+
+/**
+ * 解析 [ESP901] 应答行的 Paper/MotorEn/PanelHold 三字段（2026-08-24 P1-1，对齐协议 §4）。
+ * 与 Changing 解析同一守卫：「Paper= 与 Changing= 同现」才认行——防止把其他含
+ * `Paper=` 的日志误当遥测；任一字段缺席保持调用方传入的 Unknown，部分应答不整行作废。
+ * 返回该行是否为遥测行（守卫通过）。
+ */
+inline bool ParsePaperStatusFields(const std::string& line, PaperPresentState& paper,
+                                   MotorEnState& motor, PanelHoldState& panel) {
+    if (line.find("Paper=") == std::string::npos || line.find("Changing=") == std::string::npos) {
+        return false;
+    }
+    if (line.find("Paper=OK") != std::string::npos) {
+        paper = PaperPresentState::Yes;
+    } else if (line.find("Paper=No") != std::string::npos) {
+        paper = PaperPresentState::No;
+    }
+    if (line.find("MotorEn=On") != std::string::npos) {
+        motor = MotorEnState::On;
+    } else if (line.find("MotorEn=Off") != std::string::npos) {
+        motor = MotorEnState::Off;
+    }
+    if (line.find("PanelHold=On") != std::string::npos) {
+        panel = PanelHoldState::On;
+    } else if (line.find("PanelHold=Off") != std::string::npos) {
+        panel = PanelHoldState::Off;
+    }
+    return true;
+}
+
+enum class PaperPrecheckDecision : uint8_t { Proceed = 0, AbortNoPaper };
+
+/**
+ * 出图前缺纸预检决策（2026-08-24 P1-2）：只有新鲜应答确证 Paper=No 才早退；
+ * Yes 与 Unknown 一律放行（fail-open）。
+ */
+inline constexpr PaperPrecheckDecision DecidePaperPrecheck(PaperPresentState paper) {
+    return paper == PaperPresentState::No ? PaperPrecheckDecision::AbortNoPaper
+                                          : PaperPrecheckDecision::Proceed;
+}
+
+/**
+ * 预览重入幂等（2026-08-24 P1-3 配套）：服务端链式调用成功在预览后，云端 LLM 的
+ * 第二步会以同 url/preview_url 重入 StartDraw；busy 已占但任务停在
+ * awaiting_confirmation 且参数完全相同时，应回 previewing（等价「已在等确认」），
+ * 而不是把「写字机正忙」失败文案念给眼前有预览的用户。仅在参数不同或未在
+ * 等确认（出图中）时才判 busy。
+ */
+inline constexpr bool IsDuplicatePreviewReentry(bool awaiting_confirmation, bool same_urls) {
+    return awaiting_confirmation && same_urls;
 }
 
 class AbortResetToken {
