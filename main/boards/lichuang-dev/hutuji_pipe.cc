@@ -13,6 +13,7 @@
 #include "application.h"
 #include "board.h"
 #include "lwip/sockets.h"
+#include "plotter_provision.h"
 
 #define TAG "HutujiPipe"
 
@@ -378,6 +379,13 @@ bool Pipe::TryConnect(uint32_t ip_addr, int timeout_ms) {
 }
 
 bool Pipe::ConnectOnce() {
+    // 配网跳窗（StopStation→跳连出厂 AP→回切）期间歇工：此时 WIFI_STA_DEF 指向
+    // 跳配 netif（192.168.0.x），若照常拨号会连上写字机 AP 模式的 :23、把
+    // 192.168.0.1 写进 NVS 缓存，还会对机器发授权运动探针。等回切后再发现。
+    if (PlotterProvision::GetInstance().IsBusy()) {
+        last_discover_miss_ = DiscoverMiss::WaitingIp;
+        return false;
+    }
     // 发现期钉 PERFORMANCE：LOW_POWER(MAX_MODEM) 下首包可到 ~200ms，50ms 扫网会漏检。
     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 

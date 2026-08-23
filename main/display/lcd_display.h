@@ -107,16 +107,21 @@ protected:
     lv_obj_t* machine_manual_section_ = nullptr;
     lv_obj_t* machine_manual_toggle_btn_ = nullptr;
     lv_obj_t* machine_manual_toggle_label_ = nullptr;
-    // 抽屉分页：主操作区与手动区互斥显示，各自都塞得进 296px 面板内高。面板不可
+    // 抽屉分页：主页/手动页/维护页互斥显示，各自都塞得进 296px 面板内高。面板不可
     // 滚（height 固定，见 lcd_display.cc EnsureMachineControlUi 注释），同屏堆叠会
     // 把按钮挤出可视区——2026-08-20 四轮 HIL 实测丢按钮的根因。
     lv_obj_t* machine_main_section_ = nullptr;
+    // 维护页（第三页）：写字机零接触配网的手动入口。machine_page_ 0=主页 1=手动 2=维护。
+    lv_obj_t* machine_maint_section_ = nullptr;
+    lv_obj_t* machine_reprovision_btn_ = nullptr;
+    int machine_page_ = 0;
     std::function<void()> machine_pause_;
     std::function<void()> machine_resume_;
     std::function<void()> machine_abort_;
     std::function<void()> machine_repeat_;
     std::function<void()> machine_pen_test_;
     std::function<void(const char* action)> machine_manual_;
+    std::function<void()> machine_reprovision_;
     std::vector<lv_obj_t*> machine_manual_buttons_;
     std::string machine_state_{"idle"};
     bool machine_controls_configured_ = false;
@@ -139,7 +144,7 @@ protected:
     void EnsureMachineControlUi();
     void ApplyMachineControlState();
     void SetGrobotSubtitle(const char* content);
-    void SetMachineManualSectionVisible(bool visible);
+    void SetMachineDrawerPage(int page);
     void InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme, const lv_font_t* large_icon_font);
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
@@ -163,7 +168,8 @@ public:
     void ConfigureMachineControls(std::function<void()> on_pause, std::function<void()> on_resume,
                                   std::function<void()> on_abort, std::function<void()> on_repeat,
                                   std::function<void()> on_pen_test,
-                                  std::function<void(const char* action)> on_manual);
+                                  std::function<void(const char* action)> on_manual,
+                                  std::function<void()> on_reprovision);
     /** boot 键功能上屏：on_talk = boot 单击等效，on_wifi = 进配网显二维码。 */
     void ConfigureVoiceEntry(std::function<void()> on_talk, std::function<void()> on_wifi);
     /** 配网二维码「关闭」回调：调用方负责退出配网模式（如 StopConfigAp）。 */

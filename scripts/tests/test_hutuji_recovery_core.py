@@ -2163,7 +2163,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # ApplyMachineControlState 一并吞进来，令「创建处只折叠一次」这类计数式断言
         # 被别处的同名调用干扰（2026-08-20 实测 count 由 1 变 2 假红）。
         ui_start = lcd_cc.index("void LcdDisplay::EnsureMachineControlUi")
-        ui_end = lcd_cc.index("void LcdDisplay::SetMachineManualSectionVisible", ui_start)
+        ui_end = lcd_cc.index("void LcdDisplay::SetMachineDrawerPage", ui_start)
         ui_body = lcd_cc[ui_start:ui_end]
         for member in (
             "machine_pause_btn_",
@@ -2230,13 +2230,18 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertGreaterEqual(lcd_cc.count("lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN)"), 2)
         self.assertIn("machine_manual_section_", ui_body)
         self.assertIn("machine_manual_toggle_btn_", ui_body)
-        self.assertIn("SetMachineManualSectionVisible(false)", ui_body)
-        self.assertIn("SetMachineManualSectionVisible(", ui_body)
-        # 展开态跨抽屉开合保持（2026-08-20 用户决策）：开机默认折叠只剩创建处一处，
-        # 打开抽屉不再强制收起，连续点动无需反复展开。
-        self.assertEqual(ui_body.count("SetMachineManualSectionVisible(false)"), 1)
-        # EXPAND 文案在构建处（初始态），COLLAPSE 只在切页 setter 里出现，
-        # 故后者对 setter_body 断言（见下）。
+        # 维护页（第三页）：写字机零接触配网手动入口挂在抽屉维护页。
+        self.assertIn("machine_maint_section_", ui_body)
+        self.assertIn("machine_reprovision_btn_", ui_body)
+        self.assertIn("Lang::Strings::MACHINE_REPROVISION", ui_body)
+        self.assertIn("SetMachineDrawerPage(0)", ui_body)
+        self.assertIn("SetMachineDrawerPage(", ui_body)
+        # 展开态跨抽屉开合保持（2026-08-20 用户决策）：开机默认主页只剩创建处一处，
+        # 打开抽屉不再强制回主页，连续点动无需反复切页。
+        self.assertEqual(ui_body.count("SetMachineDrawerPage(0)"), 1)
+        # 切页循环 主页→手动→维护→主页；EXPAND 文案在构建处（初始态），
+        # 其余页文案只在切页 setter 里出现，故后者对 setter_body 断言（见下）。
+        self.assertIn("(self->machine_page_ + 1) % 3", ui_body)
         self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", ui_body)
         # 标题行必须 locale-proof：en-US 下固定件（状态胶囊 + 切换 129 + 收起 96 +
         # 3*8 间距）已占 ~324px，标题「Drawing Controls」按 SPACE_BETWEEN 排会溢出
@@ -2261,19 +2266,22 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # （分页已保证可达；聊天区等其它 UI 的滚动与本抽屉无关，故只查这两段）。
         self.assertNotIn("lv_obj_scroll_to_view_recursive(", ui_body)
         self.assertNotIn("lv_obj_scroll_to_y(panel", ui_body)
-        setter_start = lcd_cc.index("void LcdDisplay::SetMachineManualSectionVisible")
+        setter_start = lcd_cc.index("void LcdDisplay::SetMachineDrawerPage")
         setter_end = lcd_cc.index("void LcdDisplay::ApplyMachineControlState", setter_start)
         setter_body = lcd_cc[setter_start:setter_end]
         self.assertNotIn("lv_obj_scroll_to", setter_body)
-        # 切页 setter 必须两向都改文案，否则按钮标签与当前页脱节。
-        self.assertIn("Lang::Strings::MACHINE_MANUAL_COLLAPSE", setter_body)
+        # 切页 setter 必须三页都改文案，否则按钮标签与当前页脱节。
         self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", setter_body)
-        # 互斥：手动区显示则主区隐藏，反之亦然。
+        self.assertIn("Lang::Strings::MACHINE_MAINT_EXPAND", setter_body)
+        self.assertIn("Lang::Strings::MACHINE_MAIN_PAGE", setter_body)
+        # 互斥：手动区/维护区显示则主区隐藏，反之亦然。
         self.assertIn("machine_main_section_", lcd_h)
         self.assertIn("lv_obj_add_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
         self.assertIn("lv_obj_remove_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
         self.assertIn("lv_obj_add_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
         self.assertIn("lv_obj_remove_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
+        self.assertIn("lv_obj_add_flag(machine_maint_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
+        self.assertIn("lv_obj_remove_flag(machine_maint_section_, LV_OBJ_FLAG_HIDDEN)", setter_body)
         # 主页三行都挂在主区（不是 panel）：否则切页时它们不会跟着隐藏。
         self.assertIn("make_row(machine_main_section_)", ui_body)
         self.assertIn("make_button(machine_main_section_, Lang::Strings::MACHINE_STOP", ui_body)
@@ -2310,13 +2318,15 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertRegex(toggle_args, r"make_button\(\s*header,")
         self.assertIn("Lang::Strings::MACHINE_MANUAL_EXPAND", toggle_args)
         # active 态（含 streaming/paper_change）必须回主页，否则停止钮随主区一起被
-        # 隐藏，而手动键此刻全灰——屏上会一个可用键都没有。判据须是 active，用
+        # 隐藏，而副页键此刻全灰——屏上会一个可用键都没有。判据须是 active，用
         # !settled 会把 manual（点动执行中）也踢回主页，点一下就跳页。
         apply_start = lcd_cc.index("void LcdDisplay::ApplyMachineControlState")
         apply_body = lcd_cc[apply_start:]
-        self.assertIn("if (active && machine_manual_section_ != nullptr &&", apply_body)
-        self.assertIn("SetMachineManualSectionVisible(false);", apply_body)
+        self.assertIn("if (active && machine_page_ != 0)", apply_body)
+        self.assertIn("SetMachineDrawerPage(0);", apply_body)
         self.assertNotIn("if (!settled && machine_manual_section_", apply_body)
+        # 维护页入口仅 settled 态可用：配网跳窗会断户网，不能打断在途任务。
+        self.assertIn("set_enabled(machine_reprovision_btn_, settled);", apply_body)
 
         # taskLVGL 栈：默认 7168 装不下手动页（比主页深两级、四级 LV_SIZE_CONTENT
         # 叠 flex），2026-08-20 实机首帧展开即 "stack overflow in task taskLVGL"
@@ -2330,6 +2340,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("#include <freertos/task.h>", lcd_cc)
 
         self.assertIn("display_->ConfigureMachineControls", board)
+        # 维护页「重新配置写字机」接零接触配网手动入口（hutuji::PlotterProvision）。
+        self.assertIn("PlotterProvision::GetInstance().RequestManual()", board)
         for request in (
             "RequestPause()",
             "RequestResume()",
@@ -2372,6 +2384,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             "MACHINE_MANUAL_SECTION",
             "MACHINE_MANUAL_EXPAND",
             "MACHINE_MANUAL_COLLAPSE",
+            "MACHINE_MAINT_EXPAND",
+            "MACHINE_MAIN_PAGE",
+            "MACHINE_REPROVISION",
+            "MACHINE_REPROVISION_HINT",
             "MACHINE_PEN_UP",
             "MACHINE_PEN_DOWN",
             "MACHINE_JOG_XP",

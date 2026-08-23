@@ -11,6 +11,7 @@
 #include "hutuji_pipe.h"
 #include "i2c_device.h"
 #include "mcp_server.h"
+#include "plotter_provision.h"
 #include "press_to_talk_mcp_tool.h"
 #include "wifi_board.h"
 
@@ -504,6 +505,11 @@ public:
                 } else if (event == NetworkEvent::WifiConfigModeExit ||
                            event == NetworkEvent::Connected) {
                     display_->HideProvisioningQr();
+                }
+                if (event == NetworkEvent::Connected) {
+                    // 户网连上后巡检写字机：找不到且出厂热点在场则自动跳配
+                    // （零接触配网；用户只扫过一次码）。
+                    hutuji::PlotterProvision::GetInstance().OnHomeNetworkConnected();
                 }
                 if (callback) {
                     callback(event, data);

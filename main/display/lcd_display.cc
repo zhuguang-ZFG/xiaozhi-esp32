@@ -1177,7 +1177,29 @@ void LcdDisplay::EnsureMachineControlUi() {
                 theme->text_color(), tool_width, "motor_off");
     make_manual(power_row, Lang::Strings::MACHINE_RESET, theme->danger_color(), lv_color_white(),
                 tool_width, "reset");
-    SetMachineManualSectionVisible(false);
+
+    // ── 维护页（第三页）：写字机零接触配网的手动入口。写字机被重置回出厂热点
+    // 或更换新机时，S3 停在户网上不会产生新的 Connected 事件，自动巡检不触发，
+    // 由本入口强制走一遍「扫描出厂热点→跳配→写凭据→回切验证」。
+    machine_maint_section_ = lv_obj_create(panel);
+    lv_obj_remove_style_all(machine_maint_section_);
+    lv_obj_set_size(machine_maint_section_, content_width, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(machine_maint_section_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(machine_maint_section_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(machine_maint_section_, theme->spacing(4), 0);
+    lv_obj_clear_flag(machine_maint_section_, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* maint_hint = lv_label_create(machine_maint_section_);
+    lv_label_set_text(maint_hint, Lang::Strings::MACHINE_REPROVISION_HINT);
+    lv_label_set_long_mode(maint_hint, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(maint_hint, content_width);
+    lv_obj_set_style_text_color(maint_hint, theme->muted_text_color(), 0);
+
+    machine_reprovision_btn_ = make_button(
+        machine_maint_section_, Lang::Strings::MACHINE_REPROVISION, theme->accent_color(),
+        theme->accent_text_color(), content_width, safe_button_height);
+    SetMachineDrawerPage(0);
 
     // 抽屉盖住主屏状态栏，断连/失败通知必须画在遮罩上面，否则点 XY 像没反应。
     machine_notice_label_ = lv_label_create(machine_control_root_);
@@ -1276,8 +1298,20 @@ void LcdDisplay::EnsureMachineControlUi() {
         machine_manual_toggle_btn_,
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
-            self->SetMachineManualSectionVisible(
-                lv_obj_has_flag(self->machine_manual_section_, LV_OBJ_FLAG_HIDDEN));
+            // 主页 → 手动 → 维护 → 主页 循环切页。
+            self->SetMachineDrawerPage((self->machine_page_ + 1) % 3);
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        machine_reprovision_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            // 与其余动作钮同语义：收起抽屉，配网结果通知落在主屏状态区（抽屉
+            // 遮罩会盖住通知，见 machine_notice_label_ 的存在理由）。
+            lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            if (self->machine_reprovision_) {
+                self->machine_reprovision_();
+            }
         },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
@@ -1363,30 +1397,43 @@ void LcdDisplay::EnsureMachineControlUi() {
     ApplyMachineControlState();
 }
 
-void LcdDisplay::SetMachineManualSectionVisible(bool visible) {
-    if (machine_manual_section_ == nullptr || machine_manual_toggle_label_ == nullptr) {
+void LcdDisplay::SetMachineDrawerPage(int page) {
+    if (machine_manual_section_ == nullptr || machine_manual_toggle_label_ == nullptr ||
+        machine_maint_section_ == nullptr) {
         return;
     }
-    // 互斥切页而非同屏展开：面板高度固定、不可滚动，两区同屏必然把按钮挤出可视区。
-    if (visible) {
-        lv_obj_remove_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(machine_manual_toggle_label_, Lang::Strings::MACHINE_MANUAL_COLLAPSE);
-        if (machine_main_section_ != nullptr) {
+    // 三页互斥而非同屏展开：面板高度固定、不可滚动，两区同屏必然把按钮挤出可视区。
+    machine_page_ = page;
+    const bool show_manual = (page == 1);
+    const bool show_maint = (page == 2);
+    if (machine_main_section_ != nullptr) {
+        if (show_manual || show_maint) {
             lv_obj_add_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN);
-        }
-    } else {
-        lv_obj_add_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(machine_manual_toggle_label_, Lang::Strings::MACHINE_MANUAL_EXPAND);
-        if (machine_main_section_ != nullptr) {
+        } else {
             lv_obj_remove_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN);
         }
     }
-    // 展开/收起无其他日志面，HIL 取证需要区分「CLICKED 没发」与「发了但别的环节断」。
+    if (show_manual) {
+        lv_obj_remove_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (show_maint) {
+        lv_obj_remove_flag(machine_maint_section_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(machine_maint_section_, LV_OBJ_FLAG_HIDDEN);
+    }
+    // 切页钮文案 = 下一页目标：主页→点动·手动→维护→主页。
+    lv_label_set_text(machine_manual_toggle_label_, page == 0 ? Lang::Strings::MACHINE_MANUAL_EXPAND
+                                                    : page == 1
+                                                        ? Lang::Strings::MACHINE_MAINT_EXPAND
+                                                        : Lang::Strings::MACHINE_MAIN_PAGE);
+    // 切页无其他日志面，HIL 取证需要区分「CLICKED 没发」与「发了但别的环节断」。
     // 顺带记 taskLVGL 历史最深空闲栈（HWM 单调只减，此刻读到的是手动页布局+绘制
     // 全程峰值余量）：证据化 12288 抬栈后手动页是否仍贴底，防止它静默回压穿。
-    ESP_LOGI(TAG, "machine manual section %s, lvgl stack hwm %u",
-             visible ? "expanded" : "collapsed", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
-    if (!visible && machine_notice_label_ != nullptr) {
+    ESP_LOGI(TAG, "machine drawer page %d, lvgl stack hwm %u", page,
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    if (page == 0 && machine_notice_label_ != nullptr) {
         lv_obj_add_flag(machine_notice_label_, LV_OBJ_FLAG_HIDDEN);
         machine_notice_hide_us_ = 0;
     }
@@ -1434,9 +1481,16 @@ void LcdDisplay::ApplyMachineControlState() {
     // 此刻又全灰——真在画/换纸时停留在手动页等于「屏上没有停止键、也没有任何可用键」。
     // 判据用 active 而非 !settled：manual 态正是点动执行中，那时必须留在手动页。
     // 切页钮在标题行常驻，用户随时可切回来。
-    if (active && machine_manual_section_ != nullptr &&
-        !lv_obj_has_flag(machine_manual_section_, LV_OBJ_FLAG_HIDDEN)) {
-        SetMachineManualSectionVisible(false);
+    // active 态强制回主页：停止钮挂在主区，手动/维护页显示时它被一并隐藏，而那两页的
+    // 按钮此刻又全灰——真在画/换纸时停留在副页等于「屏上没有停止键、也没有任何可用键」。
+    // 判据用 active 而非 !settled：manual 态正是点动执行中，那时必须留在手动页。
+    // 切页钮在标题行常驻，用户随时可切回来。
+    if (active && machine_page_ != 0) {
+        SetMachineDrawerPage(0);
+    }
+    // 维护页入口同样仅 settled 态可用：配网跳窗会断户网，不能打断在途任务。
+    if (machine_reprovision_btn_ != nullptr) {
+        set_enabled(machine_reprovision_btn_, settled);
     }
 
     // 标题行状态灯：文案走 locale，颜色复用按钮语义色（进行中=琥珀、
@@ -1510,18 +1564,17 @@ void LcdDisplay::ApplyMachineControlState() {
 #endif
 }
 
-void LcdDisplay::ConfigureMachineControls(std::function<void()> on_pause,
-                                          std::function<void()> on_resume,
-                                          std::function<void()> on_abort,
-                                          std::function<void()> on_repeat,
-                                          std::function<void()> on_pen_test,
-                                          std::function<void(const char* action)> on_manual) {
+void LcdDisplay::ConfigureMachineControls(
+    std::function<void()> on_pause, std::function<void()> on_resume, std::function<void()> on_abort,
+    std::function<void()> on_repeat, std::function<void()> on_pen_test,
+    std::function<void(const char* action)> on_manual, std::function<void()> on_reprovision) {
     machine_pause_ = std::move(on_pause);
     machine_resume_ = std::move(on_resume);
     machine_abort_ = std::move(on_abort);
     machine_repeat_ = std::move(on_repeat);
     machine_pen_test_ = std::move(on_pen_test);
     machine_manual_ = std::move(on_manual);
+    machine_reprovision_ = std::move(on_reprovision);
     machine_controls_configured_ = true;
     if (setup_ui_called_) {
         DisplayLockGuard lock(this);

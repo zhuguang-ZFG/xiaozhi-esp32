@@ -96,6 +96,10 @@
         "MACHINE_RESET": "Reset",
         "MACHINE_STATE_MANUAL": "Manual",
         "VOICE_TALK": "Talk",
-        "WIFI_CONFIG_SHORT": "Wi-Fi"
+        "WIFI_CONFIG_SHORT": "Wi-Fi",
+        "MACHINE_MAINT_EXPAND": "Maintenance",
+        "MACHINE_MAIN_PAGE": "Home",
+        "MACHINE_REPROVISION": "Set Up Plotter Again",
+        "MACHINE_REPROVISION_HINT": "Tap after the plotter is reset or replaced to re-share home Wi-Fi"
     }
 }

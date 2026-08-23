@@ -8,6 +8,7 @@
 #include "boards/lichuang-dev/hutuji_ble_diag.h"
 #include "boards/lichuang-dev/hutuji_recovery_core.h"
 #include "boards/lichuang-dev/hutuji_music.h"
+#include "boards/lichuang-dev/plotter_provision.h"
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
@@ -549,7 +550,8 @@ private:
             [this]() { ScheduleMachineControl("abort", &hutuji::Job::RequestAbort); },
             [this]() { ScheduleMachineControl("repeat", &hutuji::Job::RequestRepeat); },
             [this]() { ScheduleMachineControl("pen_test", &hutuji::Job::RequestPenTest); },
-            [this](const char* action) { ScheduleManualControl(action); });
+            [this](const char* action) { ScheduleManualControl(action); },
+            []() { hutuji::PlotterProvision::GetInstance().RequestManual(); });
 
         // boot 键功能上屏：「说话」与 boot 单击完全同语义（starting 态转配网，
         // 否则 ToggleChatState）；触摸唤醒已由 LV_EVENT_PRESSED 钩子在板级完成，
@@ -678,7 +680,16 @@ private:
                     StopWifiLostWatchdog();
                     display_->HideProvisioningQr();
                 } else if (event == NetworkEvent::Disconnected) {
-                    StartWifiLostWatchdog();
+                    // 配网跳窗内的断连是流程一部分：看门狗若在 120s 触发会把
+                    // 回切途中的设备踹进配网模式，跳窗期间不武装。
+                    if (!hutuji::PlotterProvision::GetInstance().IsBusy()) {
+                        StartWifiLostWatchdog();
+                    }
+                }
+                if (event == NetworkEvent::Connected) {
+                    // 户网连上后巡检写字机：找不到且出厂热点在场则自动跳配
+                    // （零接触配网；用户只扫过一次码）。
+                    hutuji::PlotterProvision::GetInstance().OnHomeNetworkConnected();
                 }
                 if (callback) {
                     callback(event, data);

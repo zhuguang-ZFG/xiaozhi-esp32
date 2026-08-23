@@ -896,6 +896,7 @@ if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_ble_diag.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_music.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pi_splash.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/plotter_provision.cc
     )
 endif()
 if(HUTUJI_GROBOT_FACE AND NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)

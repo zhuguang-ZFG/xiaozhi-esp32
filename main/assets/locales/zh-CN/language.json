@@ -96,6 +96,10 @@
         "MACHINE_RESET": "复位",
         "MACHINE_STATE_MANUAL": "手动控制中",
         "VOICE_TALK": "说话",
-        "WIFI_CONFIG_SHORT": "配网"
+        "WIFI_CONFIG_SHORT": "配网",
+        "MACHINE_MAINT_EXPAND": "维护",
+        "MACHINE_MAIN_PAGE": "主页",
+        "MACHINE_REPROVISION": "重新配置写字机",
+        "MACHINE_REPROVISION_HINT": "写字机被重置或更换后点这里，会自动把家里网络配给它"
     }
 }
