@@ -3032,10 +3032,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("WaitResponse(kPaperStatusTimeoutMs", preview, "刷新必须消费 ok")
 
     def test_duplicate_preview_reentry_idempotent(self):
-        """预览重入幂等（2026-08-24 P1-3 配套，实锤隐患）：服务端链式调用成功在预览后，
-        云端 LLM 第二步会以同 url/preview_url 重入 StartDraw——busy 命中时若回
-        「写字机正忙」，用户眼前有预览却听到失败文案（比漏调更难解释）。
-        同参数重入必须回 previewing；参数不同或未在等确认才判 busy。"""
+        """预览重入幂等（2026-08-24 P1-3 配套 + fixup）：服务端链式调用在生成完成点
+        即发，云端第二步以同 url/preview_url 重入 StartDraw——第一步还在下载 PNG
+        （state=previewing）时第二步就会到。判据必须是「已在预览流程中」
+        （previewing 或 awaiting_confirmation），不是 awaiting_confirmation_ 标志
+        （它要等 PNG 下载完才置 true，用它做主路径判据等于没修）。同参数重入回
+        previewing；参数不同或不在预览流程（如 streaming）才判 busy。"""
         compiler = find_compiler()
         if compiler is None:
             self.skipTest("no supported host C++ compiler found")
@@ -3060,7 +3062,6 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             """
         )
         self._compile_and_run(compiler, source, stem="hutuji_preview_reentry_test")
-
         job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(
             encoding="utf-8"
         )
@@ -3068,7 +3069,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         end = job.index("std::string Job::RequestConfirm", start)
         body = job[start:end]
         self.assertIn("IsDuplicatePreviewReentry", body, "StartDraw 必须走幂等重入判定")
+        self.assertIn(
+            'state == "previewing" || state == "awaiting_confirmation"',
+            body,
+            "谓词必须是「已在预览流程中」——awaiting_confirmation_ 要等 PNG 下载完才置 true，主路径不成立",
+        )
         self.assertIn('return JsonString("previewing")', body, "幂等重入须回 previewing")
+
 
 if __name__ == "__main__":
     unittest.main()

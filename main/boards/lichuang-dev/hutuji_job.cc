@@ -296,10 +296,18 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     }
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
-        // P1-3 同参数幂等重入：服务端链式调用已成功在预览，云端第二步以同
-        // url/preview_url 重入时回 previewing（等价「你要的这张已在等确认」），
-        // 避免用户看到预览却听到「写字机正忙」。参数不同或未在等确认才判 busy。
-        if (IsDuplicatePreviewReentry(awaiting_confirmation_.load(),
+        // P1-3 同参数幂等重入：服务端链式调用在生成完成点即发，云端第二步以同
+        // url/preview_url 重入时回 previewing（等价「你要的这张已在预览/等确认」），
+        // 避免用户看到预览却听到「写字机正忙」。判据必须是「已在预览流程中」——
+        // awaiting_confirmation_ 要等 PNG 下载完才置 true，而第二步恰好落在下载窗口
+        // （fixup 2026-08-24：原判据在主路径不成立）。参数不同或不在预览流程才 busy。
+        std::string state;
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            state = state_;
+        }
+        const bool in_preview_flow = state == "previewing" || state == "awaiting_confirmation";
+        if (IsDuplicatePreviewReentry(in_preview_flow,
                                       url_ == url && preview_url_ == preview_url)) {
             return JsonString("previewing");
         }
