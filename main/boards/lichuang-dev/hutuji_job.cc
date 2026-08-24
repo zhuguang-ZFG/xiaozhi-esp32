@@ -104,6 +104,14 @@ void Job::SetState(const char* state) {
         state_ = state;
         state_snapshot = state_;
     }
+    // 落笔棘轮闸清除（见 manual_pen_down_latched_ 注释）：settled/manual 之外的任何
+    // 状态都意味着有 Z 接管方（出图流/笔测试/换纸/重连），此后笔位不再可信，
+    // 下一次手动落笔必须重新走 G92 校准。
+    if (std::strcmp(state, "idle") != 0 && std::strcmp(state, "done") != 0 &&
+        std::strcmp(state, "error") != 0 && std::strcmp(state, "aborted") != 0 &&
+        std::strcmp(state, "manual") != 0) {
+        manual_pen_down_latched_.store(false);
+    }
     if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
         display->UpdateMachineControlState(state_snapshot);
     }
@@ -851,6 +859,15 @@ std::string Job::RequestManualControl(const std::string& action) {
             busy_.store(false);
             return "{\"error\":\"当前任务状态不允许手动控制\"}";
         }
+        // 落笔棘轮闸（2026-08-25）：已确认落笔且无 Z 接管方时，重复 pen_down 幂等
+        // 短路——pen_down 序列先 G92 Z0 重设基准再降 5mm，对已落笔位重放会以更低位
+        // 为新基准继续下压，无限位开关下可累积压坏笔/纸台。语音面触发摩擦最低，
+        // 屏幕按钮同闸受益。残余风险：落笔中 ok 丢失（运动已执行但判失败）不锁存，
+        // 重试会再压深——失败已播报，由人现场处置。
+        if (action == "pen_down" && manual_pen_down_latched_.load()) {
+            busy_.store(false);
+            return JsonString("已处于落笔状态，无需重复落笔");
+        }
         if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
             busy_.store(false);
             return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
@@ -989,6 +1006,13 @@ void Job::ManualTask() {
 
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        // 落笔棘轮闸锁存/解除：只在动作整体成功（含等 Idle）后更新，失败保持
+        // 原值——G92 已发而 Z5 被拒的中间态靠播报让人处置，不假装知道笔位。
+        if (ok && action == "pen_down") {
+            manual_pen_down_latched_.store(true);
+        } else if (ok && action == "pen_up") {
+            manual_pen_down_latched_.store(false);
+        }
         SetState("idle");
         busy_.store(false);
     }

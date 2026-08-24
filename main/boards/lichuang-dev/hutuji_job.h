@@ -240,6 +240,11 @@ private:
     std::atomic<bool> buffer_replayable_{false};
     // 试笔期间不接受暂停/恢复；abort 只置标志，不并发 reset 抢占 Z 运动应答。
     std::atomic<bool> pen_test_active_{false};
+    // 落笔棘轮闸（2026-08-25）：pen_down 序列先 G92 Z0 重设基准再降 5mm，重复触发会
+    // 以更低位为新基准继续下压，无限位开关下可累积压坏笔/纸台。本闸在手动 pen_down
+    // 成功后锁存；重复 pen_down 幂等短路。任何 Z 接管方（出图/笔测试/换纸）经 SetState
+    // 进非 settled/manual 态时清除——之后首次落笔必须重新校准，语义与首回一致。
+    std::atomic<bool> manual_pen_down_latched_{false};
     // 射频 PERFORMANCE 持有：timer 由 StartPerformanceHold 惰性创建，StopPerformanceHold
     // 停止；hold_active_ 防止重复创建/双重回落。timer 回调仅在 esp_timer 任务线程跑，
     // 与任务线程的 SetState 不共享该标志的写路径外的状态。

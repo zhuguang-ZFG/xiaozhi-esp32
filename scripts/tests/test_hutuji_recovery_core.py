@@ -2718,6 +2718,15 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             self.assertIn('"hutuji.manual"', body)
             self.assertIn("IsVoiceAllowedAction", body)
             self.assertIn("RequestManualControl", body)
+            # 落笔幂等语义必须进工具描述（LLM 据此区分重复调用与失败）。
+            self.assertIn("已处于落笔状态", body)
+        # 落笔棘轮闸接线（2026-08-25）：job 侧锁存成员 + 请求侧幂等短路必须同时在位，
+        # 缺一即退化为「重复落笔逐次压深 5mm」的棘轮。
+        job_h = (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(encoding="utf-8")
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        self.assertIn("manual_pen_down_latched_", job_h)
+        self.assertIn('action == "pen_down" && manual_pen_down_latched_.load()', job_cc)
+        self.assertIn("已处于落笔状态", job_cc)
 
     def test_manual_control_wired_through_board_and_ui(self):
         """board 统一转发 action 字符串；UI 抽屉手动区按钮仅 settled 态可用。"""
