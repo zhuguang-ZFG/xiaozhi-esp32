@@ -1451,29 +1451,6 @@ void Job::Run() {
             break;
         }
         stream_connection_seq_ = session_seq;
-        // P1-2 出图前缺纸预检：此刻必为 idle（尚未 G92/灌流），允许发普通命令 [ESP901]。
-        // 三重判据（序号+新鲜度+Ok）：确证 Paper=No 才早退；超时/序号未推进/发送失败
-        // 一律按 Unknown 放行（fail-open）；Changing=On 不预检（§3 单写者，正常路径不可达）。
-        {
-            const uint32_t paper_before = pipe.GetPaperStatusSequence();
-            bool paper_confirmed_out = false;
-            if (pipe.GetPaperChangingState() != PaperChangingState::On &&
-                pipe.SendLine("[ESP901]")) {
-                int paper_err = -1;
-                if (pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &paper_err) ==
-                        WaitResult::Ok &&
-                    pipe.GetPaperStatusSequence() != paper_before) {
-                    paper_confirmed_out = DecidePaperPrecheck(pipe.GetPaperPresentState()) ==
-                                          PaperPrecheckDecision::AbortNoPaper;
-                }
-            }
-            if (paper_confirmed_out) {
-                last_error_ = "没纸了，请先放纸";
-                SetState("error");
-                Notify(last_error_);
-                break;
-            }
-        }
         // 授权探测已在 Pipe 建链时完成；未授权任务在这里停止，绘图载荷零字节下发。
         // 下载/校验期间就被暂停时，不能把状态改回 streaming——否则 status 谎报
         // 正在画，实际转发循环一进去就卡在暂停门上。
@@ -2344,6 +2321,7 @@ bool Job::StreamToGrbl() {
     draw_start_tick_ = xTaskGetTickCount();
     UpdateDisplayProgress();
     TickType_t last_notify_tick = xTaskGetTickCount();
+    TickType_t last_display_tick = xTaskGetTickCount();  // 屏显节流（与播报节流分列）
 
     // Idle→Active 发布与 abort 提交锁原子化；abort 已在校准/下载阶段收敛时不得再开窗。
     {
@@ -2749,7 +2727,16 @@ bool Job::StreamToGrbl() {
             c_line.pop_front();
             ++lines_sent_;
 
-            UpdateDisplayProgress();
+            // 进度屏显 250ms 节流：每 ok 一次的 SetStatus 会阻塞灌流循环
+            // （waveshare LCD LVGL 屏刷实证 ~60ms/行——2026-08-24 插桩测量 68.8s/1151 行，
+            // 证据 results/local-only/2026-08-24/hil-instr-cat-com14-v4.log 在本机；
+            // 喂流 66ms/行 → 超 $1=25ms 失能 → 弹簧弹笔 → 不落笔）。屏显只反映节奏，
+            // 不收 ok 的账；播报 5s 节流不变。
+            TickType_t display_now = xTaskGetTickCount();
+            if ((display_now - last_display_tick) >= pdMS_TO_TICKS(250)) {
+                last_display_tick = display_now;
+                UpdateDisplayProgress();
+            }
             // 进度推送用 lines_sent_（已确认数），不是 next_（已发数）——已发≠已画
             TickType_t now = xTaskGetTickCount();
             if ((now - last_notify_tick) >= pdMS_TO_TICKS(5000)) {
@@ -2801,7 +2788,6 @@ bool Job::StreamToGrbl() {
         }
     }
 
-    window_guard.MarkQuiesced();
     return true;
 }
 

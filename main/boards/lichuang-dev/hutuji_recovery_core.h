@@ -843,16 +843,6 @@ inline bool ParsePaperStatusFields(const std::string& line, PaperPresentState& p
     return true;
 }
 
-enum class PaperPrecheckDecision : uint8_t { Proceed = 0, AbortNoPaper };
-
-/**
- * 出图前缺纸预检决策（2026-08-24 P1-2）：只有新鲜应答确证 Paper=No 才早退；
- * Yes 与 Unknown 一律放行（fail-open）。
- */
-inline constexpr PaperPrecheckDecision DecidePaperPrecheck(PaperPresentState paper) {
-    return paper == PaperPresentState::No ? PaperPrecheckDecision::AbortNoPaper
-                                          : PaperPrecheckDecision::Proceed;
-}
 
 /**
  * 预览重入幂等（2026-08-24 P1-3 配套）：服务端链式调用成功在预览后，云端 LLM 的

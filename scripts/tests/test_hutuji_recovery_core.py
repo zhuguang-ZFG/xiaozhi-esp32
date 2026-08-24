@@ -2983,42 +2983,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self._compile_and_run(compiler, source, stem="hutuji_paper_status_fields_test")
 
-    def test_decide_paper_precheck_fail_open(self):
-        """出图前缺纸预检决策（2026-08-24 P1-2）：Paper=No 才早退；
-        Yes 与 Unknown 一律放行（fail-open——Telnet 抖动/序号未推进读到 Unknown，
-        不得把有纸的正常出图误拒，那比页尾 error:90 更糟）。"""
-        compiler = find_compiler()
-        if compiler is None:
-            self.skipTest("no supported host C++ compiler found")
-        source = textwrap.dedent(
-            r"""
-            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
-
-            #include <cassert>
-
-            int main() {
-                using namespace hutuji;
-                static_assert(DecidePaperPrecheck(PaperPresentState::No) ==
-                                  PaperPrecheckDecision::AbortNoPaper,
-                              "Paper=No 必须早退");
-                static_assert(DecidePaperPrecheck(PaperPresentState::Yes) ==
-                                  PaperPrecheckDecision::Proceed,
-                              "Paper=Yes 放行");
-                static_assert(DecidePaperPrecheck(PaperPresentState::Unknown) ==
-                                  PaperPrecheckDecision::Proceed,
-                              "Unknown 必须 fail-open 放行");
-                return 0;
-            }
-            """
-        )
-        self._compile_and_run(compiler, source, stem="hutuji_paper_precheck_test")
 
 
     def test_status_json_never_sends_commands(self):
         """StatusJson 只读禁令（2026-08-24 实锤回归）：[ESP901] 是普通命令会吃 ok，
         StatusJson 发而不消费会在响应队列留孤儿 ok——下个窗口化出图把队列应答当
         在途凭据，计数凭空多一格（提前多发一行、ok 配对错位）。遥测刷新只许走
-        Preview() 与出图前预检的「发 + WaitResponse 消费」路径。"""
+        Preview() 的「发 + WaitResponse 消费」路径。"""
         job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(
             encoding="utf-8"
         )
