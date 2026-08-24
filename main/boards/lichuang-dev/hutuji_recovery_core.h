@@ -128,6 +128,24 @@ inline float ClampJogStepMm(float step) {
     }
     return kJogStepMmCoarse;
 }
+/**
+ * 语音面（hutuji.manual）动作白名单：只开放运动/笔/步距/回原点。
+ * set_origin 重写工作原点、unlock/motor_off/reset 属维护动作，误触发代价高，
+ * 仅保留屏幕入口；RequestManualControl 自身的全量白名单不受影响。
+ */
+inline constexpr const char* kVoiceManualActions[] = {
+    "pen_up", "pen_down", "jog_x+", "jog_x-", "jog_y+", "jog_y-",
+    "home", "jog_step_1", "jog_step_10"};
+
+inline bool IsVoiceAllowedAction(const std::string& action) {
+    for (const char* candidate : kVoiceManualActions) {
+        if (action == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
 
 /**
  * 控制页状态胶囊：Grbl 态 + 三轴。坐标非有限时打 `---`，避免把 NaN 画到屏上。

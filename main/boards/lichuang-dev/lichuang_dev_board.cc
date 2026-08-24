@@ -390,6 +390,24 @@ private:
             });
 
         mcp_server.AddTool(
+            "hutuji.manual",
+            "手动控制写字机轴运动，仅空闲可用。action 取值："
+            "\"jog_x+\"/\"jog_x-\"/\"jog_y+\"/\"jog_y-\" 按当前步距点动（步距用 "
+            "\"jog_step_1\"/\"jog_step_10\" 切 1mm/10mm）；\"pen_up\" 抬笔、"
+            "\"pen_down\" 落笔（落笔先做 Z0 校准，笔尖会碰纸）；\"home\" 回左下原点。"
+            "用户说「往左/右/前/后挪一点」「抬笔/落笔」「回原点」「步距调大/调小」时用。"
+            "返回 started 表示已开始执行，完成后设备会播报；正忙或未连接返回 error。"
+            "set_origin/unlock/motor_off/reset 是维护动作，语音不开放。",
+            PropertyList({Property("action", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string action = properties["action"].value<std::string>();
+                if (!hutuji::IsVoiceAllowedAction(action)) {
+                    return std::string("{\"error\":\"语音不开放该手动动作\"}");
+                }
+                return hutuji::Job::GetInstance().RequestManualControl(action);
+            });
+
+        mcp_server.AddTool(
             "hutuji.sing",
             "播放歌曲：url 是云端 hutuji_sing 返回的歌曲地址，title 是歌名。"
             "只放歌不碰写字机；下载完成后自动开始唱，唱完自动停。"

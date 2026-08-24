@@ -2673,6 +2673,52 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self._compile_and_run(compiler, source, stem="hutuji_decide_jog_test")
 
+    def test_voice_manual_tool_whitelist(self):
+        """语音手动控制白名单：维护动作（set_origin/unlock/motor_off/reset）不开放。
+
+        hutuji.manual 把 RequestManualControl 暴露给云端 LLM；工具层必须先过
+        IsVoiceAllowedAction 再进 RequestManualControl——RequestManualControl
+        自身全量白名单含维护动作，语音误触 set_origin/unlock/motor_off/reset
+        代价高（重写工作原点/失能/软复位），仅保留屏幕入口。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include <cassert>
+            #include <string>
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            int main() {
+                using namespace hutuji;
+                // 运动/笔/步距/回原点：放行。
+                for (const char* a : {"pen_up", "pen_down", "jog_x+", "jog_x-",
+                                      "jog_y+", "jog_y-", "home", "jog_step_1",
+                                      "jog_step_10"}) {
+                    assert(IsVoiceAllowedAction(a));
+                }
+                // 维护动作与未知/大小写变体：一律拒绝。
+                for (const char* a : {"set_origin", "unlock", "motor_off", "reset",
+                                      "", "jog_z+", "JOG_X+", "jog_x"}) {
+                    assert(!IsVoiceAllowedAction(a));
+                }
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_voice_manual_test")
+        # 双板工具都必须先过白名单再进 RequestManualControl（防 LLM 越权传维护动作）。
+        for board_rel in (
+            "main/boards/lichuang-dev/lichuang_dev_board.cc",
+            "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc",
+        ):
+            body = (ROOT / board_rel).read_text(encoding="utf-8")
+            self.assertIn('"hutuji.manual"', body)
+            self.assertIn("IsVoiceAllowedAction", body)
+            self.assertIn("RequestManualControl", body)
+
     def test_manual_control_wired_through_board_and_ui(self):
         """board 统一转发 action 字符串；UI 抽屉手动区按钮仅 settled 态可用。"""
         board = (
