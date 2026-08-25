@@ -872,6 +872,46 @@ std::string Job::RequestManualControl(const std::string& action) {
             busy_.store(false);
             return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
         }
+        // 点动同步预检（2026-08-25 实机 HIL 实证）：越界若只在 ManualTask 里拦，
+        // 工具早已回 "started"，失败只进 notify，LLM 会把拒绝播报成「已经往左挪啦」。
+        // 此处与任务内用同一份新鲜坐标 + 同一个 DecideJog（同源 core，改一处即两处）
+        // 先判一次，越界/坐标不可信直接以返回值回 LLM；任务内判定保留作纵深防御。
+        // 阻塞上界 kJogFreshStateTimeoutMs，MCP 工具线程可接受（语音链路本就秒级）。
+        if (action.rfind("jog_x", 0) == 0 || action.rfind("jog_y", 0) == 0) {
+            const float pre_step = GetJogStepMm();
+            const float pre_dx =
+                action == "jog_x+" ? pre_step : (action == "jog_x-" ? -pre_step : 0.0f);
+            const float pre_dy =
+                action == "jog_y+" ? pre_step : (action == "jog_y-" ? -pre_step : 0.0f);
+            StartPerformanceHold();
+            const bool fresh = QueryAndWaitFreshMachineState(kJogFreshStateTimeoutMs);
+            float mx = 0, my = 0, mz = 0;
+            if (fresh) {
+                pipe.GetMachinePos(mx, my, mz);
+            }
+            const hutuji::JogVerdict verdict =
+                fresh ? hutuji::DecideJog(mx, my, pre_dx, pre_dy)
+                      : hutuji::JogVerdict::kStalePosition;
+            StopPerformanceHold();
+            if (verdict != hutuji::JogVerdict::kOk) {
+                busy_.store(false);
+                if (verdict == hutuji::JogVerdict::kOutOfBounds) {
+                    const char* dir = action == "jog_x+"   ? "右"
+                                      : action == "jog_x-" ? "左"
+                                      : action == "jog_y+" ? "前"
+                                                           : "后";
+                    const float limit = pre_dx != 0 ? hutuji::kJogEnvelopeMaxXMm
+                                                    : hutuji::kJogEnvelopeMaxYMm;
+                    char reason[128];
+                    snprintf(reason, sizeof(reason),
+                             "{\"error\":\"点动越界：当前位置 X%.1f Y%.1f，向%s走 %.0f "
+                             "毫米会超出 %.0f 毫米行程限位，已拒绝\"}",
+                             mx, my, dir, pre_step, limit);
+                    return std::string(reason);
+                }
+                return "{\"error\":\"未能取到可信坐标，已拒绝点动以保安全，请稍后再试\"}";
+            }
+        }
         abort_requested_.store(false);
         pending_manual_action_ = action;
         SetState("manual");

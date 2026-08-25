@@ -2727,6 +2727,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("manual_pen_down_latched_", job_h)
         self.assertIn('action == "pen_down" && manual_pen_down_latched_.load()', job_cc)
         self.assertIn("已处于落笔状态", job_cc)
+        # 点动同步预检接线（2026-08-25 实机 HIL：越界只在 ManualTask 里拦时工具已回
+        # "started"，LLM 会把拒绝播报成「已经往左挪啦」）。预检必须在任务派发前以
+        # 同一 DecideJog 裁决，越界/坐标不可信以工具返回值直述失败。
+        self.assertIn("点动同步预检", job_cc)
+        self.assertIn("hutuji::DecideJog(mx, my, pre_dx, pre_dy)", job_cc)
+        self.assertIn("点动越界：当前位置", job_cc)
+        self.assertIn("未能取到可信坐标，已拒绝点动", job_cc)
 
     def test_manual_control_wired_through_board_and_ui(self):
         """board 统一转发 action 字符串；UI 抽屉手动区按钮仅 settled 态可用。"""
