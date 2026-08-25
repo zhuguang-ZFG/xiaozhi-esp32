@@ -1732,7 +1732,18 @@ void Job::UpdateDisplayProgress() {
         int pct = lines_total_ > 0 ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
         snprintf(buf, sizeof(buf), "画画中 %d%%  (%zu/%zu)", pct, lines_sent_, lines_total_);
     }
-    display->SetStatus(buf);
+    // 灌流路径零 UI 阻塞（半墨根治，2026-08-25）：SetStatus 要拿 LVGL 显示锁，
+    // 主任务渲染 Grobot 全脸动画时整帧持锁（TTS 播报期帧连帧），灌流任务在锁上
+    // 停摆实测 230–640ms（证据 hub results/local-only/2026-08-25/tree-redraw-com14.log：
+    // 10 次落笔期空窗，树冠/框左缘微段区无墨）→ Grbl planner 排空 → $1=25 失能
+    // → 弹簧抬笔（PreparePenOrigin 注释同款设计行为）→ 后续笔画无墨。250ms 节流
+    // 只降频率救不了单次锁等待，故 UI 变更按仓规走 Application::Schedule 回主任务
+    // 执行：灌流任务只付互斥入队成本（µs 级），锁等待发生在主任务自身（同线程
+    // LVGL，无竞争）。display 为 Board 单例所有，寿命覆盖队列延迟；text 按值捕获
+    // 免悬垂；lambda 不捕 this，任务结束后迟到执行也无害。
+    std::string text(buf);
+    Application::GetInstance().Schedule(
+        [display, text]() { display->SetStatus(text.c_str()); });
 }
 
 bool Job::WaitWhilePaused() {
@@ -2751,11 +2762,13 @@ bool Job::StreamToGrbl() {
             c_line.pop_front();
             ++lines_sent_;
 
-            // 进度屏显 250ms 节流：每 ok 一次的 SetStatus 会阻塞灌流循环
-            // （waveshare LCD LVGL 屏刷实证 ~60ms/行——2026-08-24 插桩测量 68.8s/1151 行，
-            // 证据 results/local-only/2026-08-24/hil-instr-cat-com14-v4.log 在本机；
-            // 喂流 66ms/行 → 超 $1=25ms 失能 → 弹簧弹笔 → 不落笔）。屏显只反映节奏，
-            // 不收 ok 的账；播报 5s 节流不变。
+            // 进度屏显 250ms 节流：UpdateDisplayProgress 已走 Application::Schedule
+            // 回主任务（见该函数注释，灌流路径零 UI 阻塞），节流保留为的是约束
+            // 主任务队列流量（≤4 条/秒）。历史：2026-08-24 插桩实证每 ok 一次的
+            // SetStatus 在 LVGL 锁上阻塞 ~60ms/行（68.8s/1151 行，证据
+            // results/local-only/2026-08-24/hil-instr-cat-com14-v4.log 在本机），
+            // 当时只节流未出灌流路径，lichuang 全脸动画下单次锁等待仍达
+            // 230–640ms（2026-08-25 tree-redraw-com14.log），半墨由此复发。
             TickType_t display_now = xTaskGetTickCount();
             if ((display_now - last_display_tick) >= pdMS_TO_TICKS(250)) {
                 last_display_tick = display_now;
