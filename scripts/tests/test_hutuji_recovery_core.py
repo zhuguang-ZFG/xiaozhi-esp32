@@ -1313,6 +1313,27 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         publish_at = run_body.index('SetState("error")', reset_at)
         self.assertLess(reset_at, publish_at)
 
+    def test_stream_rejects_empty_sit_before_home_and_paper(self):
+        """2026-08-26：有归位+只换纸 = StreamToGrbl 曾对空 spans return true。
+
+        空坐路径：ParseLines 空或无 XY → 旧代码 return true → WaitForIdle →
+        ReturnHomeAfterDraw → ChangePaperAfterDraw，用户看到归位换纸却从未灌线。
+        必须在开窗前 fail closed；灌流结束 lines_sent_==0 再闸一道。
+        """
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        start = source.index("bool Job::StreamToGrbl()")
+        body = source[start : source.index("}  // namespace hutuji", start)]
+        self.assertIn("拒绝空坐出图", body)
+        self.assertIn("xy_moves == 0", body)
+        self.assertIn("lines_sent_ == 0", body)
+        # 空坐闸必须在 SetWindowed(true)/Active 开窗之前，避免空任务占住流控窗。
+        gate_at = body.index("拒绝空坐出图")
+        window_at = body.index("SetWindowed(true)")
+        self.assertLess(gate_at, window_at)
+        self.assertIn("灌流完成 lines_sent=", body)
+
     def test_waveshare_touch_wakes_power_save(self):
         """FT5x06 首次触摸应退出低亮度省电，同时保留 LVGL 原触摸分发。"""
         board = (

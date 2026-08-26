@@ -2398,6 +2398,26 @@ bool Job::StreamToGrbl() {
     TickType_t last_notify_tick = xTaskGetTickCount();
     TickType_t last_display_tick = xTaskGetTickCount();  // 屏显节流（与播报节流分列）
 
+    // 空坐闸（2026-08-26）：旧实现 spans 为空时直接 return true → WaitForIdle →
+    // 归位 → 换纸，用户体感「开始画只换纸、笔架动都没动」。云端零运动闸只拦
+    // 生成物，拦不住设备侧 buffer 空/解析空。无 XY 同行（纯 Z/模态）同样拒绝。
+    size_t xy_moves = 0;
+    for (const auto& sp : spans) {
+        const std::string_view sv = LineAt(sp);
+        float ignored = 0.0f;
+        if (ExtractGcodeWord(sv, 'X', ignored) || ExtractGcodeWord(sv, 'Y', ignored)) {
+            ++xy_moves;
+        }
+    }
+    if (spans.empty() || xy_moves == 0) {
+        last_error_ = spans.empty() ? "G-code 无有效行，拒绝空坐出图"
+                                    : "G-code 无 XY 运动，拒绝空坐出图";
+        ESP_LOGE(TAG, "%s (buffer_len=%zu spans=%zu)", last_error_.c_str(), buffer_len_,
+                 spans.size());
+        return false;
+    }
+    ESP_LOGI(TAG, "开始灌流 lines=%zu xy=%zu bytes=%zu", spans.size(), xy_moves, buffer_len_);
+
     // Idle→Active 发布与 abort 提交锁原子化；abort 已在校准/下载阶段收敛时不得再开窗。
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
@@ -2865,6 +2885,14 @@ bool Job::StreamToGrbl() {
         }
     }
 
+    // 双闸：解析有行但一行都没发出（异常早退漏标）同样不得装成「画完」。
+    if (lines_sent_ == 0) {
+        last_error_ = "灌流未发出任何行，拒绝空坐出图";
+        ESP_LOGE(TAG, "%s (lines_total=%zu)", last_error_.c_str(), lines_total_);
+        window_guard.MarkQuiesced();
+        return false;
+    }
+    ESP_LOGI(TAG, "灌流完成 lines_sent=%zu/%zu", lines_sent_, lines_total_);
     return true;
 }
 
