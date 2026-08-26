@@ -928,7 +928,10 @@ void LcdDisplay::EnsureMachineControlUi() {
         }
     }
     // 开机打印三钮恢复后的实际几何：命中归因依赖真实落点（08-26 距离分析
-    // 只能拿默认矩形凑，0/15 与 47/52px 脱靶无法归因——NVS 位不在日志里）。
+    // 只能拿默认矩形凑——按钮真实位在 NVS、日志里没有）。trig/wifi 用
+    // LV_SIZE_CONTENT 定宽，首帧布局前 get_width 是未决值（同文件 2271 行
+    // 先例：读内容宽前先 update_layout）。
+    lv_obj_update_layout(screen);
     ESP_LOGI(TAG, "Home buttons geom: talk(%d,%d %dx%d) trig(%d,%d %dx%d) wifi(%d,%d %dx%d)",
              lv_obj_get_x(voice_talk_btn_), lv_obj_get_y(voice_talk_btn_),
              lv_obj_get_width(voice_talk_btn_), lv_obj_get_height(voice_talk_btn_),
