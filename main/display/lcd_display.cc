@@ -708,10 +708,8 @@ void LcdDisplay::ShowDrawPreviewLoading() {
     }
     lv_obj_move_foreground(draw_preview_root_);
     lv_obj_remove_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN);
-    if (provisioning_qr_root_ != nullptr &&
-        !lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN)) {
-        lv_obj_move_foreground(provisioning_qr_root_);
-    }
+    // QR root 已在创建时挂到 lv_layer_top()（433 行），配网中弹预览也压不住
+    // 它——删掉腐根版的 move_foreground（advisory）。
 }
 
 void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::string& hint,
@@ -773,11 +771,8 @@ void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::st
     }
     lv_obj_move_foreground(draw_preview_root_);
     lv_obj_remove_flag(draw_preview_root_, LV_OBJ_FLAG_HIDDEN);
-    // 配网二维码优先级更高：配网中弹预览不得盖住二维码。
-    if (provisioning_qr_root_ != nullptr &&
-        !lv_obj_has_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN)) {
-        lv_obj_move_foreground(provisioning_qr_root_);
-    }
+    // QR root 已在创建时挂到 lv_layer_top()（433 行），配网中弹预览也压不住
+    // 它——删掉腐根版的 move_foreground（advisory）。
 }
 
 void LcdDisplay::HideDrawPreview() {
@@ -2164,13 +2159,9 @@ void LcdDisplay::SetupUI() {
 
     InitializeEmotionUi(screen, lvgl_theme, large_icon_font);
     EnsureMachineControlUi();
-    if (provisioning_qr_root_ != nullptr) {
-        lv_obj_move_foreground(provisioning_qr_root_);
-    }
+    // QR root 已在创建时挂到 lv_layer_top()（433 行），SetupUI 时无需再抬。
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
     // 主界面搭好后立刻盖上启动画面：π 播 3000ms（上游原值）再 500ms 交接给脸。
-    // 交接目标取 emoji_box_（Grobot 画布容器），淡入上浮的是脸本身，不动状态栏
-    // 与按钮——它们在 backdrop 底下，随 backdrop 一起淡出即自然露出。
     pi_splash_ = std::make_unique<HutujiPiSplash>();
     if (!pi_splash_->Start(screen, LV_HOR_RES, LV_VER_RES, emoji_box_)) {
         pi_splash_.reset();
@@ -2694,9 +2685,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
     EnsureMachineControlUi();
-    if (provisioning_qr_root_ != nullptr) {
-        lv_obj_move_foreground(provisioning_qr_root_);
-    }
+    // QR root 已在创建时挂到 lv_layer_top()（433 行），SetupUI 时无需再抬。
 }
 
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
