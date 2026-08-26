@@ -821,9 +821,12 @@ void LcdDisplay::EnsureMachineControlUi() {
     auto* theme = static_cast<LvglTheme*>(current_theme_);
     // 480x320 横屏布局（2026-08-20 美观改版，用户否决「三个大钮一排」）：
     // 主角/角落分层——「说话」是语音设备主动作，做成中下大圆钮（拇指区、
-    // 孩子看到就想按）；「绘图控制」「配网」是次要入口，退到右上角 48px 小
-    // 方钮。三个钮都保留按下跟随拖动，位置可挪。
-    const lv_coord_t corner_btn_size = 48;
+    // 孩子看到就想按）；「绘图控制」「配网」是次要入口，退到右上角小方钮。
+    // 三个钮都保留按下跟随拖动，位置可挪。角钮尺寸：56px 是本仓成文硬约束
+    // （本文件头注 CONSTRAINTS / PRODUCT.md:55「at least 56 px」/
+    // DESIGN.md:169），2026-08-20 改版降到 48px 属违规漂移；08-26 诊断日志
+    // 距离分析（脱靶 29-52px）亦证明 48px 不够，恢复 56。
+    const lv_coord_t corner_btn_size = 56;
     const lv_coord_t talk_diameter = 96;
     // 抽屉内按钮行高：主操作行 20% 屏高、其余 17%，56px 下限兜底（儿童命中面）。
     const lv_coord_t primary_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;

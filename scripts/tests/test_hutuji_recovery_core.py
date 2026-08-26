@@ -2179,11 +2179,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         ):
             self.assertIn(member, ui_body)
         self.assertIn("button_height < 56 ? 56 : button_height", ui_body)
-        # 默认视觉：说话大圆钮中下、触发/配网 48px 小方钮右上（2026-08-20 美观
-        # 改版，主角/角落分层）；对象采用 TOP_LEFT 坐标系，非 TOP_LEFT 对齐与
+        # 默认视觉：说话大圆钮中下、触发/配网 56px 小方钮右上（2026-08-20 美观
+        # 改版，主角/角落分层；56px 是 PRODUCT.md:55/DESIGN.md:169 成文下限，
+        # 2026-08-26 恢复合规）；对象采用 TOP_LEFT 坐标系，非 TOP_LEFT 对齐与
         # set_pos 增量混用会让 LVGL 坐标损坏、按钮飞出屏幕。
         self.assertIn("LV_ALIGN_TOP_LEFT", ui_body)
-        self.assertIn("const lv_coord_t corner_btn_size = 48;", ui_body)
+        self.assertIn("const lv_coord_t corner_btn_size = 56;", ui_body)
         self.assertIn("const lv_coord_t talk_diameter = 96;", ui_body)
         self.assertRegex(
             ui_body,
