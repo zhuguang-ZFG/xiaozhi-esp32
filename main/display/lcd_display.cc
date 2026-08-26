@@ -843,6 +843,10 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_clear_flag(voice_talk_btn_, LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_clear_flag(voice_talk_btn_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(voice_talk_btn_, LV_OBJ_FLAG_PRESS_LOCK);
+    // 08-26 诊断日志距离分析：用户点按距钮心 29-52px 全脱靶（48px 钮半径
+    // 仅 24px），360ms 钮心直击才响应——命中几何是主变量，非事件丢失。扩展
+    // 点击区不改视觉；talk 孤立居中可给 12px。
+    lv_obj_set_ext_click_area(voice_talk_btn_, 12);
     lv_obj_set_style_radius(voice_talk_btn_, talk_diameter / 2, 0);
     lv_obj_set_style_bg_color(voice_talk_btn_, theme->accent_color(), 0);
     lv_obj_set_style_bg_opa(voice_talk_btn_, LV_OPA_COVER, 0);
@@ -870,6 +874,8 @@ void LcdDisplay::EnsureMachineControlUi() {
     // 拖动时持续锁定最初命中的按钮；按钮本身不参与 LVGL 滚动判定。
     lv_obj_clear_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_PRESS_LOCK);
+    // 角钮间距约 20px，ext 8px 双侧不重叠（12px 会互相越界抢事件）。
+    lv_obj_set_ext_click_area(machine_control_trigger_btn_, 8);
     lv_obj_set_style_radius(machine_control_trigger_btn_, 12, 0);
     lv_obj_set_style_bg_color(machine_control_trigger_btn_, theme->accent_color(), 0);
     lv_obj_set_style_bg_opa(machine_control_trigger_btn_, LV_OPA_COVER, 0);
@@ -893,6 +899,7 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_clear_flag(wifi_config_btn_, LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_clear_flag(wifi_config_btn_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(wifi_config_btn_, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_set_ext_click_area(wifi_config_btn_, 8);
     lv_obj_set_style_radius(wifi_config_btn_, 12, 0);
     lv_obj_set_style_bg_color(wifi_config_btn_, theme->accent_color(), 0);
     lv_obj_set_style_bg_opa(wifi_config_btn_, LV_OPA_COVER, 0);
