@@ -427,7 +427,10 @@ void LcdDisplay::EnsureProvisioningQrUi() {
     }
 
     auto* theme = static_cast<LvglTheme*>(current_theme_);
-    provisioning_qr_root_ = lv_obj_create(lv_screen_active());
+    // 挂到 lv_layer_top()：顶层永远在所有 screen 子对象之上（抽屉、预览、
+    // 按钮），之后任何显式抬层路径都不再需要 move_foreground——advisory
+    // 指出的 per-callsite 补丁会腐根，此一次创建即终结。
+    provisioning_qr_root_ = lv_obj_create(lv_layer_top());
     lv_obj_set_size(provisioning_qr_root_, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_style_radius(provisioning_qr_root_, 0, 0);
     lv_obj_set_style_border_width(provisioning_qr_root_, 0, 0);
@@ -519,7 +522,8 @@ void LcdDisplay::ShowProvisioningQr(const std::string& payload, const std::strin
     } else {
         lv_obj_add_flag(provisioning_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
     }
-    lv_obj_move_foreground(provisioning_qr_root_);
+    // QR root 已在创建时挂到 lv_layer_top()（433 行），永远在所有 screen
+    // 子对象之上，不再需 move_foreground——advisory：per-callsite 补丁会腐根。
     lv_obj_remove_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
 }
 
