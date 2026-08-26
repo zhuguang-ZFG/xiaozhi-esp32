@@ -1296,6 +1296,12 @@ void LcdDisplay::EnsureMachineControlUi() {
                         // 不必每次重开「点动·手动」；开机默认折叠仍在创建处 :878。
                         self->ApplyMachineControlState();
                         lv_obj_move_foreground(self->machine_control_root_);
+                        // 配网 QR 页与抽屉共存时，QR 关闭钮必须在抽屉之上：08-26
+                        // 用户点「关闭」无反应根因是抽屉抬到顶层后把点击吃了。
+                        if (self->provisioning_qr_root_ != nullptr &&
+                            !lv_obj_has_flag(self->provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN)) {
+                            lv_obj_move_foreground(self->provisioning_qr_root_);
+                        }
                         lv_obj_remove_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
                     } else {
                         // 布局记忆：真拖动才写 NVS（点按开抽屉不擦写 flash）。
