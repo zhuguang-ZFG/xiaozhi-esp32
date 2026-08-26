@@ -2191,8 +2191,13 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             r"LV_HOR_RES - 90 - theme->spacing\(3\),\s*theme->spacing\(3\)\);",
         )
         trigger_setup = ui_body[: ui_body.index("lv_obj_add_event_cb")]
-        self.assertNotIn("lv_obj_get_width(machine_control_trigger_btn_)", trigger_setup)
-        self.assertNotIn("lv_obj_get_height(machine_control_trigger_btn_)", trigger_setup)
+        # 守卫意图：禁止 get_width/height 喂进 set_pos 增量算坐标（TOP_LEFT 对齐
+        # 下会坐标损坏、按钮飞屏）。开机几何日志（ESP_LOGI 诊断读取）不在此列，
+        # 2026-08-26 加入——命中归因依赖真实落点可观测。
+        self.assertNotRegex(
+            trigger_setup,
+            r"set_pos\([^)]*lv_obj_get_(width|height)\(machine_control_trigger_btn_",
+        )
         self.assertIn("LV_EVENT_PRESSING", ui_body)
         self.assertIn("LV_EVENT_RELEASED", ui_body)
         self.assertIn("lv_event_get_indev(e)", ui_body)

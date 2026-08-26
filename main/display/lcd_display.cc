@@ -927,6 +927,16 @@ void LcdDisplay::EnsureMachineControlUi() {
             lv_obj_set_pos(wifi_config_btn_, saved_x, saved_y);
         }
     }
+    // 开机打印三钮恢复后的实际几何：命中归因依赖真实落点（08-26 距离分析
+    // 只能拿默认矩形凑，0/15 与 47/52px 脱靶无法归因——NVS 位不在日志里）。
+    ESP_LOGI(TAG, "Home buttons geom: talk(%d,%d %dx%d) trig(%d,%d %dx%d) wifi(%d,%d %dx%d)",
+             lv_obj_get_x(voice_talk_btn_), lv_obj_get_y(voice_talk_btn_),
+             lv_obj_get_width(voice_talk_btn_), lv_obj_get_height(voice_talk_btn_),
+             lv_obj_get_x(machine_control_trigger_btn_), lv_obj_get_y(machine_control_trigger_btn_),
+             lv_obj_get_width(machine_control_trigger_btn_),
+             lv_obj_get_height(machine_control_trigger_btn_), lv_obj_get_x(wifi_config_btn_),
+             lv_obj_get_y(wifi_config_btn_), lv_obj_get_width(wifi_config_btn_),
+             lv_obj_get_height(wifi_config_btn_));
 
     // 抽屉：暗场压底 + 居中纸感面板；点遮罩空白处收起（保留原有语义）。
     machine_control_root_ = lv_obj_create(screen);
