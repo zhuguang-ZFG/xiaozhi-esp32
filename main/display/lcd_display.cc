@@ -254,7 +254,12 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
 
     ESP_LOGI(TAG, "Initialize LVGL port");
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    port_cfg.task_priority = 1;
+    // 上游 2025-03 遗留的 priority=1 低于组件默认 4：audio_output(4)/opus_codec(2)
+    // 不绑核，会落到核 1 抢占 taskLVGL——拖动按钮时 PRESSING 事件与重绘被音频
+    // 任务反复插队，用户体感「拖动不跟手」（2026-08-26 取证，芯片层三轮调参后
+    // 已排除）。抬回组件默认 4，与 audio_output 同级靠时间片轮转，I2S DMA 喂
+    // 数据每次唤醒工作量小，无欠载风险；上游其他板（EmoteDisplay）甚至用 5。
+    port_cfg.task_priority = 4;
 #if CONFIG_SOC_CPU_CORES_NUM > 1
     port_cfg.task_affinity = 1;
 #endif
@@ -1943,6 +1948,16 @@ void LcdDisplay::SetGrobotSubtitle(const char* content) {
 #if CONFIG_HUTUJI_GROBOT_FACE
 void LcdDisplay::AccentDriftTimerCb(lv_timer_t* timer) {
     auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
+    // 触摸按下/拖动期间整帧跳过：色相呼吸（4 钮底色）+ 大圆钮阴影脉动每
+    // 100ms 制造一轮无效化重绘，拖动重绘排在动画帧后面加剧「不跟手」。
+    // 2026-08-26 取证：芯片层已排除（10ms 极速轻点全捕获），丢失在 UI 渲染链。
+    for (lv_indev_t* indev = lv_indev_get_next(nullptr); indev != nullptr;
+         indev = lv_indev_get_next(indev)) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER &&
+            lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
+            return;
+        }
+    }
     // 8s 正弦绕 π 品牌中段（0.50）±0.10：明显可辨的色相呼吸，不出品牌色带。
     const uint32_t tick = lv_tick_get();
     const float drift = 0.10f * sinf((float)(tick % 8000) / 8000.0f * 6.2832f);
