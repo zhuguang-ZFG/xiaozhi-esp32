@@ -1450,6 +1450,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         for fn, next_symbol in (
             ("bool Job::ChangePaperAfterDraw()", "\n}\n\nstd::vector<Job::LineSpan>"),
             ("bool Job::RecoverDisconnectedDraw()", "\nbool Job::ReturnHomeAfterDraw()"),
+            # 第三处：Z0 校准等待环（作业起点固件自动换纸窗口，2026-08-27 实机实锤
+            # ok 迟到 8s）——同款 RAII，析构行是唯一复位点。
+            ("bool Job::PreparePenOrigin()", "\nbool Job::QueryAndWaitFreshMachineState"),
         ):
             start = source.index(fn)
             body = source[start : source.index(next_symbol, start)]
@@ -1462,9 +1465,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 self.assertIn("~BlockingGuard()", resets[0])
                 self.assertEqual(body.count("SetExpectBlockingPeer(true)"), 1)
 
-        # Run() 收尾那一处是任务级兜底（不在这两个函数体内），保持原样：全文件恰好
-        # 三处 RAII 析构 + 一处收尾兜底，多出任何手工复位都说明又开了新出口。
-        self.assertEqual(source.count("SetExpectBlockingPeer(false)"), 4)
+        # Run() 收尾那一处是任务级兜底（不在这三个函数体内），保持原样：全文件恰好
+        # 四处 RAII 析构 + 一处收尾兜底，多出任何手工复位都说明又开了新出口。
+        self.assertEqual(source.count("SetExpectBlockingPeer(false)"), 5)
 
     def test_describe_transfer_failure_mapping(self):
         """R21-F03：下载/校验失败的用户面话术——404 引导重新生成（TTL 过期是正常
@@ -1519,8 +1522,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertLess(tail_break, failed)
 
     def test_paper_change_notify_is_once_gated(self):
-        """R21-F01：换纸播报两个入口（文件内换纸行 / 页尾与恢复的 ChangePaperAfterDraw）
-        共用 paper_change_notified_ 门控，整张任务只播一次；门控随 Run() 复位。"""
+        """R21-F01：换纸播报三个入口（文件内换纸行 / 页尾与恢复的 ChangePaperAfterDraw /
+        Z0 校准的固件自动换纸等待窗）共用 paper_change_notified_ 门控，整张任务只播一次；
+        门控随 Run() 复位。"""
         source = (
             ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
         ).read_text(encoding="utf-8")
@@ -1530,10 +1534,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("paper_change_notified_ = false;", run_body)
 
         announces = source.count('Notify("正在换纸，请稍候")')
-        self.assertEqual(announces, 2)  # 恰好两个入口，文案一致
+        self.assertEqual(announces, 3)  # 恰好三个入口，文案一致
         gates = source.count("if (!paper_change_notified_)")
-        self.assertEqual(gates, 2)  # 两个入口都在门控内
-        self.assertEqual(source.count("paper_change_notified_ = true;"), 2)
+        self.assertEqual(gates, 3)  # 三个入口都在门控内
+        self.assertEqual(source.count("paper_change_notified_ = true;"), 3)
 
     def test_pipe_transition_notify_wording(self):
         """R21-F04：状态转移播报去英文状态名/机器坐标/内网 IP；Run→Idle 与 Hold

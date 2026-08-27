@@ -67,6 +67,14 @@ constexpr uint32_t kPenSpringReturnMs = 100;
 constexpr uint32_t kReconnectReadyTimeoutMs = 2 * 60 * 1000;
 constexpr uint32_t kResetRecoveryTimeoutMs = 30000;
 constexpr uint32_t kPaperStatusTimeoutMs = 5000;
+// Z0 校准应答等待：固件会在作业开始前后自动换纸（M30/页尾归位/首页 G0X0Y0Z0/
+// M721/实体键/BT 连接），换纸期 Grbl 主循环阻塞，排在队尾的 G92 Z0 要等换纸跑完
+// 才执行并回 ok——2026-08-27 实机实锤 ok 迟到 8s，按 kPaperStatusTimeoutMs=5s 等
+// 已把整单杀死（用户面「说完开始画，换了个纸就没了」）。预算对齐换纸行
+// （kPaperOkTimeoutMs）：前 kZ0QuietWaitMs 静默（常态 ok 毫秒级），超过即按换纸
+// 对待：播报 + blocking 标记保 TCP，1s 分段保持 abort 可响应。
+constexpr uint32_t kZ0QuietWaitMs = 6000;
+constexpr uint32_t kZ0WaitSliceMs = 1000;
 constexpr int kDeferredMaxRetries = 8;
 constexpr int kDisconnectReplayMaxRetries = 2;
 // 暂停上限：超过则自动放弃，避免 busy_ 被无限期占用导致所有工具返回 busy。
@@ -889,9 +897,8 @@ std::string Job::RequestManualControl(const std::string& action) {
             if (fresh) {
                 pipe.GetMachinePos(mx, my, mz);
             }
-            const hutuji::JogVerdict verdict =
-                fresh ? hutuji::DecideJog(mx, my, pre_dx, pre_dy)
-                      : hutuji::JogVerdict::kStalePosition;
+            const hutuji::JogVerdict verdict = fresh ? hutuji::DecideJog(mx, my, pre_dx, pre_dy)
+                                                     : hutuji::JogVerdict::kStalePosition;
             StopPerformanceHold();
             if (verdict != hutuji::JogVerdict::kOk) {
                 busy_.store(false);
@@ -900,8 +907,8 @@ std::string Job::RequestManualControl(const std::string& action) {
                                       : action == "jog_x-" ? "左"
                                       : action == "jog_y+" ? "前"
                                                            : "后";
-                    const float limit = pre_dx != 0 ? hutuji::kJogEnvelopeMaxXMm
-                                                    : hutuji::kJogEnvelopeMaxYMm;
+                    const float limit =
+                        pre_dx != 0 ? hutuji::kJogEnvelopeMaxXMm : hutuji::kJogEnvelopeMaxYMm;
                     char reason[128];
                     snprintf(reason, sizeof(reason),
                              "{\"error\":\"点动越界：当前位置 X%.1f Y%.1f，向%s走 %.0f "
@@ -1782,8 +1789,7 @@ void Job::UpdateDisplayProgress() {
     // LVGL，无竞争）。display 为 Board 单例所有，寿命覆盖队列延迟；text 按值捕获
     // 免悬垂；lambda 不捕 this，任务结束后迟到执行也无害。
     std::string text(buf);
-    Application::GetInstance().Schedule(
-        [display, text]() { display->SetStatus(text.c_str()); });
+    Application::GetInstance().Schedule([display, text]() { display->SetStatus(text.c_str()); });
 }
 
 bool Job::WaitWhilePaused() {
@@ -1899,7 +1905,64 @@ bool Job::PreparePenOrigin() {
         } prepare_guard{stream_mutex_, stream_quiescence_};
 
         int error_code = -1;
-        const WaitResult wr = pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &error_code);
+        // 固件自动换纸会阻塞 Grbl 主循环，排在队尾的 G92 Z0 要等换纸跑完才执行
+        // （2026-08-27 实机实锤 ok 迟到 8s，原 5s 上限先把整单杀死）。按换纸行同款
+        // 预算分段等，ok 随到随画。
+        WaitResult wr = WaitResult::Timeout;
+        bool wait_aborted = false;
+        bool paper_wait_notified = false;
+        const TickType_t z0_began = xTaskGetTickCount();
+        TickType_t last_wait_notify = z0_began;
+        uint32_t waited = 0;
+        pipe.SetExpectBlockingPeer(true);
+        struct BlockingGuard {
+            Pipe& p;
+            ~BlockingGuard() { p.SetExpectBlockingPeer(false); }
+        } blocking_guard{pipe};
+        while (waited < kPaperOkTimeoutMs) {
+            if (abort_requested_.load()) {
+                wait_aborted = true;
+                break;
+            }
+            if (!pipe.IsConnected() || !pipe.IsReady() ||
+                pipe.GetConnectionSequence() != stream_connection_seq_) {
+                break;
+            }
+            if (pipe.GetGrblState() == GrblState::Alarm) {
+                last_error_ =
+                    "Z0 校准时写字机报警 (ALARM:" + std::to_string(pipe.GetAlarmCode()) + ")";
+                return false;
+            }
+            const uint32_t step = (kPaperOkTimeoutMs - waited > kZ0WaitSliceMs)
+                                      ? kZ0WaitSliceMs
+                                      : (kPaperOkTimeoutMs - waited);
+            wr = pipe.WaitResponse(step, nullptr, &error_code);
+            if (wr != WaitResult::Timeout) {
+                break;
+            }
+            waited += step;
+            if (!paper_wait_notified && waited >= kZ0QuietWaitMs) {
+                paper_wait_notified = true;
+                last_wait_notify = xTaskGetTickCount();
+                // R21-F01 第三处入口：与换纸行/页尾 M30 共用 paper_change_notified_
+                // 门控，整张任务只播一次换纸话术（本站点是作业起点固件自动换纸窗口）。
+                if (!paper_change_notified_) {
+                    paper_change_notified_ = true;
+                    Notify("正在换纸，请稍候");
+                    if (auto* d = Board::GetInstance().GetDisplay()) {
+                        d->SetStatus("换纸中...");
+                    }
+                }
+            } else if (paper_wait_notified &&
+                       (xTaskGetTickCount() - last_wait_notify) >= pdMS_TO_TICKS(30000)) {
+                last_wait_notify = xTaskGetTickCount();
+                Notify("还在换纸，请稍候");
+            }
+        }
+        if (wait_aborted) {
+            last_error_ = "aborted";
+            return false;
+        }
         if (wr != WaitResult::Ok) {
             stream_disconnected_ = !pipe.IsConnected() || !pipe.IsReady() ||
                                    pipe.GetConnectionSequence() != stream_connection_seq_;
@@ -1913,6 +1976,10 @@ bool Job::PreparePenOrigin() {
             return false;
         }
         prepare_guard.quiesced = true;
+        if (paper_wait_notified) {
+            ESP_LOGI(TAG, "Z0 校准应答落在固件自动换纸窗口（等待 >%lu ms），继续出图",
+                     (unsigned long)waited);
+        }
         ESP_LOGI(TAG, "弹簧回位后已校准 G92 Z0");
         return true;
     }
@@ -2410,8 +2477,8 @@ bool Job::StreamToGrbl() {
         }
     }
     if (spans.empty() || xy_moves == 0) {
-        last_error_ = spans.empty() ? "G-code 无有效行，拒绝空坐出图"
-                                    : "G-code 无 XY 运动，拒绝空坐出图";
+        last_error_ =
+            spans.empty() ? "G-code 无有效行，拒绝空坐出图" : "G-code 无 XY 运动，拒绝空坐出图";
         ESP_LOGE(TAG, "%s (buffer_len=%zu spans=%zu)", last_error_.c_str(), buffer_len_,
                  spans.size());
         return false;
@@ -2840,10 +2907,15 @@ bool Job::StreamToGrbl() {
                 last_notify_tick = now;
                 // R21-F05：进度播报只留百分比——机器坐标/行号对最终用户是噪声
                 // （坐标仍在串口逐行日志可查）。5s 节流不变。
+                // 2026-08-27 半墨复发实锤：Notify 的 cJSON+MQTT/TLS 发布在灌流环内
+                // 同步执行，单次数百 ms（96% 那次撞 700ms 停顿）；planner 缓冲对
+                // ~2mm 碎段只顶 ~250ms，饿穿即 $1=25 失能→弹簧抬笔→整段丢墨。
+                // 与 e623aec 屏显同款处理：Schedule 回主任务，灌流环只付入队成本。
                 int pct = lines_total_ > 0 ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
                 char buf[64];
                 snprintf(buf, sizeof(buf), "出图进度: %d%%", pct);
-                Notify(buf);
+                std::string text(buf);
+                Application::GetInstance().Schedule([this, text]() { Notify(text); });
             }
         } else if (wr == WaitResult::Failed) {
             // error 只丢坏行；character-counting 已灌入 RX 的后续行仍会执行。
