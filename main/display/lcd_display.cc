@@ -1481,6 +1481,56 @@ void LcdDisplay::MachineHudTimerCb(lv_timer_t* timer) {
     self->ApplyMachineControlState();
 }
 
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+void LcdDisplay::EnsureGrblStatusDot(lv_obj_t* right_icons) {
+    if (right_icons == nullptr || grbl_dot_ != nullptr) {
+        return;
+    }
+    auto* dot_theme = static_cast<LvglTheme*>(current_theme_);
+    // 顶栏 Grbl 状态圆点：右图标组最左（静音/电池之前），12px 纯圆无边框。
+    // 初始灰=离线，首拍 timer（500ms）后按 Pipe 实况上色。
+    grbl_dot_ = lv_obj_create(right_icons);
+    lv_obj_set_size(grbl_dot_, 12, 12);
+    lv_obj_set_style_radius(grbl_dot_, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(grbl_dot_, 0, 0);
+    lv_obj_set_style_pad_all(grbl_dot_, 0, 0);
+    lv_obj_set_style_bg_color(grbl_dot_, dot_theme->muted_text_color(), 0);
+    lv_obj_set_style_bg_opa(grbl_dot_, LV_OPA_COVER, 0);
+    lv_obj_set_style_margin_right(grbl_dot_, dot_theme->spacing(2), 0);
+    lv_obj_remove_flag(grbl_dot_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(grbl_dot_, LV_OBJ_FLAG_CLICKABLE);
+    if (grbl_status_timer_ == nullptr) {
+        grbl_status_timer_ = lv_timer_create(GrblStatusTimerCb, 500, this);
+    }
+}
+
+void LcdDisplay::GrblStatusTimerCb(lv_timer_t* timer) {
+    auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
+    if (self == nullptr || self->grbl_dot_ == nullptr) {
+        return;
+    }
+    // 数据源与手动页 HUD 同源：Pipe 三个原子量，LVGL 线程直读无锁。
+    // 分级：2=在线就绪已授权（绿）、1=连上但未就绪/未授权（琥珀）、0=离线（灰）。
+    auto& dot_pipe = hutuji::Pipe::GetInstance();
+    int level = 0;
+    if (dot_pipe.IsConnected()) {
+        level = (dot_pipe.IsReady() && dot_pipe.IsAuthorized()) ? 2 : 1;
+    }
+    if (level == self->grbl_dot_level_) {
+        return;
+    }
+    self->grbl_dot_level_ = level;
+    auto* dot_theme = static_cast<LvglTheme*>(self->current_theme_);
+    lv_color_t dot_color = dot_theme->muted_text_color();
+    if (level == 2) {
+        dot_color = dot_theme->success_color();
+    } else if (level == 1) {
+        dot_color = dot_theme->warning_color();
+    }
+    lv_obj_set_style_bg_color(self->grbl_dot_, dot_color, 0);
+}
+#endif
+
 void LcdDisplay::ApplyMachineControlState() {
     if (machine_pause_btn_ == nullptr) {
         return;
@@ -1990,18 +2040,25 @@ void LcdDisplay::AccentDriftTimerCb(lv_timer_t* timer) {
     const uint32_t tick = lv_tick_get();
     const float drift = 0.10f * sinf((float)(tick % 8000) / 8000.0f * 6.2832f);
     const lv_color_t c = lv_color_hex(PiGradientHex(kPiBrandGradientT + drift));
+    // 聆听态：说话大圆钮与呼吸光晕整体切绿（与状态胶囊同色=「我在听，说吧」，
+    // 2026-08-28 用户决策）；其余 3 钮保持品牌 accent 漂移。触摸跳过帧后
+    // 下一帧自愈，不需要补偿写。
+    const lv_color_t talk_c =
+        self->status_listening_
+            ? static_cast<LvglTheme*>(self->current_theme_)->success_color()
+            : c;
     lv_obj_t* targets[] = {self->voice_talk_btn_, self->machine_control_trigger_btn_,
                            self->wifi_config_btn_, self->draw_preview_confirm_btn_};
     for (lv_obj_t* btn : targets) {
         if (btn != nullptr) {
-            lv_obj_set_style_bg_color(btn, c, 0);
+            lv_obj_set_style_bg_color(btn, btn == self->voice_talk_btn_ ? talk_c : c, 0);
         }
     }
     // 说话大圆钮再叠 2.5s 呼吸光晕：彩色阴影宽度/不透明度脉动，全屏视觉主角。
     if (self->voice_talk_btn_ != nullptr) {
         const float breath = 0.5f + 0.5f * sinf((float)(tick % 2500) / 2500.0f * 6.2832f);
         lv_obj_set_style_shadow_width(self->voice_talk_btn_, 24 + (int)(12.0f * breath), 0);
-        lv_obj_set_style_shadow_color(self->voice_talk_btn_, c, 0);
+        lv_obj_set_style_shadow_color(self->voice_talk_btn_, talk_c, 0);
         lv_obj_set_style_shadow_opa(self->voice_talk_btn_, (lv_opa_t)(60 + (int)(120.0f * breath)),
                                     0);
     }
@@ -2071,6 +2128,11 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_flow(right_icons, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(right_icons, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
+
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+    // 右图标组最左落 Grbl 状态圆点（静音/电池之前）。
+    EnsureGrblStatusDot(right_icons);
+#endif
 
     mute_label_ = lv_label_create(right_icons);
     lv_label_set_text(mute_label_, "");
@@ -2575,6 +2637,11 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_align(right_icons, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+    // 右图标组最左落 Grbl 状态圆点（静音/电池之前）。
+    EnsureGrblStatusDot(right_icons);
+#endif
+
     mute_label_ = lv_label_create(right_icons);
     lv_label_set_text(mute_label_, "");
     lv_obj_set_style_text_font(mute_label_, icon_font, 0);
@@ -2780,12 +2847,28 @@ void LcdDisplay::ClearChatMessages() {
 void LcdDisplay::SetStatus(const char* status) {
     LvglDisplay::SetStatus(status);
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    // 说话/聆听状态驱动全脸：说话嘴部开合+微弹跳、聆听瞳孔放大。
+    // 说话/聆听状态驱动全脸：说话嘴部开合+微弹跳、聆听瞳孔放大+3s 连续扫光。
     // 状态写入与 33ms LVGL timer 读取必须在同一显示锁内。
-    if (grobot_eyes_ != nullptr && status != nullptr) {
+    // 状态胶囊同步变色（2026-08-28 用户主诉：唤醒无感知）：聆听=绿（「我在听，说吧」）、
+    // 连接中=柔和色，其余回默认正文色；AccentDriftTimerCb 读 status_listening_ 给说话大圆钮同色。
+    if (status != nullptr) {
         DisplayLockGuard lock(this);
-        grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0);
-        grobot_eyes_->SetListening(std::strcmp(status, Lang::Strings::LISTENING) == 0);
+        const bool listening = std::strcmp(status, Lang::Strings::LISTENING) == 0;
+        if (grobot_eyes_ != nullptr) {
+            grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0);
+            grobot_eyes_->SetListening(listening);
+        }
+        status_listening_ = listening;
+        if (status_label_ != nullptr) {
+            auto* status_theme = static_cast<LvglTheme*>(current_theme_);
+            lv_color_t status_color = status_theme->text_color();
+            if (listening) {
+                status_color = status_theme->success_color();
+            } else if (std::strcmp(status, Lang::Strings::CONNECTING) == 0) {
+                status_color = status_theme->muted_text_color();
+            }
+            lv_obj_set_style_text_color(status_label_, status_color, 0);
+        }
     }
 #endif
 }

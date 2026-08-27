@@ -104,6 +104,15 @@ protected:
     lv_obj_t* machine_jog_step_10_btn_ = nullptr;
     lv_timer_t* machine_hud_timer_ = nullptr;
     static void MachineHudTimerCb(lv_timer_t* timer);
+    // 顶栏 Grbl 状态圆点（双 SetupUI 分支共用）：绿=在线就绪已授权、
+    // 琥珀=连上但未就绪/未授权、灰=离线；grbl_dot_level_ 缓存防重复写样式。
+    // status_listening_ 由 SetStatus 写、AccentDriftTimerCb 读（同在 LVGL 线程）。
+    lv_obj_t* grbl_dot_ = nullptr;
+    lv_timer_t* grbl_status_timer_ = nullptr;
+    int grbl_dot_level_ = -1;
+    bool status_listening_ = false;
+    void EnsureGrblStatusDot(lv_obj_t* right_icons);
+    static void GrblStatusTimerCb(lv_timer_t* timer);
     lv_obj_t* machine_manual_section_ = nullptr;
     lv_obj_t* machine_manual_toggle_btn_ = nullptr;
     lv_obj_t* machine_manual_toggle_label_ = nullptr;

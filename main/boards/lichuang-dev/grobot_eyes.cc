@@ -586,17 +586,19 @@ void GrobotEyes::Render() {
     // 1) 色相潮汐：基底相位 5s 正弦 ±0.22 持续往复，整脸彩虹永不静止；
     //    相位经钳制映射，极端相位只在两角形成渐变高原，无接缝。
     // 2) 高光扫脸：上游 shine 公式。说话 1.5s/周连续强扫（0.90），
+    //    聆听 3s/周连续扫（0.90，介于说话与空闲之间）——配合瞳孔放大 18%，
+    //    对话距离一眼可辨「已唤醒、在听」（2026-08-28 用户主诉：唤醒无感知）；
     //    空闲每 6s 扫 2s（0.85，接近上游峰值的亮带），sleepy 全停。
     float tide = 0.0f, shine_strength = 0.0f, shine_pos = -1.0f;
     if (mood_index_ != kSleepyMoodIndex) {
         tide = 0.22f * sinf((float)(last_frame_us_ % 5000000) / 5000000.0f * 6.2832f);
-        const int64_t period_us = speaking_ ? 1500000 : 6000000;
-        const float duty = speaking_ ? 1.0f : 0.34f;
+        const int64_t period_us = speaking_ ? 1500000 : (listening_ ? 3000000 : 6000000);
+        const float duty = (speaking_ || listening_) ? 1.0f : 0.34f;
         const float t01 = (float)(last_frame_us_ % period_us) / (float)period_us;
         if (t01 < duty) {
             // 从 -半宽扫到 1+半宽，进出都无残影。
             shine_pos = t01 / duty * (1.0f + 2.0f * kPiShineHalfWidth) - kPiShineHalfWidth;
-            shine_strength = speaking_ ? 0.90f : 0.85f;
+            shine_strength = (speaking_ || listening_) ? 0.90f : 0.85f;
         }
     }
     BuildShadeLut(mood_base_phase_ + tide, shine_strength, shine_pos);

@@ -1685,7 +1685,14 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         status_body = lcd_cc[status_start:status_end]
         self.assertIn("LvglDisplay::SetStatus(status);", status_body)
         self.assertIn("grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0)", status_body)
-        self.assertIn("grobot_eyes_->SetListening(std::strcmp(status, Lang::Strings::LISTENING) == 0)", status_body)
+        # 聆听判定收敛为局部布尔，SetListening 与胶囊变色/说话钮变色共用同一真值源
+        self.assertIn("const bool listening = std::strcmp(status, Lang::Strings::LISTENING) == 0;", status_body)
+        self.assertIn("grobot_eyes_->SetListening(listening)", status_body)
+        # 唤醒可见性（2026-08-28 用户主诉：唤醒无感知）：聆听=绿、连接中=柔和色；
+        # status_listening_ 缓存供 AccentDriftTimerCb 给说话大圆钮同色
+        self.assertIn("status_listening_ = listening;", status_body)
+        self.assertIn("status_theme->success_color()", status_body)
+        self.assertIn("status_theme->muted_text_color()", status_body)
         # 基类调用必须在眼睛驱动之前（状态栏文本不能被截掉）
         self.assertLess(
             status_body.index("LvglDisplay::SetStatus(status);"),
@@ -2070,8 +2077,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
     def test_grobot_face_shine_flows_and_accent_buttons_breathe(self):
         """脸的「活」= 色相潮汐（5s 正弦 ±0.22，钳制映射无接缝）+ 上游 shine 扫光
-        （说话 1.5s/周 0.90 连续扫、空闲 6s 周期占空 34%、sleepy 全停）；主屏 accent
-        按钮 8s ±0.10 呼吸，说话大圆钮叠 2.5s 光晕脉动，安全语义色不参与。"""
+        （说话 1.5s/周 0.90 连续扫、聆听 3s/周 0.90 连续扫——2026-08-28 唤醒无感知
+        主诉新增、空闲 6s 周期占空 34%、sleepy 全停）；主屏 accent 按钮 8s ±0.10
+        呼吸，说话大圆钮叠 2.5s 光晕脉动，安全语义色不参与；聆听时说话钮整钮切绿。"""
         eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(
             encoding="utf-8"
         )
@@ -2086,9 +2094,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("0.22f * sinf", eyes_cc)
         self.assertIn("PiGradientRgb(tc, shine_strength, shine_pos", eyes_cc)
         self.assertIn("kPiShineHalfWidth", eyes_cc)
-        self.assertIn("speaking_ ? 1500000 : 6000000", eyes_cc)
-        self.assertIn("speaking_ ? 1.0f : 0.34f", eyes_cc)
-        self.assertIn("speaking_ ? 0.90f : 0.85f", eyes_cc)
+        self.assertIn("speaking_ ? 1500000 : (listening_ ? 3000000 : 6000000)", eyes_cc)
+        self.assertIn("(speaking_ || listening_) ? 1.0f : 0.34f", eyes_cc)
+        self.assertIn("(speaking_ || listening_) ? 0.90f : 0.85f", eyes_cc)
         self.assertIn("mood_index_ != kSleepyMoodIndex", eyes_cc)
         self.assertIn("BuildShadeLut(mood_base_phase_ + tide", eyes_cc)
         # 按钮呼吸 + 说话钮光晕：只刷 accent 系，安全语义色恒定
@@ -2099,6 +2107,33 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("tick % 2500", lcd_cc)
         self.assertIn("lv_timer_create(AccentDriftTimerCb, 100, this)", lcd_cc)
         self.assertIn("lv_timer_delete(accent_drift_timer_)", lcd_cc)
+        # 聆听时说话大圆钮整钮切绿（读 SetStatus 写入的缓存，同在 LVGL 线程无锁）
+        self.assertIn("self->status_listening_", lcd_cc)
+        self.assertIn("btn == self->voice_talk_btn_ ? talk_c : c", lcd_cc)
+
+    def test_grbl_status_dot_on_topbar_three_levels(self):
+        """顶栏 Grbl 状态圆点（2026-08-28 用户主诉「不知道写字机在不在线」）：
+        绿=在线就绪已授权、琥珀=连上但未就绪/未授权、灰=离线；数据源与手动页 HUD
+        同源（Pipe 原子量），500ms timer 刷新，级别缓存防重复写样式。两份 SetupUI
+        分支（WeChat 与普通样式，Waveshare 与 lichuang 各编一份）都必须挂载——
+        漏一份等于某板型主屏永久无指示。"""
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        lcd_h = (ROOT / "main/display/lcd_display.h").read_text(encoding="utf-8")
+        self.assertIn("void LcdDisplay::EnsureGrblStatusDot(lv_obj_t* right_icons)", lcd_cc)
+        self.assertIn("void LcdDisplay::GrblStatusTimerCb(lv_timer_t* timer)", lcd_cc)
+        self.assertIn("lv_timer_create(GrblStatusTimerCb, 500, this)", lcd_cc)
+        # 三级判据与数据源
+        self.assertIn("dot_pipe.IsConnected()", lcd_cc)
+        self.assertIn("dot_pipe.IsReady() && dot_pipe.IsAuthorized()", lcd_cc)
+        self.assertIn("dot_theme->success_color()", lcd_cc)
+        self.assertIn("dot_theme->warning_color()", lcd_cc)
+        self.assertIn("dot_theme->muted_text_color()", lcd_cc)
+        # 双分支各挂一次（WeChat / 普通 SetupUI 的 right_icons）
+        self.assertEqual(lcd_cc.count("EnsureGrblStatusDot(right_icons);"), 2)
+        # 头文件字段：圆点/timer/级别缓存 + 聆听缓存
+        self.assertIn("lv_obj_t* grbl_dot_ = nullptr;", lcd_h)
+        self.assertIn("int grbl_dot_level_ = -1;", lcd_h)
+        self.assertIn("bool status_listening_ = false;", lcd_h)
 
     def test_production_board_registers_preview_confirm_tools(self):
         """产品板是 Waveshare：预览/确认必须在这块板上注册，否则真机走不到确认门。"""
