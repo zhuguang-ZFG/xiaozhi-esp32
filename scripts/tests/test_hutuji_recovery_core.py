@@ -2134,6 +2134,16 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("lv_obj_t* grbl_dot_ = nullptr;", lcd_h)
         self.assertIn("int grbl_dot_level_ = -1;", lcd_h)
         self.assertIn("bool status_listening_ = false;", lcd_h)
+        # z-order 回归（2026-08-28 刷机实锤「主屏看不到圆点/状态胶囊」）：WeChat
+        # 分支栏先建、460x300 整屏脸后建，脸把栏压住；InitializeEmotionUi 须在脸
+        # 定尺寸后把两栏抬到脸上（顶栏先从 container_ 改挂 screen——z-order 只在
+        # 兄弟间生效）
+        emo_start = lcd_cc.index("void LcdDisplay::InitializeEmotionUi")
+        emo_end = lcd_cc.index("void LcdDisplay::SetGrobotSubtitle", emo_start)
+        emo_body = lcd_cc[emo_start:emo_end]
+        self.assertIn("lv_obj_set_parent(top_bar_, screen)", emo_body)
+        self.assertIn("lv_obj_move_foreground(top_bar_)", emo_body)
+        self.assertIn("lv_obj_move_foreground(status_bar_)", emo_body)
 
     def test_production_board_registers_preview_confirm_tools(self):
         """产品板是 Waveshare：预览/确认必须在这块板上注册，否则真机走不到确认门。"""

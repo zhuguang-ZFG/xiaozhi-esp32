@@ -1974,6 +1974,19 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     constexpr int kFaceHeight = 190;
 #endif
     lv_obj_set_size(emoji_box_, kFaceWidth, kFaceHeight);
+    // 兑现上方「状态栏继续独立叠在最前层」：WeChat 分支的创建顺序是栏在前、脸在后，
+    // 460x300 整屏脸会把顶栏/状态胶囊压到不可见（普通分支栏在脸后创建，天然在上，
+    // 此处空指针跳过）。z-order 只在兄弟间生效——顶栏原是 container_ 子件，须先改挂
+    // screen 再抬；local style 随对象走，补显式对齐替代原 flex 定位。先顶栏后状态栏，
+    // 保持胶囊在顶栏之上的原叠序。
+    if (top_bar_ != nullptr) {
+        lv_obj_set_parent(top_bar_, screen);
+        lv_obj_align(top_bar_, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_move_foreground(top_bar_);
+    }
+    if (status_bar_ != nullptr) {
+        lv_obj_move_foreground(status_bar_);
+    }
     if (eyes->Init(emoji_box_, kFaceWidth, kFaceHeight)) {
         grobot_eyes_ = std::move(eyes);
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
