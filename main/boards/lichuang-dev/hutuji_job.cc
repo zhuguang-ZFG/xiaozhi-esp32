@@ -66,7 +66,7 @@ constexpr uint32_t kJogFreshStateTimeoutMs = 6000;
 constexpr int kMaxOkFallback = 3;
 // MPos 与在途行终点的比较容差（mm）。Grbl 报告保留 3 位小数。
 constexpr float kOkFallbackPosTolMm = 0.05f;
-// 本机 $1=25ms：Idle 后等待驱动失能和弹簧回到自然抬笔位，再声明 Z0。
+// 本机 $1=255（2026-08-28 机设）：任务期/闲置期电机保持通电（治虚实交替）；例外：M30 页尾强制失能 XYZ（Grbl GCode.cpp:1730/1785，刻意）。Idle 后等弹簧回到自然抬笔位再声明 Z0。
 constexpr uint32_t kPenSpringReturnMs = 100;
 constexpr uint32_t kReconnectReadyTimeoutMs = 2 * 60 * 1000;
 constexpr uint32_t kResetRecoveryTimeoutMs = 30000;
@@ -1916,7 +1916,7 @@ void Job::UpdateDisplayProgress() {
     // 灌流路径零 UI 阻塞（半墨根治，2026-08-25）：SetStatus 要拿 LVGL 显示锁，
     // 主任务渲染 Grobot 全脸动画时整帧持锁（TTS 播报期帧连帧），灌流任务在锁上
     // 停摆实测 230–640ms（证据 hub results/local-only/2026-08-25/tree-redraw-com14.log：
-    // 10 次落笔期空窗，树冠/框左缘微段区无墨）→ Grbl planner 排空 → $1=25 失能
+    // 10 次落笔期空窗，树冠/框左缘微段区无墨）→ Grbl planner 排空 →（$1=25 时代）失能
     // → 弹簧抬笔（PreparePenOrigin 注释同款设计行为）→ 后续笔画无墨。250ms 节流
     // 只降频率救不了单次锁等待，故 UI 变更按仓规走 Application::Schedule 回主任务
     // 执行：灌流任务只付互斥入队成本（µs 级），锁等待发生在主任务自身（同线程
@@ -1989,7 +1989,7 @@ bool Job::PreparePenOrigin() {
             return false;
         }
 
-        // `$1=25` 会在 Idle 25ms 后关闭驱动；再留足时间让弹簧回到自然抬笔位。
+        // `$1=255` 起闲置不自动失能（M30 页尾强制失能除外）；此处留的是弹簧物理回位时间（与 $1 无关）。
         vTaskDelay(pdMS_TO_TICKS(kPenSpringReturnMs));
         bool retry_after_pause = false;
         {
@@ -3074,7 +3074,7 @@ bool Job::StreamToGrbl() {
                 // （坐标仍在串口逐行日志可查）。5s 节流不变。
                 // 2026-08-27 半墨复发实锤：Notify 的 cJSON+MQTT/TLS 发布在灌流环内
                 // 同步执行，单次数百 ms（96% 那次撞 700ms 停顿）；planner 缓冲对
-                // ~2mm 碎段只顶 ~250ms，饿穿即 $1=25 失能→弹簧抬笔→整段丢墨。
+                // ~2mm 碎段只顶 ~250ms；$1=25 时代饿穿即失能→弹簧抬笔→整段丢墨（$1=255 已消灭此失效模式，注释留作历史机理）。
                 // 与 e623aec 屏显同款处理：Schedule 回主任务，灌流环只付入队成本。
                 int pct = lines_total_ > 0 ? static_cast<int>(lines_sent_ * 100 / lines_total_) : 0;
                 char buf[64];
