@@ -3281,6 +3281,13 @@ class AbortHomeAfterStopTest(unittest.TestCase):
         self.assertIn('"G1G90 Z0.0F10000"', drain)
         self.assertIn('"G1G90 X0Y0F8000"', drain)
         self.assertIn("GrblState::Hold", drain)  # Hold 先 `~`，清不动才回落 reset
+        # 2026-08-28 二轮 HIL 实证钉死：paused_（S3 冻结闸）必须先于 quiescence
+        # 等待清除——不清则流循环永停在收应答冻结、quiescence 永不发布、任务悬挂
+        # 且 abort 的 `~` 与归位行全被堵死。
+        self.assertLess(drain.index("paused_.store(false"),
+                        drain.index("CanResetAfterStream"))
+        # quiescence 超时必须兜底移交 reset 任务，不得静默悬挂
+        self.assertIn("return StartAbortResetTask();", drain)
         self.assertIn('"已停止并回原点"', job_cc)
         self.assertIn("abort_reset_owner_.Started() && !waited", job_cc)
         # StartDraw 复位标记

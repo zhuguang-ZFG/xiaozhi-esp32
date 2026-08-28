@@ -652,21 +652,16 @@ bool Job::PerformAbortDrainHome() {
     auto& pipe = Pipe::GetInstance();
     bool homed = false;
     do {
-        const TickType_t began = xTaskGetTickCount();
-        while (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire))) {
-            if (xTaskGetTickCount() - began > pdMS_TO_TICKS(kAbortDrainQuiescenceTimeoutMs)) {
-                break;
+        // 顺序关键（2026-08-28 二轮 HIL 实证）：paused_ 是 S3 侧冻结闸，不解它
+        // 流循环永远停在收应答冻结里、quiescence 永远不来；且 Hold 不消费行命令。
+        // 故先清 paused_ 解冻流循环（它会看到 abort_requested_ 而停喂收口），
+        // 再 `~` 退出 Grbl Hold 让残余在途段排空。
+        if (paused_.load(std::memory_order_acquire) || pipe.GetGrblState() == GrblState::Hold) {
+            {
+                std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+                paused_.store(false, std::memory_order_release);
             }
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        if (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire)) ||
-            !pipe.IsConnected()) {
-            break;
-        }
-        if (pipe.GetGrblState() == GrblState::Hold) {
-            // 先暂停后停止：Hold 不消费行命令，发 `~` 退出 Hold 让残余在途段
-            // 排空（用户已放弃本张，多画几笔无碍），随后与纯流式同序列。
-            // `~` 也清不动 Hold 的极端情形才回落 reset 路径。
+            SetStreamingOrPaused();
             if (!pipe.SendRealtime('~')) {
                 break;
             }
@@ -678,6 +673,18 @@ bool Job::PerformAbortDrainHome() {
             if (pipe.GetGrblState() == GrblState::Hold) {
                 return StartAbortResetTask();  // 移交：worker 旗标归 reset 任务收尾
             }
+        }
+        const TickType_t began = xTaskGetTickCount();
+        while (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire))) {
+            if (xTaskGetTickCount() - began > pdMS_TO_TICKS(kAbortDrainQuiescenceTimeoutMs)) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire)) ||
+            !pipe.IsConnected()) {
+            // 收口超时（如流循环卡死）：兜底移交受控 reset 路径而非悬挂任务。
+            return StartAbortResetTask();
         }
         if (!WaitForIdle(false, kAbortDrainIdleTimeoutMs)) {
             break;
