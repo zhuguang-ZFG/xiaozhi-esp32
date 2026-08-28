@@ -441,21 +441,11 @@ std::string Job::RequestAbort() {
             Notify("写字机正在换纸，无法即停；换纸完成后任务将停止");
             return JsonString("换纸中无法即停，完成后即停");
         }
-        // 2026-08-28 用户决策「停止后也要自己回原点」+ 当日两次 HIL 实证
-        // （abort 后 [ESP901] 无应答致 socket 崩 + 复位清坐标）：纯流式态改走
-        // 断流排空归位（不 `!` 不 reset，坐标不失效）；已 paused/Hold 态
-        // （Hold 不消费行命令）才回落既有受控 reset 路径（其内带快照归位）。
-        if (paused_.load() || Pipe::GetInstance().GetGrblState() == GrblState::Hold) {
-            if (!StartAbortResetTask()) {
-                abort_requested_.store(false);
-                // 回滚同样动纪元：旧候选至多被冤枉拒发一次重试，不会漏看后续提交。
-                stream_control_epoch_.store(
-                    NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
-                    std::memory_order_release);
-                return "{\"error\":\"无法创建 abort 恢复任务\"}";
-            }
-            return JsonString("ok");
-        }
+        // 2026-08-28 用户决策「停止后也要自己回原点」+ 当日 HIL 实证三连：
+        // ①reset 清坐标致归位空操作；②Hold 不消费行命令；③abort 后 [ESP901]
+        // 无应答 2/2 把 socket 打崩。故非换纸 abort 一律走断流排空归位：
+        // 不 `!` 不 reset；Hold 态在任务内先 `~` 退出（排空残余在途段）再走
+        // 同一序列；reset 只留错误恢复/暂停超时/[ESP901] 三连死的最后兜底。
         if (!StartAbortDrainHomeTask()) {
             abort_requested_.store(false);
             stream_control_epoch_.store(
@@ -674,7 +664,20 @@ bool Job::PerformAbortDrainHome() {
             break;
         }
         if (pipe.GetGrblState() == GrblState::Hold) {
-            return StartAbortResetTask();  // 移交：worker 旗标归 reset 任务收尾
+            // 先暂停后停止：Hold 不消费行命令，发 `~` 退出 Hold 让残余在途段
+            // 排空（用户已放弃本张，多画几笔无碍），随后与纯流式同序列。
+            // `~` 也清不动 Hold 的极端情形才回落 reset 路径。
+            if (!pipe.SendRealtime('~')) {
+                break;
+            }
+            const TickType_t hold_began = xTaskGetTickCount();
+            while (pipe.GetGrblState() == GrblState::Hold &&
+                   xTaskGetTickCount() - hold_began < pdMS_TO_TICKS(3000)) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (pipe.GetGrblState() == GrblState::Hold) {
+                return StartAbortResetTask();  // 移交：worker 旗标归 reset 任务收尾
+            }
         }
         if (!WaitForIdle(false, kAbortDrainIdleTimeoutMs)) {
             break;

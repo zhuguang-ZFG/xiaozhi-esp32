@@ -3267,13 +3267,20 @@ class AbortHomeAfterStopTest(unittest.TestCase):
         # ③纯流式走断流排空（不 `!` 不 reset，坐标不失效）；paused/Hold 才回落
         # reset 路径；④播报分流；⑤断流路径无 owner 时 Run 尾不得误判复位失败
         self.assertIn("StartAbortDrainHomeTask()", job_cc)
+        # 用户 abort 不再直接路由 reset 任务（reset 只剩错误恢复/暂停超时/兜底）
+        req_start = job_cc.index("std::string Job::RequestAbort()")
+        req = job_cc[req_start:job_cc.index("bool Job::StartAbortResetTask()", req_start)]
+        self.assertNotIn("StartAbortResetTask()", req)
         self.assertIn("bool Job::PerformAbortDrainHome()", job_cc)
         drain_start = job_cc.index("bool Job::PerformAbortDrainHome()")
         drain = job_cc[drain_start:job_cc.index("bool Job::WaitForAbortReset", drain_start)]
-        self.assertNotIn("SendRealtime", drain)  # 排空路径禁发 `!`/`?` 实时字符
+        # 排空路径实时字符只许 `~`（Hold 退出）；禁 `!`（feed hold）与 0x18 reset
+        import re as _re
+        realtime = _re.findall(r"SendRealtime\('(.?)'\)", drain)
+        self.assertEqual(realtime, ["~"])
         self.assertIn('"G1G90 Z0.0F10000"', drain)
         self.assertIn('"G1G90 X0Y0F8000"', drain)
-        self.assertIn("GrblState::Hold", drain)  # Hold 移交 reset 路径
+        self.assertIn("GrblState::Hold", drain)  # Hold 先 `~`，清不动才回落 reset
         self.assertIn('"已停止并回原点"', job_cc)
         self.assertIn("abort_reset_owner_.Started() && !waited", job_cc)
         # StartDraw 复位标记
