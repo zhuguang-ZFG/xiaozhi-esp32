@@ -340,6 +340,7 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     paused_.store(false);
     paper_active_.store(false);
     repeat_mode_.store(false);
+    abort_home_done_.store(false);
     buffer_replayable_.store(false);
     url_ = url;
     preview_url_ = preview_url;
@@ -456,7 +457,12 @@ bool Job::StartAbortResetTask() {
     BaseType_t created = xTaskCreate(
         [](void*) {
             auto& job = Job::GetInstance();
-            job.PerformAbortReset(true, true, false);
+            if (!job.PerformAbortReset(true, true, false)) {
+                // 连接层失败（如 socket 被对端打崩）时管道自动重连约 1s 即回；
+                // 给一次带 reconnect 宽限的重试，让「请断电重启」成为少数派终态。
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                job.PerformAbortReset(true, false, true);
+            }
             job.abort_reset_worker_active_.store(false, std::memory_order_release);
             vTaskDelete(nullptr);
         },
@@ -506,6 +512,7 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
         }
 
         bool stopped = false;
+        float hold_x = 0, hold_y = 0, hold_z = 0;
         uint32_t stopped_status_baseline = pipe.GetStatusReportSequence();
         while ((xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
             if (!pipe.IsConnected() || pipe.GetConnectionSequence() != session) {
@@ -524,6 +531,9 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
                 stopped_status_baseline = before_query;
                 stopped = true;
                 abort_hold_confirmed_.store(true, std::memory_order_release);
+                // 归位坐标快照必须在 reset 前取：pipe 每条状态报告都覆写 MPos，
+                // 复位后的 0,0 报告会冲掉这里的真位置（2026-08-28 advisory）。
+                pipe.GetMachinePos(hold_x, hold_y, hold_z);
                 break;
             }
         }
@@ -589,6 +599,11 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
         }
     } while (false);
 
+    if (success) {
+        // 2026-08-28 用户决策「停止后也要自己回原点」：归位失败不翻盘
+        // （机器已停稳是主结果），只分流尾态播报。
+        abort_home_done_.store(HomeAfterAbort(hold_x, hold_y), std::memory_order_release);
+    }
     if (!success) {
         pipe.CancelAbortReset();
         // 不解锁未知 Alarm。若普通 abort 未能完成受限 reset，只拆会话阻止继续写；
@@ -1675,7 +1690,7 @@ void Job::Run() {
         break;
     }
     if (abort_notify == 1) {
-        Notify("已停止");
+        Notify(abort_home_done_.load() ? "已停止并回原点" : "已停止");
     } else if (abort_notify == 2) {
         Notify("取消失败，写字机可能未停稳，请断电重启");
     }
@@ -2311,6 +2326,37 @@ bool Job::ReturnHomeAfterDraw() {
         return false;
     }
     ESP_LOGI(TAG, "页尾归位完成（G1 X0Y0，不触发换纸）");
+    return true;
+}
+
+bool Job::HomeAfterAbort(float hold_x, float hold_y) {
+    auto& pipe = Pipe::GetInstance();
+    // 受限 reset 已把 Grbl 坐标清零；坐标由调用方在 Hold 确认时快照传入
+    // （pipe 每条状态报告都覆写 MPos，函数内现读会拿到复位后的 0,0 假位置）。
+    char g92[64];
+    // Z0：复位后电机失能、弹簧已把笔物理抬回；声明 Z0 与页尾 PreparePenOrigin 同语义。
+    snprintf(g92, sizeof(g92), "G92 X%.3f Y%.3f Z0", (double)hold_x, (double)hold_y);
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (!pipe.SendLine(g92) || !pipe.SendLine("G1G90 X0Y0F8000")) {
+            last_error_ = "归位命令发送失败";
+            return false;
+        }
+    }
+    int err = -1;
+    // 两条命令各等一个 ok：G92 的 ok 先到，G1 的后到；WaitResponse 按序消费。
+    if (pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok ||
+        pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok) {
+        last_error_ = "归位应答超时或被拒 (error:" + std::to_string(err) + ")";
+        return false;
+    }
+    if (!WaitForIdle(false, kHomeIdleTimeoutMs)) {
+        if (last_error_.empty()) {
+            last_error_ = "归位后未确认写字机 Idle";
+        }
+        return false;
+    }
+    ESP_LOGI(TAG, "abort 归位完成（G92 复原 + G1 X0Y0）");
     return true;
 }
 

@@ -793,10 +793,21 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
         # 归位实现：发送的必须是 G1 形式的原点行，且函数内只有这一条发送。
         start = source.index("bool Job::ReturnHomeAfterDraw()")
-        end = source.index("bool Job::ChangePaperAfterDraw()", start)
+        end = source.index("bool Job::HomeAfterAbort(", start)
         body = source[start:end]
         homes = re.findall(r'pipe\.SendLine\("([^"]+)"\)', body)
         self.assertEqual(homes, ["G1G90 X0Y0F8000"])
+        # 2026-08-28 用户决策「停止后也要自己回原点」：abort 归位同样必须是 G1
+        # （G0 X0Y0 会触发换纸），且必须先 G92 复原 Hold 快照坐标再归位——复位后
+        # MPos 已被清成 0,0，缺了 G92 复原就是原地不动的假归位。
+        ab_start = end
+        ab_end = source.index("bool Job::ChangePaperAfterDraw()", ab_start)
+        ab_body = source[ab_start:ab_end]
+        ab_homes = re.findall(r'pipe\.SendLine\("([^"]+)"\)', ab_body)
+        self.assertEqual(ab_homes, ["G1G90 X0Y0F8000"])
+        self.assertIn("SendLine(g92)", ab_body)
+        self.assertLess(ab_body.index("SendLine(g92)"),
+                        ab_body.index('SendLine("G1G90 X0Y0F8000")'))
         # 归位必须「ok 后再 fresh Idle」：G1 的 ok 只表示入 planner，缺了
         # WaitForIdle 就退化成靠 M30 内部 synchronize 的隐性顺序保证，abort 在
         # 归位/换纸两阶段之间没有真实决策点。
@@ -1512,7 +1523,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         body = source[start : source.index("\n}\n", start)]
 
         decided = body.index('"abort reset 恢复失败"')
-        stopped = body.index('Notify("已停止")')
+        stopped = body.index('"已停止并回原点"')
         failed = body.index("取消失败，写字机可能未停稳")
         self.assertLess(decided, stopped)
         self.assertLess(decided, failed)
@@ -3226,6 +3237,38 @@ class AbortScaffoldWavesharePortTest(unittest.TestCase):
         self.assertIn("CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5", cmake)
         guard_idx = cmake.index("HUTUJI_AUTO_TEST_ABORT_ON_PAPER is only supported")
         self.assertIn("waveshare-3.5", cmake[guard_idx:guard_idx + 90])
+
+
+
+class AbortHomeAfterStopTest(unittest.TestCase):
+    def test_abort_homes_with_hold_snapshot(self):
+        """2026-08-28 用户决策「停止后也要自己回原点」+ advisory 修正：
+        ①HomeAfterAbort 必须吃 Hold 时快照的 (x,y) 参数——pipe 每条状态报告都覆写
+        MPos，函数内现读会拿到复位后的 0,0 假位置（G92 X0 Y0 → G1 X0Y0 原地不动，
+        正好复刻「没回原点」）；②快照（GetMachinePos）必须在 PerformAbortReset 的
+        SendAbortReset 之前；③失败路径有一次 reconnect 宽限重试；④尾部播报按
+        abort_home_done_ 分流「已停止并回原点」。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        job_h = (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(encoding="utf-8")
+        self.assertIn("bool HomeAfterAbort(float hold_x, float hold_y);", job_h)
+        self.assertIn("std::atomic<bool> abort_home_done_{false};", job_h)
+        # ①函数体不得现读 MPos
+        body_start = job_cc.index("bool Job::HomeAfterAbort(float hold_x, float hold_y)")
+        body = job_cc[body_start:job_cc.index("\n}\n", body_start)]
+        self.assertNotIn("GetMachinePos", body)
+        self.assertIn('"G92 X%.3f Y%.3f Z0"', body)
+        self.assertIn('"G1G90 X0Y0F8000"', body)
+        # ②快照先于 SendAbortReset
+        perf_start = job_cc.index("bool Job::PerformAbortReset")
+        perf = job_cc[perf_start:job_cc.index("bool Job::WaitForAbortReset", perf_start)]
+        self.assertLess(perf.index("pipe.GetMachinePos(hold_x, hold_y, hold_z)"),
+                        perf.index("pipe.SendAbortReset("))
+        self.assertIn("abort_home_done_.store(HomeAfterAbort(hold_x, hold_y)", perf)
+        # ③重试与④播报分流
+        self.assertIn("job.PerformAbortReset(true, false, true)", job_cc)
+        self.assertIn('"已停止并回原点"', job_cc)
+        # StartDraw 复位标记
+        self.assertIn("abort_home_done_.store(false);", job_cc)
 
 
 if __name__ == "__main__":

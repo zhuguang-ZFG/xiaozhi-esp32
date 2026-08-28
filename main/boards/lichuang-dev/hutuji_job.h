@@ -127,6 +127,15 @@ private:
     bool QueryAndWaitFreshMachineState(uint32_t timeout_ms);
     /** 正常页尾专有：G1 归位（不触发换纸），随后才允许 ChangePaperAfterDraw。 */
     bool ReturnHomeAfterDraw();
+    /**
+     * abort 专有归位（2026-08-28 用户决策「停止后也要自己回原点」）：受限 reset 会
+     * 把 Grbl 坐标清零（物理笔架停在原处），且 pipe 每条状态报告都覆写 MPos——
+     * 故必须由调用方在 Hold 确认那一刻快照坐标传入，用 G92 复原后再
+     * G1G90 X0Y0F8000 回原点（G1 不触发换纸，与页尾归位同语义）。在函数内现读
+     * MPos 会拿到复位后的 0,0 假位置，禁止。仅限正常 abort 路径；
+     * paper_active 窗/试笔/预览取消不走这里。
+     */
+    bool HomeAfterAbort(float hold_x, float hold_y);
     bool ChangePaperAfterDraw();
     bool RecoverDisconnectedDraw();
     void ReleaseBuffer();
@@ -236,6 +245,8 @@ private:
     std::atomic<StreamQuiescence> stream_quiescence_{StreamQuiescence::Idle};
     // abort owner 已用 fresh Hold:0/Idle 证明机器停稳；流任务可丢弃旧应答并发布 Quiesced。
     std::atomic<bool> abort_hold_confirmed_{false};
+    // abort 归位完成标记（2026-08-28）：供 Run 尾部分流「已停止」/「已停止并回原点」。
+    std::atomic<bool> abort_home_done_{false};
     // character-counting 收到 error 后，Grbl RX 内后续行仍会继续执行。流线程先 `!`
     // 并退窗，Run 随后同步走受控 reset；reset 完成前不能发布 error 或释放 busy_。
     std::atomic<bool> stream_error_stop_required_{false};
