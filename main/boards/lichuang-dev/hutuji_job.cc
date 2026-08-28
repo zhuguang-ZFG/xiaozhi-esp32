@@ -500,6 +500,9 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
     abort_reset_session_.store(session, std::memory_order_release);
     const TickType_t began = xTaskGetTickCount();
     bool success = false;
+    // 归位坐标快照声明在 do 外：快照点在循环内（Hold 确认时），使用点在循环后
+    // （reset 成功后 HomeAfterAbort）——声明进 do 会出作用域（编译实证）。
+    float hold_x = 0, hold_y = 0, hold_z = 0;
     do {
         // `!` 必须先于任何可能长达数十分钟的 planner-sync 应答等待。它只是
         // 安全停机字符，不是 reset；即使旧流已 Failed 也要先尽力停住机器。
@@ -512,7 +515,6 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
         }
 
         bool stopped = false;
-        float hold_x = 0, hold_y = 0, hold_z = 0;
         uint32_t stopped_status_baseline = pipe.GetStatusReportSequence();
         while ((xTaskGetTickCount() - began) < pdMS_TO_TICKS(kResetRecoveryTimeoutMs)) {
             if (!pipe.IsConnected() || pipe.GetConnectionSequence() != session) {
