@@ -3185,6 +3185,32 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self.assertIn('return JsonString("previewing")', body, "幂等重入须回 previewing")
 
+    def test_prefetch_adopt_frees_old_psram_buffer(self):
+        """预取接管 PSRAM 泄漏（2026-08-24 登记 §5）：上一张成功后 buffer_ 留存供重画
+        （buffer_replayable_），AdoptPrefetch 直接 `buffer_ = prefetch_buffer_` 会
+        泄漏旧 G-code PSRAM——重复新画且命中预取时每次漏 ~512KiB，需在接管前释放。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        job_h = (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(encoding="utf-8")
+        start = job_cc.index("bool Job::AdoptPrefetch()")
+        end = job_cc.index("void Job::WaitForAudioOutputIdle()", start)
+        body = job_cc[start:end]
+        # 必须在 prefetch_mutex_ 持锁区内、接管前释放旧 buffer_（否则累积泄漏）
+        self.assertIn("heap_caps_free(buffer_)", body)
+        self.assertIn("buffer_ = prefetch_buffer_", body)
+        self.assertLess(body.index("heap_caps_free(buffer_)"), body.index("buffer_ = prefetch_buffer_"))
+        self.assertIn("prefetch_buffer_ = nullptr", body)
+        self.assertIn("prefetch_len_ = 0", body)
+        self.assertIn("PSRAM 所有权", body)
+        # 头文件必须注明两块 PSRAM 缓冲的所有权与移交语义
+        self.assertIn("PSRAM 所有权", job_h)
+        self.assertIn("prefetch_buffer_", job_h)
+        self.assertIn("buffer_replayable_", job_h)
+        # DownloadToPsram 仍在入口 ReleaseBuffer——Adopt 分支的释放与之对称
+        dl_start = job_cc.index("bool Job::DownloadToPsram")
+        dl_end = job_cc.index("bool Job::VerifyCrc", dl_start)
+        dl_body = job_cc[dl_start:dl_end]
+        self.assertIn("ReleaseBuffer()", dl_body)
+
 
 if __name__ == "__main__":
     unittest.main()

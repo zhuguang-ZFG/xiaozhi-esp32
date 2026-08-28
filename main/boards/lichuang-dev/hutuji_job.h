@@ -190,6 +190,11 @@ private:
     std::string url_;
     std::string preview_url_;
     // G-code 预取：预览待确认期间后台下载，确认时直接复用。
+    // PSRAM 所有权：buffer_ 归出图任务持有（成功后 buffer_replayable_留存供重画，
+    // 失败由 ReleaseBuffer 释放）；prefetch_buffer_ 在 Prefetch 阶段由预览任务
+    // 持有，Ready 后经 AdoptPrefetch 原子移交至 buffer_，移交前须先释放旧
+    // buffer_ 以免累积泄漏（上一张成功留存 + 命中预取的重复新画场景，每次漏 ~512KiB）。
+    // 两者发布/作废由 prefetch_mutex_ 保护，buffer_ 本身仅在出图任务上下文读写。
     enum class PrefetchState { Idle, Running, Ready };
     std::atomic<PrefetchState> prefetch_state_{PrefetchState::Idle};
     std::atomic<bool> prefetch_cancel_{false};
@@ -197,11 +202,11 @@ private:
     std::atomic<uint32_t> prefetch_epoch_{0};
     // 保护 prefetch_buffer_ 的发布/接管/释放三方的互斥。
     std::mutex prefetch_mutex_;
-    uint8_t* prefetch_buffer_ = nullptr;
+    uint8_t* prefetch_buffer_ = nullptr;  // 预取 PSRAM 缓冲：Ready 前为预览任务所有，Adopt 后所有权移交 buffer_
     size_t prefetch_len_ = 0;
     uint32_t prefetch_crc_ = 0;
     std::string prefetch_url_;
-    uint8_t* buffer_ = nullptr;
+    uint8_t* buffer_ = nullptr;  // 出图 PSRAM 缓冲：Adopt 接管或 DownloadToPsram 分配，Run 尾决定留存或释放
     size_t buffer_len_ = 0;
     uint32_t expect_crc_ = 0;
 

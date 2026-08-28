@@ -1314,6 +1314,16 @@ bool Job::AdoptPrefetch() {
     if (prefetch_state_.load() != PrefetchState::Ready || prefetch_url_ != url_) {
         return false;
     }
+    // PSRAM 所有权：prefetch_buffer_ 在 Ready 后由预取任务持有，Adopt 时移交至
+    // buffer_（出图任务持有，成功后为可重画留存）。旧 buffer_ 若留存（上一张
+    // 成功 done 且 buffer_replayable_）必须先释放，否则重复“新画命中预取”会
+    // 累积泄漏旧 G-code 缓冲（~512KiB/次）。DownloadToPsram 路径已在入口
+    // ReleaseBuffer，此分支同样需显式释放后再接管。
+    if (buffer_ != nullptr) {
+        heap_caps_free(buffer_);
+        buffer_ = nullptr;
+        buffer_len_ = 0;
+    }
     buffer_ = prefetch_buffer_;
     buffer_len_ = prefetch_len_;
     expect_crc_ = prefetch_crc_;
