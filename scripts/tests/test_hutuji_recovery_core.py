@@ -3212,6 +3212,22 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("ReleaseBuffer()", dl_body)
 
 
+
+class AbortScaffoldWavesharePortTest(unittest.TestCase):
+    def test_abort_scaffold_ported_to_waveshare(self):
+        """2026-08-28 C4 复测移植：HUTUJI_AUTO_TEST_ABORT_ON_PAPER 脚手架从
+        lichuang_dev_board.cc 原样移植到 waveshare 3.5 板（逻辑只用 Job 通用接口），
+        CMake guard 同步放行双板。钉死：板 cc 含轮询+RequestAbort 块，guard 含双板名。"""
+        ws = (ROOT / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc").read_text(encoding="utf-8")
+        cmake = (ROOT / "main/CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn("#ifdef HUTUJI_AUTO_TEST_ABORT_ON_PAPER", ws)
+        self.assertIn("job.RequestAbort()", ws)
+        self.assertIn('auto_test_abort', ws)
+        self.assertIn("CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5", cmake)
+        guard_idx = cmake.index("HUTUJI_AUTO_TEST_ABORT_ON_PAPER is only supported")
+        self.assertIn("waveshare-3.5", cmake[guard_idx:guard_idx + 90])
+
+
 if __name__ == "__main__":
     unittest.main()
 

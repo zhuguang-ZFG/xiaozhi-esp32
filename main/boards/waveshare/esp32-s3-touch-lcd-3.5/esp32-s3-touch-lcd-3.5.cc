@@ -575,6 +575,34 @@ private:
                 []() { WifiManager::GetInstance().StopConfigAp(); });
         });
 
+#ifdef HUTUJI_AUTO_TEST_ABORT_ON_PAPER
+        // bringup §8.5（换纸中调 abort）脚手架，2026-08-28 从 lichuang_dev_board.cc
+        // 原样移植（逻辑只用 Job 通用接口，无板级依赖）。默认不定义此宏，正常镜像
+        // 行为不变；取证后必须回刷不带宏的镜像。paper_active 也覆盖断连恢复保护窗，
+        // 触发前后都打 status 自证窗口类型。
+        xTaskCreate(
+            [](void*) {
+                auto& job = hutuji::Job::GetInstance();
+                // 50ms 轮询、20 分钟上限，够覆盖单张 A4 出图到页尾换纸；
+                // 超时即退出，不让脚手架任务常驻。
+                for (int i = 0; i < 24000; ++i) {
+                    if (job.IsPaperActive()) {
+                        ESP_LOGW("AutoTest", "换纸窗口命中，abort 前 status: %s",
+                                 job.StatusJson().c_str());
+                        auto result = job.RequestAbort();
+                        ESP_LOGW("AutoTest", "换纸中 abort 返回: %s", result.c_str());
+                        ESP_LOGW("AutoTest", "abort 后 status: %s", job.StatusJson().c_str());
+                        vTaskDelete(nullptr);
+                        return;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+                ESP_LOGW("AutoTest", "20 分钟内未观察到换纸窗口，abort 脚手架退出");
+                vTaskDelete(nullptr);
+            },
+            "auto_test_abort", 3072, nullptr, 4, nullptr);
+#endif
+
         mcp_server.AddTool("hutuji.status",
             "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、任务状态。"
             "state 含 previewing 预览加载中、awaiting_confirmation 等用户确认。",
