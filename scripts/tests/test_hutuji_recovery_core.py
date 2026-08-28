@@ -3264,9 +3264,18 @@ class AbortHomeAfterStopTest(unittest.TestCase):
         self.assertLess(perf.index("pipe.GetMachinePos(hold_x, hold_y, hold_z)"),
                         perf.index("pipe.SendAbortReset("))
         self.assertIn("abort_home_done_.store(HomeAfterAbort(hold_x, hold_y)", perf)
-        # ③重试与④播报分流
-        self.assertIn("job.PerformAbortReset(true, false, true)", job_cc)
+        # ③纯流式走断流排空（不 `!` 不 reset，坐标不失效）；paused/Hold 才回落
+        # reset 路径；④播报分流；⑤断流路径无 owner 时 Run 尾不得误判复位失败
+        self.assertIn("StartAbortDrainHomeTask()", job_cc)
+        self.assertIn("bool Job::PerformAbortDrainHome()", job_cc)
+        drain_start = job_cc.index("bool Job::PerformAbortDrainHome()")
+        drain = job_cc[drain_start:job_cc.index("bool Job::WaitForAbortReset", drain_start)]
+        self.assertNotIn("SendRealtime", drain)  # 排空路径禁发 `!`/`?` 实时字符
+        self.assertIn('"G1G90 Z0.0F10000"', drain)
+        self.assertIn('"G1G90 X0Y0F8000"', drain)
+        self.assertIn("GrblState::Hold", drain)  # Hold 移交 reset 路径
         self.assertIn('"已停止并回原点"', job_cc)
+        self.assertIn("abort_reset_owner_.Started() && !waited", job_cc)
         # StartDraw 复位标记
         self.assertIn("abort_home_done_.store(false);", job_cc)
 

@@ -172,6 +172,10 @@ private:
     void CommitPauseTimeoutCancel();
 
     bool StartAbortResetTask();
+    /** 纯流式 abort 的断流排空归位任务（2026-08-28）：不 `!` 不 reset，坐标不失效。 */
+    bool StartAbortDrainHomeTask();
+    /** 返回 true = 已把 worker 旗标移交 reset 路径（Hold 回落）；false = 本路径收尾。 */
+    bool PerformAbortDrainHome();
     bool PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed = false,
                            bool allow_unready_reconnect = false);
     /** 等已启动的 reset 恢复收敛，busy_ 在此之前不得释放。 */

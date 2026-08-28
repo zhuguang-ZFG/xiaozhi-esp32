@@ -46,6 +46,10 @@ constexpr uint32_t kPostPaperIdleTimeoutMs = 5000;
 constexpr uint32_t kHomeIdleTimeoutMs = 30 * 1000;
 // R20-JOB-01：归位行 ok 预算独立命名，不与换纸状态查询常量耦合。
 constexpr uint32_t kHomeOkTimeoutMs = 5000;
+// 断流归位（2026-08-28）：流任务发布 Quiesced 的上界；在途排空到 Idle 的上界
+// （在途窗口 ≤512B ≈ 十数行短段，15s 余量充足）。
+constexpr uint32_t kAbortDrainQuiescenceTimeoutMs = 5000;
+constexpr uint32_t kAbortDrainIdleTimeoutMs = 15000;
 constexpr uint32_t kPenOriginIdleTimeoutMs = 5000;
 // 等 ok 超时后的状态兜底探测：只要一份新状态报告，2s 足够（`?` 是实时命令，
 // 不排 planner 队列）。
@@ -437,13 +441,27 @@ std::string Job::RequestAbort() {
             Notify("写字机正在换纸，无法即停；换纸完成后任务将停止");
             return JsonString("换纸中无法即停，完成后即停");
         }
-        if (!StartAbortResetTask()) {
+        // 2026-08-28 用户决策「停止后也要自己回原点」+ 当日两次 HIL 实证
+        // （abort 后 [ESP901] 无应答致 socket 崩 + 复位清坐标）：纯流式态改走
+        // 断流排空归位（不 `!` 不 reset，坐标不失效）；已 paused/Hold 态
+        // （Hold 不消费行命令）才回落既有受控 reset 路径（其内带快照归位）。
+        if (paused_.load() || Pipe::GetInstance().GetGrblState() == GrblState::Hold) {
+            if (!StartAbortResetTask()) {
+                abort_requested_.store(false);
+                // 回滚同样动纪元：旧候选至多被冤枉拒发一次重试，不会漏看后续提交。
+                stream_control_epoch_.store(
+                    NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+                    std::memory_order_release);
+                return "{\"error\":\"无法创建 abort 恢复任务\"}";
+            }
+            return JsonString("ok");
+        }
+        if (!StartAbortDrainHomeTask()) {
             abort_requested_.store(false);
-            // 回滚同样动纪元：旧候选至多被冤枉拒发一次重试，不会漏看后续提交。
             stream_control_epoch_.store(
                 NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
                 std::memory_order_release);
-            return "{\"error\":\"无法创建 abort 恢复任务\"}";
+            return "{\"error\":\"无法创建 abort 归位任务\"}";
         }
     }
     return JsonString("ok");
@@ -457,12 +475,7 @@ bool Job::StartAbortResetTask() {
     BaseType_t created = xTaskCreate(
         [](void*) {
             auto& job = Job::GetInstance();
-            if (!job.PerformAbortReset(true, true, false)) {
-                // 连接层失败（如 socket 被对端打崩）时管道自动重连约 1s 即回；
-                // 给一次带 reconnect 宽限的重试，让「请断电重启」成为少数派终态。
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                job.PerformAbortReset(true, false, true);
-            }
+            job.PerformAbortReset(true, true, false);
             job.abort_reset_worker_active_.store(false, std::memory_order_release);
             vTaskDelete(nullptr);
         },
@@ -619,6 +632,81 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
         return false;
     }
     return success;
+}
+
+bool Job::StartAbortDrainHomeTask() {
+    // 与 reset 任务共用 abort_reset_worker_active_ 发布面：Run 尾部只认这一个旗标。
+    abort_reset_worker_active_.store(true, std::memory_order_release);
+    BaseType_t created = xTaskCreate(
+        [](void*) {
+            auto& job = Job::GetInstance();
+            // 返回 true = 已把 worker 旗标移交 reset 任务（Hold 回落），此处不再清。
+            if (!job.PerformAbortDrainHome()) {
+                job.abort_reset_worker_active_.store(false, std::memory_order_release);
+            }
+            vTaskDelete(nullptr);
+        },
+        "hutuji_abort_drain", 4096, nullptr, 6, nullptr);
+    if (created != pdPASS) {
+        abort_reset_worker_active_.store(false, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+// 断流归位（2026-08-28 用户决策 + advisory 定序）：纯流式 abort 不发 `!` 不 reset——
+// 停喂后在途行自然排空到 fresh Idle（坐标不失效），再抬笔、G1 归位。Hold 态不消费
+// 行命令，故 Hold（先暂停后停止）移交既有受控 reset 路径（其内带 Hold 快照归位）。
+// 返回 true 表示已移交 reset 任务（worker 旗标随走），false 表示本路径已收尾。
+bool Job::PerformAbortDrainHome() {
+    auto& pipe = Pipe::GetInstance();
+    bool homed = false;
+    do {
+        const TickType_t began = xTaskGetTickCount();
+        while (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire))) {
+            if (xTaskGetTickCount() - began > pdMS_TO_TICKS(kAbortDrainQuiescenceTimeoutMs)) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire)) ||
+            !pipe.IsConnected()) {
+            break;
+        }
+        if (pipe.GetGrblState() == GrblState::Hold) {
+            return StartAbortResetTask();  // 移交：worker 旗标归 reset 任务收尾
+        }
+        if (!WaitForIdle(false, kAbortDrainIdleTimeoutMs)) {
+            break;
+        }
+        int err = -1;
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            if (!pipe.SendLine("G1G90 Z0.0F10000")) {
+                break;
+            }
+        }
+        // 已在 fresh Idle，无 error:8 风险；ok 只代表入 planner，归位后再等 Idle。
+        if (pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok) {
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            if (!pipe.SendLine("G1G90 X0Y0F8000")) {
+                break;
+            }
+        }
+        if (pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok) {
+            break;
+        }
+        if (!WaitForIdle(false, kHomeIdleTimeoutMs)) {
+            break;
+        }
+        homed = true;
+        ESP_LOGI(TAG, "abort 断流归位完成（无 reset，坐标未失效）");
+    } while (false);
+    abort_home_done_.store(homed, std::memory_order_release);
+    return false;
 }
 
 bool Job::WaitForAbortReset() {
@@ -1647,7 +1735,9 @@ void Job::Run() {
         if (abort_reset_owner_.Running() ||
             abort_reset_worker_active_.load(std::memory_order_acquire)) {
             stream_lock.unlock();
-            if (!WaitForAbortReset()) {
+            const bool waited = WaitForAbortReset();
+            // 断流归位路径不占 owner：只在 owner 真的 Started 时才据返回值判失败。
+            if (abort_reset_owner_.Started() && !waited) {
                 reset_ok = false;
             }
             continue;
