@@ -696,10 +696,17 @@ bool Job::PerformAbortDrainHome() {
                 break;
             }
         }
-        // 已在 fresh Idle，无 error:8 风险；ok 只代表入 planner，归位后再等 Idle。
+        // 已在 fresh Idle，无 error:8 风险；ok 只代表入 planner。抬笔的 Z 块在
+        // planner 完成 ≠ 弹簧物理抬笔完成——2026-08-28 用户实证拖痕：Z0 与归位
+        // 行仅隔 10ms，笔还没抬离纸面 XY 已起步。故 Z0 后必须等 fresh Idle +
+        // 弹簧沉降（与 PreparePenOrigin/手动抬笔同口径）才发归位行。
         if (pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok) {
             break;
         }
+        if (!WaitForIdle(false, kPenOriginIdleTimeoutMs)) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(kPenSpringReturnMs));
         {
             std::lock_guard<std::mutex> stream_lock(stream_mutex_);
             if (!pipe.SendLine("G1G90 X0Y0F8000")) {

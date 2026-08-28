@@ -3280,6 +3280,15 @@ class AbortHomeAfterStopTest(unittest.TestCase):
         self.assertEqual(realtime, ["~"])
         self.assertIn('"G1G90 Z0.0F10000"', drain)
         self.assertIn('"G1G90 X0Y0F8000"', drain)
+        # 拖痕实证钉死（2026-08-28 用户报告）：Z0 抬笔与归位行之间必须有
+        # fresh Idle + 弹簧沉降，否则笔未抬离纸面 XY 已起步（拖痕）。
+        z_idx = drain.index('"G1G90 Z0.0F10000"')
+        home_idx = drain.index('"G1G90 X0Y0F8000"')
+        idle_idx = drain.index("WaitForIdle(false, kPenOriginIdleTimeoutMs)")
+        spring_idx = drain.index("kPenSpringReturnMs")
+        self.assertLess(z_idx, idle_idx)
+        self.assertLess(idle_idx, spring_idx)
+        self.assertLess(spring_idx, home_idx)
         self.assertIn("GrblState::Hold", drain)  # Hold 先 `~`，清不动才回落 reset
         # 2026-08-28 二轮 HIL 实证钉死：paused_（S3 冻结闸）必须先于 quiescence
         # 等待清除——不清则流循环永停在收应答冻结、quiescence 永不发布、任务悬挂
