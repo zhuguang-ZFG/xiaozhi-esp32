@@ -503,6 +503,9 @@ void LcdDisplay::ShowProvisioningQr(const std::string& payload, const std::strin
     lv_image_set_src(provisioning_qr_code_, nullptr);
     provisioning_qr_image_ = std::move(image);
     lv_image_set_src(provisioning_qr_code_, provisioning_qr_image_->image_dsc());
+    if (provisioning_qr_hint_ != nullptr) {
+        lv_label_set_text(provisioning_qr_hint_, hint.c_str());
+    }
     if (machine_control_trigger_btn_ != nullptr) {
         lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1226,6 +1229,24 @@ void LcdDisplay::EnsureMachineControlUi() {
     machine_reprovision_btn_ = make_button(
         machine_maint_section_, Lang::Strings::MACHINE_REPROVISION, theme->accent_color(),
         theme->accent_text_color(), content_width, safe_button_height);
+
+    lv_obj_t* bind_hint = lv_label_create(machine_maint_section_);
+    machine_draw_bind_hint_ = bind_hint;
+    lv_label_set_text(bind_hint, Lang::Strings::MACHINE_DRAW_BIND_HINT);
+    lv_label_set_long_mode(bind_hint, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(bind_hint, content_width);
+    lv_obj_set_style_text_color(bind_hint, theme->muted_text_color(), 0);
+
+    machine_draw_bind_btn_ = make_button(
+        machine_maint_section_, Lang::Strings::MACHINE_DRAW_BIND, theme->accent_color(),
+        theme->accent_text_color(), content_width, safe_button_height);
+    // InitializeTools 里 ConfigureDrawBind 早于 SetupUI；此处须按已注册回调决定可见性。
+    if (machine_draw_bind_) {
+        lv_obj_remove_flag(machine_draw_bind_btn_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(bind_hint, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(machine_draw_bind_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
     SetMachineDrawerPage(0);
 
     // 抽屉盖住主屏状态栏，断连/失败通知必须画在遮罩上面，否则点 XY 像没反应。
@@ -1344,6 +1365,16 @@ void LcdDisplay::EnsureMachineControlUi() {
             lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
             if (self->machine_reprovision_) {
                 self->machine_reprovision_();
+            }
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        machine_draw_bind_btn_,
+        [](lv_event_t* e) {
+            auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+            lv_obj_add_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+            if (self->machine_draw_bind_) {
+                self->machine_draw_bind_();
             }
         },
         LV_EVENT_CLICKED, this);
@@ -1662,6 +1693,24 @@ void LcdDisplay::ConfigureMachineControls(
     if (setup_ui_called_) {
         DisplayLockGuard lock(this);
         EnsureMachineControlUi();
+    }
+}
+
+void LcdDisplay::ConfigureDrawBind(std::function<void()> on_bind) {
+    machine_draw_bind_ = std::move(on_bind);
+    if (setup_ui_called_ && machine_draw_bind_btn_ != nullptr) {
+        DisplayLockGuard lock(this);
+        if (machine_draw_bind_) {
+            if (machine_draw_bind_hint_ != nullptr) {
+                lv_obj_remove_flag(machine_draw_bind_hint_, LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_remove_flag(machine_draw_bind_btn_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            if (machine_draw_bind_hint_ != nullptr) {
+                lv_obj_add_flag(machine_draw_bind_hint_, LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_add_flag(machine_draw_bind_btn_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 

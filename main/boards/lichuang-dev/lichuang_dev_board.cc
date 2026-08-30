@@ -6,6 +6,7 @@
 #include "display/lcd_display.h"
 #include "esp32_camera.h"
 #include "hutuji_ble_diag.h"
+#include "hutuji_conversation_report.h"
 #include "hutuji_job.h"
 #include "hutuji_music.h"
 #include "hutuji_pipe.h"
@@ -305,6 +306,9 @@ private:
         // Allow switching between press-to-talk (长按说话) and click-to-talk (单击唤醒)
         press_to_talk_tool_ = new PressToTalkMcpTool();
         press_to_talk_tool_->Initialize();
+
+        // 对话上报 worker 须尽早用静态栈创建，勿拖到首句 STT（heap 低谷会失败）。
+        hutuji::InitConversationReport();
 
         // hutuji 写字机 Telnet 哑管道（方案 E：TCP 客户端 → Grbl_Esp32 Telnet:23）
         hutuji::Pipe::GetInstance().Start();

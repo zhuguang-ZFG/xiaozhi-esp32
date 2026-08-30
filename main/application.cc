@@ -6,6 +6,7 @@
 #include "display.h"
 #ifdef CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
 #include "boards/lichuang-dev/hutuji_activation_relay.h"
+#include "boards/lichuang-dev/hutuji_conversation_report.h"
 #endif
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
@@ -586,10 +587,14 @@ void Application::InitializeProtocol() {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
+                    Schedule([this, display, message = std::string(text->valuestring),
                               glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
+                        if (protocol_) {
+                            hutuji::ReportConversationTurn(
+                                "assistant", message.c_str(), protocol_->session_id());
+                        }
                     });
                 }
             }
@@ -602,10 +607,14 @@ void Application::InitializeProtocol() {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
+                Schedule([this, display, message = std::string(text->valuestring),
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
+                    if (protocol_) {
+                        hutuji::ReportConversationTurn("user", message.c_str(),
+                                                       protocol_->session_id());
+                    }
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
@@ -977,8 +986,14 @@ void Application::HandleStateChangedEvent() {
 
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
+#if CONFIG_USE_CUSTOM_WAKE_WORD
+                // MultiNet 唤醒词会从扬声器回灌误触发（如 TTS 说「小派」），
+                // 直接 AbortSpeaking 造成「说着说着没声」。speaking 期关检测。
+                audio_service_.EnableWakeWordDetection(false);
+#else
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#endif
             }
             audio_service_.ResetDecoder();
             break;

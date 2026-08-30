@@ -185,6 +185,23 @@ esp_err_t Ota::CheckVersion() {
         ESP_LOGI(TAG, "No websocket section found!");
     }
 
+    cJSON* messaging = cJSON_GetObjectItem(root, "messaging");
+    if (cJSON_IsObject(messaging)) {
+        Settings msg_settings("messaging", true);
+        cJSON* item = NULL;
+        cJSON_ArrayForEach(item, messaging) {
+            if (cJSON_IsString(item)) {
+                if (msg_settings.GetString(item->string) != item->valuestring) {
+                    msg_settings.SetString(item->string, item->valuestring);
+                }
+            } else if (cJSON_IsNumber(item)) {
+                if (msg_settings.GetInt(item->string) != item->valueint) {
+                    msg_settings.SetInt(item->string, item->valueint);
+                }
+            }
+        }
+    }
+
     has_server_time_ = false;
     cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
     if (cJSON_IsObject(server_time)) {

@@ -3223,6 +3223,60 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("ReleaseBuffer()", dl_body)
 
 
+    def test_grbl_settings_fingerprint_matches_com13_golden(self):
+        """2026-08-29 COM13 实机 golden；float 容差 0.001，整型须精确。"""
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <string>
+
+            int main() {
+                using hutuji::CheckGrblSettingAgainstGolden;
+                using hutuji::GrblSettingValueMatches;
+                using hutuji::ParseGrblSettingLine;
+                using hutuji::kGrblSettingGoldenCount;
+
+                std::string key;
+                double value = 0.0;
+                assert(ParseGrblSettingLine("$130=210.000", key, value));
+                assert(key == "130");
+                assert(value == 210.0);
+                auto ok130 = CheckGrblSettingAgainstGolden(9, key, value);
+                assert(ok130.ok);
+
+                assert(ParseGrblSettingLine("$1=255", key, value));
+                auto ok1 = CheckGrblSettingAgainstGolden(0, key, value);
+                assert(ok1.ok);
+
+                assert(ParseGrblSettingLine("$Errors/Verbose=0", key, value));
+                auto okVerbose = CheckGrblSettingAgainstGolden(kGrblSettingGoldenCount - 1, key, value);
+                assert(okVerbose.ok);
+
+                assert(ParseGrblSettingLine("$Errors/Verbose=Off", key, value));
+                auto okVerboseOff = CheckGrblSettingAgainstGolden(kGrblSettingGoldenCount - 1, key, value);
+                assert(okVerboseOff.ok);
+
+                assert(ParseGrblSettingLine("$130=200.000", key, value));
+                auto bad130 = CheckGrblSettingAgainstGolden(9, key, value);
+                assert(!bad130.ok);
+                assert(bad130.key == "130");
+
+                assert(!ParseGrblSettingLine("ok", key, value));
+                assert(!ParseGrblSettingLine("$130=210garbage", key, value));
+                assert(GrblSettingValueMatches(12000.0, 12000.0, false));
+                assert(!GrblSettingValueMatches(11999.0, 12000.0, false));
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, "grbl_settings_fingerprint")
+
 
 class AbortScaffoldWavesharePortTest(unittest.TestCase):
     def test_abort_scaffold_ported_to_waveshare(self):

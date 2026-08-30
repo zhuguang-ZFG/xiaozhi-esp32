@@ -100,6 +100,8 @@
         "MACHINE_MAINT_EXPAND": "Maintenance",
         "MACHINE_MAIN_PAGE": "Home",
         "MACHINE_REPROVISION": "Set Up Plotter Again",
-        "MACHINE_REPROVISION_HINT": "Tap after the plotter is reset or replaced to re-share home Wi-Fi"
+        "MACHINE_REPROVISION_HINT": "Tap after the plotter is reset or replaced to re-share home Wi-Fi",
+        "MACHINE_DRAW_BIND": "Bind Hutuji Account",
+        "MACHINE_DRAW_BIND_HINT": "Scan QR on your phone to upload drawings from the web"
     }
 }

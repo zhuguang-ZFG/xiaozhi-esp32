@@ -5,7 +5,9 @@
 #include "application.h"
 #include "boards/lichuang-dev/hutuji_job.h"
 #include "boards/lichuang-dev/hutuji_pipe.h"
+#include "boards/lichuang-dev/hutuji_draw_bind.h"
 #include "boards/lichuang-dev/hutuji_ble_diag.h"
+#include "boards/lichuang-dev/hutuji_conversation_report.h"
 #include "boards/lichuang-dev/hutuji_recovery_core.h"
 #include "boards/lichuang-dev/hutuji_music.h"
 #include "boards/lichuang-dev/plotter_provision.h"
@@ -538,6 +540,9 @@ private:
                 return true;
             });
 
+        // 对话上报 worker 须尽早用静态栈创建，勿拖到首句 STT（heap 低谷会失败）。
+        hutuji::InitConversationReport();
+
         // hutuji 写字机 Telnet 哑管道（TCP 客户端 → Grbl_Esp32 Telnet:23）。
         hutuji::Pipe::GetInstance().Start();
 
@@ -570,9 +575,19 @@ private:
         // TryWifiConnect（有凭据回连；无凭据新机按上游流程弹回配网）。必须
         // Schedule 回主循环：StopConfigAp 的事件回调是同步调用，新机无凭据时
         // TryWifiConnect 内部有 vTaskDelay(1500)，在 taskLVGL 上跑会卡死 UI。
-        display_->SetProvisioningCancelHandler([]() {
+        display_->SetProvisioningCancelHandler([this]() {
+            if (hutuji::IsDrawBindActive()) {
+                hutuji::StopDrawBind(display_);
+                return;
+            }
             Application::GetInstance().Schedule(
                 []() { WifiManager::GetInstance().StopConfigAp(); });
+        });
+
+        display_->ConfigureDrawBind([this]() {
+            Application::GetInstance().Schedule([this]() {
+                hutuji::StartDrawBind(display_);
+            });
         });
 
 #ifdef HUTUJI_AUTO_TEST_ABORT_ON_PAPER

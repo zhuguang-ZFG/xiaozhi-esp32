@@ -123,6 +123,8 @@ protected:
     // 维护页（第三页）：写字机零接触配网的手动入口。machine_page_ 0=主页 1=手动 2=维护。
     lv_obj_t* machine_maint_section_ = nullptr;
     lv_obj_t* machine_reprovision_btn_ = nullptr;
+    lv_obj_t* machine_draw_bind_btn_ = nullptr;
+    lv_obj_t* machine_draw_bind_hint_ = nullptr;
     int machine_page_ = 0;
     std::function<void()> machine_pause_;
     std::function<void()> machine_resume_;
@@ -131,6 +133,7 @@ protected:
     std::function<void()> machine_pen_test_;
     std::function<void(const char* action)> machine_manual_;
     std::function<void()> machine_reprovision_;
+    std::function<void()> machine_draw_bind_;
     std::vector<lv_obj_t*> machine_manual_buttons_;
     std::string machine_state_{"idle"};
     bool machine_controls_configured_ = false;
@@ -179,6 +182,7 @@ public:
                                   std::function<void()> on_pen_test,
                                   std::function<void(const char* action)> on_manual,
                                   std::function<void()> on_reprovision);
+    void ConfigureDrawBind(std::function<void()> on_bind);
     /** boot 键功能上屏：on_talk = boot 单击等效，on_wifi = 进配网显二维码。 */
     void ConfigureVoiceEntry(std::function<void()> on_talk, std::function<void()> on_wifi);
     /** 配网二维码「关闭」回调：调用方负责退出配网模式（如 StopConfigAp）。 */

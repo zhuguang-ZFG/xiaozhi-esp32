@@ -134,6 +134,7 @@ void Pipe::PipeTask() {
         paper_changing_.store(PaperChangingState::Unknown);
         ready_.store(false);
         authorized_.store(false);
+        ResetSettingsFingerprintState();
         DrainResponses();
         if (task_session_active_.load()) {
             // 进行中的绘图刚经历断连。旧 planner 可能仍在运动，或 M30 换纸仍在
@@ -735,6 +736,7 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
         const uint32_t banner_generation = reset_banner_seq_.fetch_add(1) + 1U;
         ready_.store(false);
         authorized_.store(false);
+        ResetSettingsFingerprintState();
         const bool recover_abort =
             abort_reset_token_.Consume(connection_seq_.load(), banner_generation, receive_epoch);
         if (recover_abort) {
@@ -769,6 +771,24 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
             // 复位已丢弃 planner 与模态，续画必然错位；且外部 0x18 意味着有别的
             // 上位机在操作机器，S3 不应与之抢状态。代价是有界的等待，不加恢复。
             ESP_LOGW(TAG, "绘图会话内检测到 reset banner，等待任务层断连分流");
+        }
+        return;
+    }
+
+    if (auth_probe_stage_ == AuthProbeStage::WaitingSettingQuery && !line.empty() &&
+        line[0] == '$') {
+        std::string key;
+        double value = 0.0;
+        if (!ParseGrblSettingLine(line, key, value)) {
+            settings_line_ok_ = false;
+            RecordSettingsMismatch("parse");
+        } else {
+            const GrblSettingCheckResult check =
+                CheckGrblSettingAgainstGolden(static_cast<size_t>(settings_query_index_), key, value);
+            settings_line_ok_ = check.ok;
+            if (!check.ok) {
+                RecordSettingsMismatch(check.key);
+            }
         }
         return;
     }
@@ -980,20 +1000,50 @@ bool Pipe::HandleAuthProbeResponse(WaitResult result, int error_code) {
         case AuthProbeStage::WaitingMotionReply:
             if (result == WaitResult::Ok) {
                 authorized_.store(true);
-                ready_.store(true);
-                auth_probe_stage_ = AuthProbeStage::Complete;
                 ESP_LOGI(TAG, "授权探测通过（抬笔后 G53 零位移）");
+                if (!BeginSettingsFingerprintProbe()) {
+                    auth_probe_stage_ = AuthProbeStage::Failed;
+                }
             } else if (result == WaitResult::Failed && error_code == 110) {
                 authorized_.store(false);
-                ready_.store(true);
-                auth_probe_stage_ = AuthProbeStage::Complete;
                 ESP_LOGW(TAG, "写字机未授权（零位移探测返回 error:110）");
+                if (!BeginSettingsFingerprintProbe()) {
+                    auth_probe_stage_ = AuthProbeStage::Failed;
+                }
             } else {
                 // error:110 之外的失败不是授权结论（如换纸窗口的 error:8）：
                 // 保持 ready=false 并有界重试，别把瞬态当权威。
                 authorized_.store(false);
                 ready_.store(false);
                 ScheduleAuthProbeRetryOrFail("零位移授权探测", error_code);
+            }
+            return true;
+
+        case AuthProbeStage::WaitingSettingQuery:
+            if (result != WaitResult::Ok) {
+                ScheduleAuthProbeRetryOrFail("设置指纹", error_code);
+                return true;
+            }
+            if (!settings_line_ok_) {
+                ready_.store(true);
+                auth_probe_stage_ = AuthProbeStage::Complete;
+                ESP_LOGE(TAG, "Grbl 设置指纹不符（$%s）", GetSettingsMismatchKey().c_str());
+                NotifyCloud("写字机参数被改动，请联系卖家恢复后再画");
+                return true;
+            }
+            ++settings_query_index_;
+            if (static_cast<size_t>(settings_query_index_) >= kGrblSettingGoldenCount) {
+                settings_verified_.store(true);
+                ready_.store(true);
+                auth_probe_stage_ = AuthProbeStage::Complete;
+                ESP_LOGI(TAG, "Grbl 设置指纹通过（%u 项）",
+                         static_cast<unsigned>(kGrblSettingGoldenCount));
+                return true;
+            }
+            settings_line_ok_ = false;
+            if (!SendLine(kGrblSettingGoldens[settings_query_index_].query_line)) {
+                auth_probe_stage_ = AuthProbeStage::Failed;
+                ESP_LOGE(TAG, "设置指纹查询发送失败");
             }
             return true;
 
@@ -1024,6 +1074,39 @@ void Pipe::ScheduleAuthProbeRetryOrFail(const char* what, int error_code) {
     ESP_LOGE(TAG, "%s失败: %s，重试额度已耗尽，等待连接重建", what, reason);
     // 用户可感知的死角：连接活着但永不 ready。给云端一条可读解释。
     NotifyCloud("写字机授权探测多次失败（可能停在暂停/保持状态），请检查写字机后重试");
+}
+
+void Pipe::ResetSettingsFingerprintState() {
+    settings_verified_.store(false);
+    settings_query_index_ = 0;
+    settings_line_ok_ = false;
+    {
+        std::lock_guard<std::mutex> lock(settings_mismatch_mutex_);
+        settings_mismatch_key_.clear();
+    }
+}
+
+void Pipe::RecordSettingsMismatch(const std::string& key) {
+    std::lock_guard<std::mutex> lock(settings_mismatch_mutex_);
+    if (settings_mismatch_key_.empty()) {
+        settings_mismatch_key_ = key;
+    }
+}
+
+bool Pipe::BeginSettingsFingerprintProbe() {
+    ResetSettingsFingerprintState();
+    auth_probe_stage_ = AuthProbeStage::WaitingSettingQuery;
+    settings_line_ok_ = false;
+    if (!SendLine(kGrblSettingGoldens[0].query_line)) {
+        ESP_LOGE(TAG, "设置指纹首项发送失败");
+        return false;
+    }
+    return true;
+}
+
+std::string Pipe::GetSettingsMismatchKey() const {
+    std::lock_guard<std::mutex> lock(settings_mismatch_mutex_);
+    return settings_mismatch_key_;
 }
 
 const char* Pipe::GrblStateName(GrblState s) {

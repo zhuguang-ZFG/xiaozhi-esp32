@@ -66,7 +66,7 @@ constexpr uint32_t kJogFreshStateTimeoutMs = 6000;
 constexpr int kMaxOkFallback = 3;
 // MPos 与在途行终点的比较容差（mm）。Grbl 报告保留 3 位小数。
 constexpr float kOkFallbackPosTolMm = 0.05f;
-// 本机 $1=255（2026-08-28 机设）：任务期/闲置期电机保持通电（治虚实交替）；例外：M30 页尾强制失能 XYZ（Grbl GCode.cpp:1730/1785，刻意）。Idle 后等弹簧回到自然抬笔位再声明 Z0。
+// 本机 $1=255（2026-08-28 机设）：任务期/闲置期电机保持通电（治虚实交替）。Idle 后等弹簧回到自然抬笔位再声明 Z0。
 constexpr uint32_t kPenSpringReturnMs = 100;
 constexpr uint32_t kReconnectReadyTimeoutMs = 2 * 60 * 1000;
 constexpr uint32_t kResetRecoveryTimeoutMs = 30000;
@@ -369,6 +369,12 @@ std::string Job::RequestConfirm() {
     auto& pipe = Pipe::GetInstance();
     if (!pipe.IsConnected() || !pipe.IsReady()) {
         return "{\"error\":\"写字机未连接或未就绪\"}";
+    }
+    if (!pipe.IsAuthorized()) {
+        return "{\"error\":\"写字机未授权，请联系卖家协助激活\"}";
+    }
+    if (!pipe.IsSettingsVerified()) {
+        return "{\"error\":\"grbl_settings_mismatch\"}";
     }
     awaiting_confirmation_.store(false);
     SetState("downloading");
@@ -861,6 +867,9 @@ std::string Job::RequestPenTest() {
         if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
             return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
         }
+        if (!pipe.IsSettingsVerified()) {
+            return "{\"error\":\"grbl_settings_mismatch\"}";
+        }
         abort_requested_.store(false);
         busy_.store(true);
         pen_test_active_.store(true);
@@ -1001,6 +1010,10 @@ std::string Job::RequestManualControl(const std::string& action) {
         if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
             busy_.store(false);
             return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
+        }
+        if (!pipe.IsSettingsVerified()) {
+            busy_.store(false);
+            return "{\"error\":\"grbl_settings_mismatch\"}";
         }
         // 点动同步预检（2026-08-25 实机 HIL 实证）：越界若只在 ManualTask 里拦，
         // 工具早已回 "started"，失败只进 notify，LLM 会把拒绝播报成「已经往左挪啦」。
@@ -1208,6 +1221,11 @@ std::string Job::StatusJson() const {
     cJSON_AddBoolToObject(root, "connected", pipe.IsConnected());
     cJSON_AddBoolToObject(root, "ready", pipe.IsReady());
     cJSON_AddBoolToObject(root, "authorized", pipe.IsAuthorized());
+    cJSON_AddBoolToObject(root, "grbl_settings_ok", pipe.IsSettingsVerified());
+    const std::string mismatch_key = pipe.GetSettingsMismatchKey();
+    if (!pipe.IsSettingsVerified() && !mismatch_key.empty()) {
+        cJSON_AddStringToObject(root, "grbl_settings_mismatch", mismatch_key.c_str());
+    }
     cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());
     cJSON_AddStringToObject(root, "state", state.c_str());
     cJSON_AddStringToObject(root, "grbl_state", Pipe::GrblStateName(pipe.GetGrblState()));
@@ -1644,6 +1662,12 @@ void Job::Run() {
             last_error_ = "写字机未授权，请联系卖家协助激活";
             SetState("error");
             Notify(last_error_);
+            break;
+        }
+        if (!pipe.IsSettingsVerified()) {
+            last_error_ = "grbl_settings_mismatch";
+            SetState("error");
+            Notify("写字机参数被改动，请联系卖家恢复后再画");
             break;
         }
         // 双读序号包住 ready/authorized 检查，防止采到刚重连但尚未探活的新 session。
@@ -2375,6 +2399,7 @@ bool Job::RecoverDisconnectedDraw() {
     }
     const uint32_t recovered_seq = pipe.GetConnectionSequence();
     if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized() ||
+        !pipe.IsSettingsVerified() ||
         pipe.GetConnectionSequence() != recovered_seq) {
         last_error_ = "断连恢复完成时连接再次切换";
         return false;

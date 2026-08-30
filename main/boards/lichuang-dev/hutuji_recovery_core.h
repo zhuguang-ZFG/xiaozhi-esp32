@@ -863,6 +863,102 @@ inline bool ParsePaperStatusFields(const std::string& line, PaperPresentState& p
 
 
 /**
+ * Grbl `$` 设置指纹（2026-08-29 实机 COM13 `$$` 只读取证 + protocol §6）。
+ * 奎享/WebUI 可改写 NVS 持久化设置，小派须 fail-closed 拒画并上报 mismatch。
+ */
+struct GrblSettingGolden {
+    const char* query_line;    // 发往 Grbl 的行（SendLine 自动补 \\n）
+    const char* response_key;  // 应答 `$KEY=VALUE` 中的 KEY
+    double expected;
+    bool integer;
+};
+
+inline constexpr GrblSettingGolden kGrblSettingGoldens[] = {
+    {"$1", "1", 255.0, true},
+    {"$3", "3", 7.0, true},
+    {"$20", "20", 0.0, true},
+    {"$21", "21", 0.0, true},
+    {"$22", "22", 0.0, true},
+    {"$100", "100", 100.0, false},
+    {"$101", "101", 100.0, false},
+    {"$110", "110", 12000.0, false},
+    {"$111", "111", 12000.0, false},
+    {"$130", "130", 210.0, false},
+    {"$131", "131", 297.0, false},
+    {"$132", "132", 200.0, false},
+    {"[Errors/Verbose]", "Errors/Verbose", 0.0, true},
+};
+
+inline constexpr size_t kGrblSettingGoldenCount =
+    sizeof(kGrblSettingGoldens) / sizeof(kGrblSettingGoldens[0]);
+
+inline bool ParseGrblSettingLine(const std::string& line, std::string& key_out, double& value_out) {
+    if (line.empty() || line[0] != '$') {
+        return false;
+    }
+    const size_t eq = line.find('=');
+    if (eq <= 1 || eq == std::string::npos) {
+        return false;
+    }
+    key_out = line.substr(1, eq - 1);
+    const std::string raw_value = line.substr(eq + 1);
+    // FlagSetting 单查走 getStringValue()，应答为 Off/On 而非 compatible 的 0/1。
+    if (raw_value == "Off" || raw_value == "off") {
+        value_out = 0.0;
+        return true;
+    }
+    if (raw_value == "On" || raw_value == "on") {
+        value_out = 1.0;
+        return true;
+    }
+    const char* start = raw_value.c_str();
+    char* end = nullptr;
+    const double parsed = std::strtod(start, &end);
+    if (end == start || (end != nullptr && *end != '\0')) {
+        return false;
+    }
+    if (!std::isfinite(parsed)) {
+        return false;
+    }
+    value_out = parsed;
+    return true;
+}
+
+inline bool GrblSettingValueMatches(double actual, double expected, bool integer) {
+    if (integer) {
+        const double rounded = std::round(actual);
+        return std::abs(actual - rounded) < 1e-6 &&
+               static_cast<long long>(rounded) == static_cast<long long>(expected);
+    }
+    return std::abs(actual - expected) <= 0.001;
+}
+
+struct GrblSettingCheckResult {
+    bool ok = false;
+    std::string key;
+    double expected = 0.0;
+    double actual = 0.0;
+};
+
+inline GrblSettingCheckResult CheckGrblSettingAgainstGolden(size_t index, const std::string& key,
+                                                            double actual) {
+    GrblSettingCheckResult result;
+    result.actual = actual;
+    if (index >= kGrblSettingGoldenCount) {
+        result.key = key;
+        return result;
+    }
+    const GrblSettingGolden& golden = kGrblSettingGoldens[index];
+    result.key = golden.response_key;
+    result.expected = golden.expected;
+    if (key != golden.response_key) {
+        return result;
+    }
+    result.ok = GrblSettingValueMatches(actual, golden.expected, golden.integer);
+    return result;
+}
+
+/**
  * 预览重入幂等（2026-08-24 P1-3 配套）：服务端链式调用成功在预览后，云端 LLM 的
  * 第二步会以同 url/preview_url 重入 StartDraw；busy 已占但任务停在
  * awaiting_confirmation 且参数完全相同时，应回 previewing（等价「已在等确认」），

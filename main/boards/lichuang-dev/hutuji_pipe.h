@@ -96,6 +96,10 @@ public:
     bool IsConnected() const { return connected_.load(); }
     bool IsReady() const { return ready_.load(); }
     bool IsAuthorized() const { return authorized_.load(); }
+    /** 连接后逐项 `$` 指纹比对通过才为 true；被上位机改设置时为 false。 */
+    bool IsSettingsVerified() const { return settings_verified_.load(); }
+    /** mismatch 时返回 golden key（如 `130`）；通过或未探测时为空。 */
+    std::string GetSettingsMismatchKey() const;
     /**
      * 绘图会话存续期间，重连只验 Telnet banner，不自动发送授权运动探针。
      * 任务层须先按 protocol §2.1 查询 Changing，再决定是否发受限 reset。
@@ -193,6 +197,7 @@ private:
         WaitingLiftOk,
         WaitingPosition,
         WaitingMotionReply,
+        WaitingSettingQuery,
         // R10-PIPE-01：可重试失败后的延迟重探等待；到期由 PipeTask 的 EAGAIN
         // 分支重新从 `$I` 起探（与 Idle 恢复探测同一驱动点，保持单任务修改）。
         RetryWait,
@@ -232,11 +237,15 @@ private:
      * 仅限 PipeTask 内调用（auth_probe_stage_ 单任务修改约定）。
      */
     void ScheduleAuthProbeRetryOrFail(const char* what, int error_code);
+    void ResetSettingsFingerprintState();
+    bool BeginSettingsFingerprintProbe();
+    void RecordSettingsMismatch(const std::string& key);
 
     std::atomic<bool> started_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> authorized_{false};
+    std::atomic<bool> settings_verified_{false};
     AbortResetToken abort_reset_token_;
     std::atomic<bool> task_session_active_{false};
     std::atomic<bool> expect_blocking_peer_{false};
@@ -275,6 +284,10 @@ private:
     int auth_probe_retries_ = 0;
     uint32_t auth_probe_retry_due_tick_ = 0;
     // R22-PIPE-02：WaitingBuildInfoOk 的无声超时计数（recv 超时拍为单位）。
+    int settings_query_index_ = 0;
+    bool settings_line_ok_ = false;
+    mutable std::mutex settings_mismatch_mutex_;
+    std::string settings_mismatch_key_;
     // 挂起态（Hold/Door/Sleep）下 Grbl 不消费行命令，`$I` 既不回 ok 也不回
     // error，纯错误驱动的 R10-PIPE-01 重试永不触发；靠本计数把「无应答」也
     // 变成可判定事件。仅 PipeTask 读写。
