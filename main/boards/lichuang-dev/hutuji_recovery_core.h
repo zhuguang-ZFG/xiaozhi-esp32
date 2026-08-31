@@ -886,6 +886,9 @@ inline constexpr GrblSettingGolden kGrblSettingGoldens[] = {
     {"$130", "130", 210.0, false},
     {"$131", "131", 297.0, false},
     {"$132", "132", 200.0, false},
+    // 末项查询故意用 Grbl 扩展名括号语法 `[Errors/Verbose]`（§9-G′ 守卫对象的对应查询
+    // 形态）；应答仍是 `$Errors/Verbose=Off`，由 ParseGrblSettingLine 的 `$` 前缀路径解析，
+    // Off→0 映射见该函数。findings #30 R5：两种语法并存非矛盾，COM14 实机指纹 13 项通过实证。
     {"[Errors/Verbose]", "Errors/Verbose", 0.0, true},
 };
 
