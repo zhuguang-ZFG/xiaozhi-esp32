@@ -335,13 +335,19 @@ private:
             "PNG 预览地址。本工具只把预览显示到设备屏幕上，不会启动任何机械动作。"
             "屏幕会出现「开始画」「取消」两个按钮，用户也可以直接说开始画或取消；"
             "用户确认后才调 hutuji.confirm 真正出图。"
-            "用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。",
+            "用户只说「画一只猫」时应先走云端 hutuji_draw，不要瞎编 url。"
+            "写文章/写诗多页时：云端 hutuji_write 会返回 pages 数组，把它原样转成 JSON "
+            "字符串传给 pages 参数（形如 [{\"url\":\"...\",\"preview_url\":\"...\"}, ...]），"
+            "并把第 1 页的两个地址同时填到 url/preview_url；设备会逐页写、每页写完自动换纸。"
+            "单页出图时 pages 留空。",
             PropertyList({Property("url", kPropertyTypeString),
-                          Property("preview_url", kPropertyTypeString)}),
+                          Property("preview_url", kPropertyTypeString),
+                          Property("pages", kPropertyTypeString, std::string(""))}),
             [](const PropertyList& properties) -> ReturnValue {
                 const std::string& url = properties["url"].value<std::string>();
                 const std::string& preview_url = properties["preview_url"].value<std::string>();
-                return hutuji::Job::GetInstance().StartDraw(url, preview_url);
+                const std::string& pages = properties["pages"].value<std::string>();
+                return hutuji::Job::GetInstance().StartDraw(url, preview_url, pages);
             });
 
         mcp_server.AddTool("hutuji.confirm",

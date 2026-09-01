@@ -4,8 +4,17 @@
 #include "audio_codec.h"
 #include "board.h"
 #include "display.h"
+// hutuji 编译面：waveshare 3.5 与 lichuang-dev 两块板都链入
+// boards/lichuang-dev/hutuji_*.cc（前者显式列入 CMake，后者经板级 glob），
+// 故会话上报的头与调用点必须同条件守卫；其余板型两者都不编。
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+#define HUTUJI_CONVERSATION_REPORT_ENABLED 1
+#endif
 #ifdef CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
 #include "boards/lichuang-dev/hutuji_activation_relay.h"
+#endif
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
 #include "boards/lichuang-dev/hutuji_conversation_report.h"
 #endif
 #include "mcp_server.h"
@@ -591,10 +600,12 @@ void Application::InitializeProtocol() {
                               glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
                         if (protocol_) {
                             hutuji::ReportConversationTurn(
                                 "assistant", message.c_str(), protocol_->session_id());
                         }
+#endif
                     });
                 }
             }
@@ -611,10 +622,12 @@ void Application::InitializeProtocol() {
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
                     if (protocol_) {
                         hutuji::ReportConversationTurn("user", message.c_str(),
                                                        protocol_->session_id());
                     }
+#endif
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {

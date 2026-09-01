@@ -7,8 +7,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace hutuji {
 // 窗口按 payload+LF 计字节；应答队列须覆盖最短非空行形成的最大在途条数，
@@ -462,6 +463,90 @@ inline bool IsValidDrawCapabilityUrl(const std::string& url, const std::string& 
 
 inline bool IsValidDrawUrl(const std::string& url) {
     return IsValidDrawCapabilityUrl(url, ".gcode");
+}
+
+/** hutuji.draw 多页参数 pages 的条数上界（与云端 write_text max_pages 同值）。 */
+inline constexpr size_t kArticleMaxPages = 20;
+
+/**
+ * 解析 hutuji.draw 的多页参数 pages（JSON 数组字符串，云端 chain push 生成）：
+ *     [{"url":"...gcode","preview_url":"...png"}, ...]
+ *
+ * 纯扫描器、不引 cJSON——宿主测试零依赖单 TU 编译。能力 URL 字母表不含引号与
+ * 反斜杠（token 是 urlsafe base64，路径固定 /files/），值内一遇 '\\' 即判非法
+ * （宁严勿宽，不为假想输入放宽解析面）。键序要求每对内 url 先、preview_url 后
+ * （云端按此序生成）；乱序、缺对、超上限、任一条目不过 IsValidDrawCapabilityUrl
+ * 均整体判非法。`"preview_url"` 字面不含 `"url"` 子串（前一字符是 '_'），前向
+ * 扫描不会误配。成功返回 true 且 out 为 1..max_pages 对；失败 out 清空。
+ */
+inline bool ParseArticlePages(const std::string& json,
+                              std::vector<std::pair<std::string, std::string>>& out,
+                              size_t max_pages = kArticleMaxPages) {
+    out.clear();
+    size_t pos = 0;
+    // key_pos 回传该键的起始位置，供跨页错配检测（见下方键序校验）。
+    auto extract = [&](const char* key, std::string& value, size_t& key_pos_out) -> bool {
+        const size_t key_pos = json.find(key, pos);
+        if (key_pos == std::string::npos) {
+            return false;
+        }
+        size_t p = key_pos + std::char_traits<char>::length(key);
+        while (p < json.size() &&
+               (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) {
+            ++p;
+        }
+        if (p >= json.size() || json[p] != ':') {
+            return false;
+        }
+        ++p;
+        while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+            ++p;
+        }
+        if (p >= json.size() || json[p] != '"') {
+            return false;
+        }
+        const size_t begin = ++p;
+        while (p < json.size() && json[p] != '"') {
+            if (json[p] == '\\') {
+                return false;
+            }
+            ++p;
+        }
+        if (p >= json.size()) {
+            return false;
+        }
+        value = json.substr(begin, p - begin);
+        key_pos_out = key_pos;
+        pos = p + 1;
+        return true;
+    };
+    while (true) {
+        std::string url;
+        std::string preview;
+        size_t key_pos = 0;  // extract 回写：第二次调用后即 preview_url 键位置
+        if (!extract("\"url\"", url, key_pos)) {
+            break;
+        }
+        const size_t after_url_value = pos;
+        if (!extract("\"preview_url\"", preview, key_pos) ||
+            !IsValidDrawCapabilityUrl(url, ".gcode") ||
+            !IsValidDrawCapabilityUrl(preview, ".png")) {
+            out.clear();
+            return false;
+        }
+        // 键序校验：本页 url 与其 preview_url 之间不得再出现 "url" 键，否则说明有
+        // 页对缺 preview_url（或键序颠倒），跨页错配会把两张纸的地址配成一对。
+        if (json.find("\"url\"", after_url_value) < key_pos) {
+            out.clear();
+            return false;
+        }
+        out.emplace_back(std::move(url), std::move(preview));
+        if (out.size() > max_pages) {
+            out.clear();
+            return false;
+        }
+    }
+    return !out.empty();
 }
 
 /**

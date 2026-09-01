@@ -628,13 +628,18 @@ private:
         mcp_server.AddTool("hutuji.draw",
             "先出预览：url 是云端 hutuji_draw 返回的 G-code 地址，preview_url 是同一次返回的 PNG "
             "预览地址。只把预览显示到屏幕上，不启动任何机械动作；屏幕会出现「开始画」「取消」"
-            "按钮，用户确认后才调 hutuji.confirm。",
+            "按钮，用户确认后才调 hutuji.confirm。"
+            "写文章/写诗多页时：把云端 hutuji_write 返回的 pages 数组原样转成 JSON 字符串传给 "
+            "pages 参数（形如 [{\"url\":\"...\",\"preview_url\":\"...\"}, ...]），并把第 1 页两个地址"
+            "同时填到 url/preview_url；设备逐页写、每页写完自动换纸。单页出图时 pages 留空。",
             PropertyList({Property("url", kPropertyTypeString),
-                          Property("preview_url", kPropertyTypeString)}),
+                          Property("preview_url", kPropertyTypeString),
+                          Property("pages", kPropertyTypeString, std::string(""))}),
             [](const PropertyList& properties) -> ReturnValue {
                 const std::string& url = properties["url"].value<std::string>();
                 const std::string& preview_url = properties["preview_url"].value<std::string>();
-                return hutuji::Job::GetInstance().StartDraw(url, preview_url);
+                const std::string& pages = properties["pages"].value<std::string>();
+                return hutuji::Job::GetInstance().StartDraw(url, preview_url, pages);
             });
 
         mcp_server.AddTool("hutuji.confirm",

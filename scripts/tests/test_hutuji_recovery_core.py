@@ -246,6 +246,120 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self._compile_and_run(compiler, source, stem="hutuji_preview_url_contract_test")
 
+    def test_parse_article_pages_enforces_pairing_order_and_limit(self):
+        """多页 pages 解析：成对、键序、上限、能力 URL 边界一处不合即整体拒收。
+
+        错配一对就会把 A 页的 G-code 配到 B 页的预览上：用户看着第 2 页预览按
+        「开始画」，机器写的是别的内容且照样换纸，纸张不可回收。故非法输入一律
+        整体拒收（out 清空），不做「跳过坏条目取其余」的宽容解析。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+            #include <string>
+            #include <utility>
+            #include <vector>
+
+            static std::string Page(const char* stamp) {
+                const std::string base =
+                    std::string("https://hutuji.donglicao.com/files/draw_") + stamp +
+                    "_abcdefghijklmnopqrstuv";
+                return "{\"url\":\"" + base + ".gcode\",\"preview_url\":\"" + base + ".png\"}";
+            }
+
+            int main() {
+                using hutuji::kArticleMaxPages;
+                using hutuji::ParseArticlePages;
+                std::vector<std::pair<std::string, std::string>> out;
+
+                // 云端 chain push 的真实形状：单页与多页都成对解析，顺序即写页顺序。
+                assert(ParseArticlePages("[" + Page("20260901_120000") + "]", out));
+                assert(out.size() == 1);
+                assert(out[0].first.size() > 0 && out[0].first.rfind(".gcode") != std::string::npos);
+                assert(out[0].second.rfind(".png") != std::string::npos);
+
+                const std::string three = "[" + Page("20260901_120000") + "," +
+                                          Page("20260901_120001") + "," +
+                                          Page("20260901_120002") + "]";
+                assert(ParseArticlePages(three, out));
+                assert(out.size() == 3);
+                assert(out[0].first != out[1].first && out[1].first != out[2].first);
+                assert(out[0].first.find("120000") != std::string::npos);
+                assert(out[2].first.find("120002") != std::string::npos);
+
+                // 空 / 空数组 / 无键：非法（调用方以空 pages 表达单页，不进本函数）。
+                assert(!ParseArticlePages("", out) && out.empty());
+                assert(!ParseArticlePages("[]", out) && out.empty());
+                assert(!ParseArticlePages("[{}]", out) && out.empty());
+
+                // 缺 preview_url 的页对：不得把下一页的 preview_url 借过来配对。
+                const std::string base2 =
+                    "https://hutuji.donglicao.com/files/draw_20260901_120001_abcdefghijklmnopqrstuv";
+                const std::string missing_preview =
+                    "[{\"url\":\"" +
+                    std::string("https://hutuji.donglicao.com/files/"
+                                "draw_20260901_120000_abcdefghijklmnopqrstuv.gcode") +
+                    "\"}," + Page("20260901_120001") + "]";
+                assert(!ParseArticlePages(missing_preview, out) && out.empty());
+
+                // 键序颠倒（preview_url 先）：本页 url 与其配对之间夹了别页的 url。
+                const std::string swapped = "[{\"preview_url\":\"" + base2 + ".png\",\"url\":\"" +
+                                            base2 + ".gcode\"}," + Page("20260901_120002") + "]";
+                assert(!ParseArticlePages(swapped, out) && out.empty());
+
+                // 扩展名互换：url 必须 .gcode、preview_url 必须 .png。
+                const std::string swapped_ext = "[{\"url\":\"" + base2 + ".png\",\"preview_url\":\"" +
+                                                base2 + ".gcode\"}]";
+                assert(!ParseArticlePages(swapped_ext, out) && out.empty());
+
+                // 任一页越出能力 URL 边界（这里是外站主机）即整体拒收。
+                const std::string evil =
+                    "[" + Page("20260901_120000") +
+                    ",{\"url\":\"https://evil.example/files/draw_x.gcode\","
+                    "\"preview_url\":\"https://evil.example/files/draw_x.png\"}]";
+                assert(!ParseArticlePages(evil, out) && out.empty());
+
+                // 值内反斜杠：能力 URL 字母表不含转义，一遇即拒（宁严勿宽）。
+                const std::string escaped = "[{\"url\":\"" + base2 +
+                                            ".gco\\\\de\",\"preview_url\":\"" + base2 + ".png\"}]";
+                assert(!ParseArticlePages(escaped, out) && out.empty());
+
+                // 上限：等于 max_pages 放行，超一页整体拒收（默认与云端 max_pages 同值）。
+                std::string many = "[";
+                for (size_t i = 0; i < kArticleMaxPages; ++i) {
+                    if (i) many += ",";
+                    many += Page("20260901_120000");
+                }
+                assert(ParseArticlePages(many + "]", out));
+                assert(out.size() == kArticleMaxPages);
+                assert(!ParseArticlePages(many + "," + Page("20260901_120000") + "]", out));
+                assert(out.empty());
+                assert(!ParseArticlePages(three, out, 2) && out.empty());
+                assert(ParseArticlePages(three, out, 3) && out.size() == 3);
+
+                // 空白与换行不影响键值扫描（云端 json.dumps 可能带空格）。
+                assert(ParseArticlePages("[ {\"url\" : \"" +
+                                             std::string("https://hutuji.donglicao.com/files/"
+                                                         "draw_20260901_120000_abcdefghijklmnopqrstuv"
+                                                         ".gcode") +
+                                             "\",\n \"preview_url\" : \"" +
+                                             std::string("https://hutuji.donglicao.com/files/"
+                                                         "draw_20260901_120000_abcdefghijklmnopqrstuv"
+                                                         ".png") +
+                                             "\" } ]",
+                                         out));
+                assert(out.size() == 1);
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, stem="hutuji_article_pages_contract_test")
+
     def test_draw_tool_requires_preview_then_explicit_confirmation(self):
         """hutuji.draw 只发布预览；用户确认必须走独立 hutuji.confirm。"""
         board = (ROOT / "main/boards/lichuang-dev/lichuang_dev_board.cc").read_text(
@@ -826,6 +940,68 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         rec_body = source[rec_start:start]
         self.assertNotIn("ReturnHomeAfterDraw", rec_body)
         self.assertNotIn("G1G90 X0Y0", rec_body)
+
+    def test_article_page_loop_advances_only_after_paper_change(self):
+        """多页文章（§10.2 pages）：翻页必须在换纸成功之后，且逐页重走
+        下载→灌流→归位→换纸整链。
+
+        翻页点若挪到换纸之前，第 2 页会画在第 1 页那张纸上（叠字，两页全废）；
+        若翻页时不 ReleaseBuffer，旧页 512KiB PSRAM 每页泄漏一份，20 页必 OOM；
+        若不清 repeat_mode_，下一页会走「复用 buffer」快路把上一页再画一次。
+        """
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        run_start = source.index("void Job::Run()")
+        run_body = source[run_start : source.index("\n}\n", run_start)]
+
+        # 页循环是 while(true) + 唯一 continue（翻页）+ 末尾 break（单页/收尾）。
+        self.assertIn("while (true) {", run_body)
+        advance = run_body.index("++article_index_;")
+        change_call = run_body.index("ok = ChangePaperAfterDraw();")
+        self.assertLess(change_call, advance)  # 换纸成功后才翻页
+        # 翻页只在 ok 分支（换纸失败/abort 不得推进页码）。
+        self.assertLess(run_body.index("} else if (ok) {"), advance)
+
+        advance_block = run_body[advance : run_body.index("continue;", advance)]
+        self.assertIn("url_ = article_pages_[article_index_].first;", advance_block)
+        self.assertIn("ReleaseBuffer();", advance_block)  # 防每页泄漏 512KiB
+        self.assertIn("repeat_mode_.store(false);", advance_block)  # 不得复用上一页
+        self.assertIn("paper_change_notified_ = false;", advance_block)  # 每页各播一次
+        self.assertIn("ok = false;", advance_block)  # 下一轮重新累计
+
+        # 单页语义不变：article_pages_ 空时不进翻页分支，直接 done。
+        self.assertIn("if (!article_pages_.empty() && article_index_ + 1 < article_pages_.size())",
+                      run_body)
+
+    def test_start_draw_pairs_pages_with_preview_and_repeat_restarts_article(self):
+        """StartDraw 的 pages 必须与 url/preview_url 同源；文章重画从第 1 页重来。
+
+        page[0] 不校验一致的话：屏幕预览是 A 页、pages[0] 是 B 页，用户按「开始画」
+        画出的与看到的不同。文章重画若走 buffer 快路只会重画最后一页（留存的就是它）。
+        """
+        source = (
+            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
+        ).read_text(encoding="utf-8")
+        start = source.index("std::string Job::StartDraw(")
+        body = source[start : source.index("\n}\n", start)]
+        self.assertIn("ParseArticlePages(pages_json, pages)", body)
+        self.assertIn("pages.front().first != url || pages.front().second != preview_url", body)
+        # 解析/配对校验必须早于 busy_ 抢占，非法参数不占用任务槽。
+        self.assertLess(body.index("ParseArticlePages"), body.index("busy_.exchange(true)"))
+
+        rep_start = source.index("std::string Job::RequestRepeat()")
+        rep_body = source[rep_start : source.index("\n}\n", rep_start)]
+        self.assertIn("article_pages_.empty() && buffer_replayable_.load()", rep_body)
+        self.assertIn("article_index_ = 0;", rep_body)
+        self.assertIn("url_ = article_pages_.front().first;", rep_body)
+
+        # status 页码只读原子（StatusJson 是 const 且不持 stream_mutex_）。
+        st_start = source.index("std::string Job::StatusJson()")
+        st_body = source[st_start : source.index("\n}\n", st_start)]
+        self.assertIn("article_total_.load(std::memory_order_relaxed)", st_body)
+        self.assertIn('cJSON_AddNumberToObject(root, "page"', st_body)
+        self.assertNotIn("article_pages_", st_body)
 
     def test_describe_grbl_error_mapping(self):
         """R20-S3-04：用户面中文映射表——8/10/110 有描述；90（通用 MessageFailed）
@@ -2164,7 +2340,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('Property("preview_url", kPropertyTypeString)', board)
         self.assertIn('mcp_server.AddTool("hutuji.confirm"', board)
-        self.assertIn("StartDraw(url, preview_url)", board)
+        self.assertIn("StartDraw(url, preview_url, pages)", board)
+        # 多页文章（§10.2 pages）：属性缺失时 LLM 无法表达多页，文章只会写第 1 页。
+        self.assertIn('Property("pages", kPropertyTypeString, std::string(""))', board)
+        self.assertIn('properties["pages"].value<std::string>()', board)
         self.assertIn("RequestConfirm()", board)
         # 单参 StartDraw 会编译失败，但更要防「只注册 draw 不注册 confirm」：
         # 那样预览停在 awaiting_confirmation，语音无法确认，只能点屏幕。
@@ -2905,6 +3084,42 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             if "ESP_LOG" in line:
                 self.assertNotIn("payload->code", line)
                 self.assertNotIn("body", line)
+
+    def test_conversation_report_guard_covers_every_board_that_links_it(self):
+        """会话上报的头/调用点守卫必须与 hutuji_conversation_report.cc 的编译面等价。
+
+        2026-09-01 实测：lichuang-dev 经板级 glob 把 boards/lichuang-dev/*.cc 全部
+        链入（含 hutuji_conversation_report.cc 与调用 InitConversationReport 的板文件），
+        但 application.cc 里的 include/调用点只守 waveshare 宏 → `'hutuji' has not been
+        declared`，lichuang-dev release 构建直接编译失败。凡链入该 .cc 的板型，
+        application.cc 侧守卫都必须放行。
+        """
+        app_cc = (ROOT / "main/application.cc").read_text(encoding="utf-8")
+        # 守卫宏必须同时覆盖两块板：waveshare 显式列入 CMake，lichuang-dev 走板级 glob。
+        self.assertIn("HUTUJI_CONVERSATION_REPORT_ENABLED", app_cc)
+        macro_def = app_cc[:app_cc.index("#define HUTUJI_CONVERSATION_REPORT_ENABLED")]
+        self.assertIn("CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5", macro_def[-400:])
+        self.assertIn("CONFIG_BOARD_TYPE_LICHUANG_DEV_S3", macro_def[-400:])
+        # 头与两处调用点都必须挂在该宏下，不得再直接守 waveshare 宏。
+        self.assertIn(
+            '#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED\n'
+            '#include "boards/lichuang-dev/hutuji_conversation_report.h"',
+            app_cc,
+        )
+        self.assertEqual(app_cc.count("hutuji::ReportConversationTurn("), 2)
+        cursor = 0
+        for idx in range(2):
+            call_at = app_cc.index("hutuji::ReportConversationTurn(", cursor)
+            cursor = call_at + 1
+            before = app_cc[:call_at]
+            self.assertIn("#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED", before[-400:],
+                          f"第 {idx + 1} 处上报调用缺守卫")
+        # 两块板都在自己的 InitializeTools 里起 worker，故编译面必须都放行。
+        for board_src in ("main/boards/lichuang-dev/lichuang_dev_board.cc",
+                          "main/boards/waveshare/esp32-s3-touch-lcd-3.5/"
+                          "esp32-s3-touch-lcd-3.5.cc"):
+            body = (ROOT / board_src).read_text(encoding="utf-8")
+            self.assertIn("hutuji::InitConversationReport();", body)
 
     def test_discover_miss_retries_cache_instead_of_skipping_plotter(self):
         """刷机/复位后 Telnet 槽位忙时不得扫网跳过缓存 IP（2026-08-22）。

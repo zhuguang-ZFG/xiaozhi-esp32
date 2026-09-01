@@ -20,6 +20,7 @@
 
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -309,10 +310,22 @@ static bool LooksLikePlannerSyncLine(const std::string& line) {
     return false;
 }
 
-std::string Job::StartDraw(const std::string& url, const std::string& preview_url) {
+std::string Job::StartDraw(const std::string& url, const std::string& preview_url,
+                           const std::string& pages_json) {
     if (!IsValidDrawCapabilityUrl(url, ".gcode") ||
         !IsValidDrawCapabilityUrl(preview_url, ".png")) {
         return "{\"error\":\"url/preview_url 必须是同站能力地址且扩展名正确\"}";
+    }
+    // 多页文章：pages 非空即文章模式；page[0] 必须与 url/preview_url 一致
+    // （云端两个字段都发，LLM 只传其一也不致画出与预览不同的内容）。
+    std::vector<std::pair<std::string, std::string>> pages;
+    if (!pages_json.empty()) {
+        if (!ParseArticlePages(pages_json, pages)) {
+            return "{\"error\":\"pages 必须是 1-20 组同站能力地址（url=gcode + preview_url=png）\"}";
+        }
+        if (pages.front().first != url || pages.front().second != preview_url) {
+            return "{\"error\":\"pages 第 1 页必须与 url/preview_url 一致\"}";
+        }
     }
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
@@ -348,6 +361,10 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     buffer_replayable_.store(false);
     url_ = url;
     preview_url_ = preview_url;
+    article_pages_ = std::move(pages);
+    article_index_ = 0;
+    article_total_.store(article_pages_.size(), std::memory_order_relaxed);
+    article_page_.store(article_pages_.empty() ? 0u : 1u, std::memory_order_relaxed);
     last_error_.clear();
     // 新任务作废旧预取：上一个任务的预取可能仍在跑，epoch 推进后其发布会被拒绝。
     CancelPrefetch();
@@ -826,11 +843,21 @@ std::string Job::RequestRepeat() {
         busy_.store(false);
         return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
     }
-    // 有留存 buffer 走快路（跳下载+CRC）；否则回落重新下载上次 url_
-    bool replay = buffer_replayable_.load() && buffer_ != nullptr && buffer_len_ > 0;
-    if (!replay && url_.empty()) {
+    // 有留存 buffer 走快路（跳下载+CRC）；否则回落重新下载上次 url_。
+    // 文章模式禁用快路：buffer 留存的只是最后一页，重画语义是整篇重写，
+    // 从第 1 页重新下载（TTL 内有效；过期按下载失败如实报错，同单页回落）。
+    bool replay = article_pages_.empty() && buffer_replayable_.load() &&
+                  buffer_ != nullptr && buffer_len_ > 0;
+    if (!replay && article_pages_.empty() && url_.empty()) {
         busy_.store(false);
         return "{\"error\":\"还没画过东西，没有可重画的内容\"}";
+    }
+    if (!article_pages_.empty()) {
+        // 文章重画从第 1 页重来；页码原子回到 1，status 立刻反映真实进度。
+        article_index_ = 0;
+        article_page_.store(1u, std::memory_order_relaxed);
+        url_ = article_pages_.front().first;
+        ReleaseBuffer();
     }
     if (!ResetAbortResetState()) {
         busy_.store(false);
@@ -1228,6 +1255,12 @@ std::string Job::StatusJson() const {
     }
     cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());
     cJSON_AddStringToObject(root, "state", state.c_str());
+    // 文章模式（§10.2 pages）：单页时两原子为 0，字段不出现。
+    const size_t article_total = article_total_.load(std::memory_order_relaxed);
+    if (article_total > 0) {
+        cJSON_AddNumberToObject(root, "page", article_page_.load(std::memory_order_relaxed));
+        cJSON_AddNumberToObject(root, "pages", article_total);
+    }
     cJSON_AddStringToObject(root, "grbl_state", Pipe::GrblStateName(pipe.GetGrblState()));
     float mx, my, mz;
     pipe.GetMachinePos(mx, my, mz);
@@ -1596,7 +1629,9 @@ void Job::Run() {
     // R21-F01/F08：一次性播报门控与失败单出口标记随任务复位。
     paper_change_notified_ = false;
     failure_notified_ = false;
-    do {
+    // 页循环：单页模式一轮即出；文章模式（article_pages_ 非空）在每页换纸成功后
+    // 推进 article_index_ 继续下一轮。循环内一切 break 保持原语义＝整单终止。
+    while (true) {
         if (abort_requested_.load()) {
             SetState("aborted");
             break;
@@ -1737,8 +1772,31 @@ void Job::Run() {
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("已取消");
         } else if (ok) {
+            if (!article_pages_.empty() && article_index_ + 1 < article_pages_.size()) {
+                // 文章翻页：换纸已成功，释放本页缓冲并推进到下一页重新下载。
+                // paper_change_notified_ 逐页重武装（每页各有一次 M30 播报）；
+                // 预取只对第 1 页有效，后续页 url 不同自然 miss 回落直下载。
+                ++article_index_;
+                article_page_.store(article_index_ + 1, std::memory_order_relaxed);
+                url_ = article_pages_[article_index_].first;
+                ReleaseBuffer();
+                repeat_mode_.store(false);
+                paper_change_notified_ = false;
+                ok = false;  // 下一轮重新累计本页成败
+                // 96 字节：中文每字 3 字节，这句满页约 53 字节，留足两位页码与余量
+                // （48 字节会截断成半个 UTF-8 字，TTS 读出乱码）。
+                char page_msg[96];
+                std::snprintf(page_msg, sizeof(page_msg), "第 %zu 页写完，换纸后继续（共 %zu 页）",
+                              article_index_, article_pages_.size());
+                Notify(page_msg);
+                continue;
+            }
             SetState("done");
-            Notify("出图完成，可以说「再来一次」直接重画");
+            if (article_pages_.empty()) {
+                Notify("出图完成，可以说「再来一次」直接重画");
+            } else {
+                Notify("文章写完了，可以说「再来一次」重写整篇");
+            }
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("画好啦！");
         } else {
@@ -1765,7 +1823,8 @@ void Job::Run() {
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("出错了");
         }
-    } while (false);
+        break;
+    }
 
     bool reset_ok = true;
     // R21-F02：abort 终态播报延到 while 循环外（stream_mutex_ 已释放、reset 结果

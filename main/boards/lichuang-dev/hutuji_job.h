@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace hutuji {
@@ -22,7 +23,8 @@ public:
     static Job& GetInstance();
 
     /** 下载并显示预览；不会启动机械运动，须随后 RequestConfirm。 */
-    std::string StartDraw(const std::string& url, const std::string& preview_url);
+    std::string StartDraw(const std::string& url, const std::string& preview_url,
+                          const std::string& pages_json = "");
 
     /** 用户看过预览后确认：此处才创建真正的出图任务。 */
     std::string RequestConfirm();
@@ -202,6 +204,17 @@ private:
     bool jog_step_loaded_ = false;
     std::string url_;
     std::string preview_url_;
+    // 多页文章（云端 hutuji_write chain push）：pages_json 解析自
+    // hutuji::ParseArticlePages，(url, preview_url) 有序对；article_index_ 是当前页。
+    // 空 vector = 单页模式（既有行为）。预览只出第 1 页，确认后逐页
+    // 下载→灌流→M30 换纸→下一页；重画从第 1 页重来（buffer_ 留存的只是最后一页）。
+    // 两者只在出图任务与 stream_mutex_ 内读写。
+    std::vector<std::pair<std::string, std::string>> article_pages_;
+    size_t article_index_ = 0;
+    // StatusJson 是 const 且不持 stream_mutex_，不能读上面两个成员；页码单独用原子
+    // 镜像发布（StartDraw/翻页写、status 读）。0 = 非文章模式，status 不出这两字段。
+    std::atomic<size_t> article_page_{0};
+    std::atomic<size_t> article_total_{0};
     // G-code 预取：预览待确认期间后台下载，确认时直接复用。
     // PSRAM 所有权：buffer_ 归出图任务持有（成功后 buffer_replayable_留存供重画，
     // 失败由 ReleaseBuffer 释放）；prefetch_buffer_ 在 Prefetch 阶段由预览任务
