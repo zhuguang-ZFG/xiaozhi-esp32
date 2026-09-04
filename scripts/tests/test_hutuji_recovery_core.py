@@ -2748,7 +2748,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         core = (ROOT / "main/boards/lichuang-dev/hutuji_recovery_core.h").read_text(
             encoding="utf-8"
         )
-        self.assertIn("kJogEnvelopeMaxXMm = 190.0f", core)
+        self.assertIn("kJogEnvelopeMaxXMm = 277.0f", core)
         self.assertIn("kJogEnvelopeMaxYMm = 190.0f", core)
         self.assertIn("kJogStepMm = 1.0f", core)
         self.assertIn("kJogStepMmFine = 1.0f", core)
@@ -2876,10 +2876,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("PerformanceReassertPeriodMs", core)
 
     def test_decide_jog_is_fail_closed_and_envelope_aligned(self):
-        """点动判定 fail-closed：非有限输入一律 kStalePosition，包线恰 190/190。
+        """点动判定 fail-closed：非有限输入一律 kStalePosition，包线恰 277/190。
 
         写字机无限位开关，新鲜 MPos + `DecideJog` 是点动唯一防线；包线与云端
-        `protocol.md` §5 限幅同源（X≤190 / Y≤190mm），漂移即撞机风险。目标点
+        `protocol.md` §5 限幅同源（X≤277 / Y≤190mm，X 长边 2026-09-04 用户实机确认），漂移即撞机风险。目标点
         恰贴包线合法（云端校验器同口径取等号），越出 1mm 步进即拒。
         """
         compiler = find_compiler()
@@ -2897,10 +2897,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 using namespace hutuji;
                 // 包线内与恰贴包线：放行。
                 assert(DecideJog(0.0f, 0.0f, kJogStepMm, 0.0f) == JogVerdict::kOk);
-                assert(DecideJog(189.0f, 189.0f, kJogStepMm, kJogStepMm) == JogVerdict::kOk);
+                assert(DecideJog(276.0f, 189.0f, kJogStepMm, kJogStepMm) == JogVerdict::kOk);
                 assert(DecideJog(1.0f, 1.0f, -kJogStepMm, -kJogStepMm) == JogVerdict::kOk);
                 // 越出包线：拒（四边各一例）。
-                assert(DecideJog(190.0f, 100.0f, kJogStepMm, 0.0f) == JogVerdict::kOutOfBounds);
+                assert(DecideJog(277.0f, 100.0f, kJogStepMm, 0.0f) == JogVerdict::kOutOfBounds);
                 assert(DecideJog(0.0f, 100.0f, -kJogStepMm, 0.0f) == JogVerdict::kOutOfBounds);
                 assert(DecideJog(100.0f, 190.0f, 0.0f, kJogStepMm) == JogVerdict::kOutOfBounds);
                 assert(DecideJog(100.0f, 0.0f, 0.0f, -kJogStepMm) == JogVerdict::kOutOfBounds);
@@ -2911,7 +2911,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 assert(DecideJog(100.0f, inf, 0.0f, kJogStepMm) == JogVerdict::kStalePosition);
                 assert(DecideJog(100.0f, 100.0f, nan, 0.0f) == JogVerdict::kStalePosition);
                 // 包线与步进常量逐值钉死，与云端 §5 / 奎享 `$J=` 序列同源。
-                static_assert(kJogEnvelopeMaxXMm == 190.0f, "X envelope drifted from cloud S5");
+                static_assert(kJogEnvelopeMaxXMm == 277.0f, "X envelope drifted from cloud S5");
                 static_assert(kJogEnvelopeMaxYMm == 190.0f, "Y envelope drifted from cloud S5");
                 static_assert(kJogStepMm == 1.0f, "fine jog step drifted from kx sequence");
                 static_assert(kJogStepMmFine == 1.0f, "fine step must stay 1mm");
@@ -2920,8 +2920,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 assert(std::string(kMotorDisableLine) == "$MD");
 
                 // 10mm 默认步进：恰贴包线放行，越出拒绝。
-                assert(DecideJog(180.0f, 0.0f, kJogStepMmCoarse, 0.0f) == JogVerdict::kOk);
-                assert(DecideJog(181.0f, 0.0f, kJogStepMmCoarse, 0.0f) == JogVerdict::kOutOfBounds);
+                assert(DecideJog(0.0f, 180.0f, 0.0f, kJogStepMmCoarse) == JogVerdict::kOk);
+                assert(DecideJog(0.0f, 181.0f, 0.0f, kJogStepMmCoarse) == JogVerdict::kOutOfBounds);
                 assert(ClampJogStepMm(1.0f) == kJogStepMmFine);
                 assert(ClampJogStepMm(10.0f) == kJogStepMmCoarse);
                 assert(ClampJogStepMm(7.0f) == kJogStepMmCoarse);
