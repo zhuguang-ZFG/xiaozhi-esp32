@@ -2760,6 +2760,13 @@ bool Job::StreamToGrbl() {
     // 照抄官方 stream.py 的 c_line / g_count 结构（§3）
     std::deque<size_t> c_line;    // 在途各行字节数（含 +1 换行，R1）
     size_t c_line_bytes_sum = 0;  // 在途字节数累加
+    // 诊断埋点（2026-09-05 提速批，判决 B「planner 空转」/C「逐行串行+RTT」假说）：
+    // 发送时记在途行数直方图、ok 到达时记 send→ok 延迟直方图，灌流结束打一行摘要。
+    // 纯计数不进任何判定路径；c_line_tick 与 c_line 严格同 push/pop/clear 对齐。
+    std::deque<uint32_t> c_line_tick;  // 与 c_line 对齐的发送时刻（ms）
+    uint32_t dbg_inflight_hist[6] = {};  // 在途 1 / 2-4 / 5-8 / 9-16 / 17-32 / 33+
+    uint32_t dbg_oklat_hist[6] = {};     // <5 / 5-20 / 20-50 / 50-100 / 100-300 / ≥300ms
+    uint64_t dbg_oklat_sum_ms = 0;
     size_t next_ = 0;             // 下一条待发
 
     // paper_pending：遇到换纸行时先排空 c_line，排空后在此标记下走逐行模式。
@@ -3014,6 +3021,12 @@ bool Job::StreamToGrbl() {
                     c_line.push_back(need);
                     c_line_bytes_sum += need;
                     ++next_;
+                    c_line_tick.push_back(xTaskGetTickCount() * portTICK_PERIOD_MS);
+                    {
+                        const size_t n = c_line.size();
+                        const int b = n <= 1 ? 0 : n <= 4 ? 1 : n <= 8 ? 2 : n <= 16 ? 3 : n <= 32 ? 4 : 5;
+                        ++dbg_inflight_hist[b];
+                    }
                     continue;
                 }
                 // 窗口满 → 落入收分支
@@ -3049,6 +3062,7 @@ bool Job::StreamToGrbl() {
         auto quiesce_for_abort = [&]() {
             pipe.DrainResponses();
             c_line.clear();
+            c_line_tick.clear();
             c_line_bytes_sum = 0;
             // 暂停超时提交的 abort 保留原因文言，用户侧才能对上 Notify 的解释。
             if (!pause_timeout_cancel) {
@@ -3064,6 +3078,7 @@ bool Job::StreamToGrbl() {
             pipe.SendRealtime('!');
             pipe.DrainResponses();
             c_line.clear();
+            c_line_tick.clear();
             c_line_bytes_sum = 0;
             last_error_ = error;
             stream_error_stop_required_.store(true, std::memory_order_release);
@@ -3136,6 +3151,13 @@ bool Job::StreamToGrbl() {
         if (wr == WaitResult::Ok) {
             c_line_bytes_sum -= c_line.front();
             c_line.pop_front();
+            {
+                const uint32_t lat = xTaskGetTickCount() * portTICK_PERIOD_MS - c_line_tick.front();
+                c_line_tick.pop_front();
+                const int b = lat < 5 ? 0 : lat < 20 ? 1 : lat < 50 ? 2 : lat < 100 ? 3 : lat < 300 ? 4 : 5;
+                ++dbg_oklat_hist[b];
+                dbg_oklat_sum_ms += lat;
+            }
             ++lines_sent_;
 
             // 进度屏显 250ms 节流：UpdateDisplayProgress 已走 Application::Schedule
@@ -3193,6 +3215,7 @@ bool Job::StreamToGrbl() {
                          released, ok_fallback_count, kMaxOkFallback);
                 lines_sent_ += released;
                 c_line.clear();
+                c_line_tick.clear();
                 c_line_bytes_sum = 0;
                 UpdateDisplayProgress();
                 continue;
@@ -3213,7 +3236,21 @@ bool Job::StreamToGrbl() {
         window_guard.MarkQuiesced();
         return false;
     }
-    ESP_LOGI(TAG, "灌流完成 lines_sent=%zu/%zu", lines_sent_, lines_total_);
+    {
+        const uint32_t ok_n = dbg_oklat_hist[0] + dbg_oklat_hist[1] + dbg_oklat_hist[2] +
+                              dbg_oklat_hist[3] + dbg_oklat_hist[4] + dbg_oklat_hist[5];
+        ESP_LOGI(TAG,
+                 "灌流完成 lines_sent=%zu/%zu | in-flight[1,2-4,5-8,9-16,17-32,33+]=%lu,%lu,%lu,%lu,%lu,%lu"
+                 " | ok延迟ms[<5,5-20,20-50,50-100,100-300,300+]=%lu,%lu,%lu,%lu,%lu,%lu 均=%lu",
+                 lines_sent_, lines_total_,
+                 (unsigned long)dbg_inflight_hist[0], (unsigned long)dbg_inflight_hist[1],
+                 (unsigned long)dbg_inflight_hist[2], (unsigned long)dbg_inflight_hist[3],
+                 (unsigned long)dbg_inflight_hist[4], (unsigned long)dbg_inflight_hist[5],
+                 (unsigned long)dbg_oklat_hist[0], (unsigned long)dbg_oklat_hist[1],
+                 (unsigned long)dbg_oklat_hist[2], (unsigned long)dbg_oklat_hist[3],
+                 (unsigned long)dbg_oklat_hist[4], (unsigned long)dbg_oklat_hist[5],
+                 (unsigned long)(ok_n ? dbg_oklat_sum_ms / ok_n : 0));
+    }
     return true;
 }
 

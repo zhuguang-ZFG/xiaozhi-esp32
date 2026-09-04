@@ -3624,6 +3624,22 @@ class StreamingLogGateTest(unittest.TestCase):
         self.assertIn('drain_on_send_.load() || line != "ok"', pipe_cc)
         self.assertIn("drain_on_send_.load() || !IsStreamingMotionLine(line)", pipe_cc)
 
+    def test_stream_diag_tick_queue_stays_aligned(self):
+        """诊断埋点不变量：c_line_tick 必须与 c_line 的每个变更点一一对应。
+
+        c_line 与 c_line_tick 靠并行 push/pop/clear 对齐；任何一处只动其一，
+        send→ok 延迟就会错位到别的行上（直方图说谎却不报错）。钉死计数相等，
+        新增 c_line 变更点时必须同步加 tick 操作，否则本测试先红。
+        """
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(job_cc.count("c_line.clear();"), job_cc.count("c_line_tick.clear();"))
+        self.assertEqual(job_cc.count("c_line.pop_front();"), job_cc.count("c_line_tick.pop_front();"))
+        self.assertEqual(job_cc.count("c_line.push_back("), job_cc.count("c_line_tick.push_back("))
+        self.assertIn("dbg_inflight_hist[", job_cc)
+        self.assertIn("dbg_oklat_hist[", job_cc)
+
 
 if __name__ == "__main__":
     unittest.main()
