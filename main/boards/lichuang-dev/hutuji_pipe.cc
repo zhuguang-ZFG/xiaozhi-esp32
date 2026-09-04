@@ -674,7 +674,12 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         last_line_ = line;
     }
-    ESP_LOGI(TAG, "<- %s", line.c_str());
+    // 窗口化灌流的 ok 每行一条，UART 115200 阻塞打印 ~2-3ms/条且占 PipeTask 收泵
+    // 时间；裸 ok 无诊断信息量（进度由 job 侧节流计数兜底），仅窗口化模式压制，
+    // 状态报告/错误/ALARM 与逐行模式（归位、换纸、探测）仍全量记录。
+    if (drain_on_send_.load() || line != "ok") {
+        ESP_LOGI(TAG, "<- %s", line.c_str());
+    }
 
     // `?` 状态报告：<State|MPos:X,Y,Z|...>
     if (!line.empty() && line.front() == '<' && line.back() == '>') {
@@ -1173,7 +1178,11 @@ bool Pipe::SendLine(const std::string& line) {
         ESP_LOGE(TAG, "发送失败: %s", line.c_str());
         return false;
     }
-    ESP_LOGI(TAG, "-> %s", line.c_str());
+    // 窗口化灌流的运动行每行 ~4-8ms 阻塞打印（UART 115200，持 write_mutex_），
+    // 是 S3 侧逐行固定成本大头；仅压制 G0-G3 运动行，控制行与逐行模式全量保留。
+    if (drain_on_send_.load() || !IsStreamingMotionLine(line)) {
+        ESP_LOGI(TAG, "-> %s", line.c_str());
+    }
     return true;
 }
 

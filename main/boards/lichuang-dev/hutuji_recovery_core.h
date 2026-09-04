@@ -18,6 +18,19 @@ inline constexpr size_t kStreamWindowBytes = 512;
 inline constexpr size_t kResponseQueueDepth = (kStreamWindowBytes - 1u) / 2u;
 
 /**
+ * 窗口化灌流中「量大到值得压日志」的运动行判定：G0/G1/G2/G3 开头即真。
+ *
+ * 背景（2026-09-05 静态时序审计）：灌流稳态每行在 UART 115200 上阻塞打印
+ * `-> %s`（TX，持 write_mutex_）与 `<- ok`（RX）合计 ~7ms/行，是 S3 侧唯一
+ * 成规模的逐行固定成本；控制行（G92/M30/`$`/探活）频率极低，不在压制面内。
+ * G4 在 §5 契约里本就禁入文件，不匹配即自然落回全量日志，无需单列。
+ */
+inline bool IsStreamingMotionLine(const std::string& line) {
+    return line.size() >= 2 && line[0] == 'G' &&
+           (line[1] == '0' || line[1] == '1' || line[1] == '2' || line[1] == '3');
+}
+
+/**
  * 解析 Grbl 的 `error` 应答为数字错误码；无法判定时返回 -1。
  *
  * **必须同时认数字与文本两种形态。** Grbl_Esp32 `Report.cpp:236` 在

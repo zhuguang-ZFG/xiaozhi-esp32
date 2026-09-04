@@ -3572,6 +3572,59 @@ class AbortHomeAfterStopTest(unittest.TestCase):
         self.assertIn("abort_home_done_.store(false);", job_cc)
 
 
+class StreamingLogGateTest(unittest.TestCase):
+    def test_streaming_motion_line_predicate(self):
+        """窗口化灌流压日志谓词：只放过 G0-G3 运动行，控制行/应答全部保留。
+
+        依据（2026-09-05 静态时序审计）：UART 115200 阻塞打印 TX+RX 合计 ~7ms/行，
+        是 S3 侧唯一成规模的逐行固定成本；压制面必须窄——G92/M30/`$`/`[ESP901]`
+        等低频控制行与 ok 之外的应答行是全量诊断凭据，不得被谓词吞掉。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+
+            int main() {
+                using hutuji::IsStreamingMotionLine;
+
+                // 运动行：灌流稳态的高频行。
+                assert(IsStreamingMotionLine("G0 X12.3Y45.6F8000"));
+                assert(IsStreamingMotionLine("G1 X12.3Y45.6F8000"));
+                assert(IsStreamingMotionLine("G1G90 Z5.0F10000"));  // 落笔/抬笔同压
+                assert(IsStreamingMotionLine("G2 X1Y2I0.5J0.25F8000"));
+                assert(IsStreamingMotionLine("G3 X1Y2I0.5J0.25F8000"));
+
+                // 控制/探测/应答：频率低且是诊断凭据，必须落回全量日志。
+                assert(!IsStreamingMotionLine("G92 Z0"));       // Z 基准旁路
+                assert(!IsStreamingMotionLine("G4 P0.1"));      // §5 禁入但出现必须可见
+                assert(!IsStreamingMotionLine("M30"));
+                assert(!IsStreamingMotionLine("[ESP901]"));
+                assert(!IsStreamingMotionLine("$I"));
+                assert(!IsStreamingMotionLine("?"));
+                assert(!IsStreamingMotionLine("ok"));
+                assert(!IsStreamingMotionLine("G"));            // 长度不足不判运动
+                assert(!IsStreamingMotionLine(""));
+                return 0;
+            }
+            """
+        )
+        HutujiRecoveryCoreTest._compile_and_run(self, compiler, source, "stream_log_gate")
+
+    def test_pipe_gates_per_line_logs_when_windowed(self):
+        """pipe.cc 双向逐行日志必须只在窗口化（drain_on_send_==false）下被压制。"""
+        pipe_cc = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('drain_on_send_.load() || line != "ok"', pipe_cc)
+        self.assertIn("drain_on_send_.load() || !IsStreamingMotionLine(line)", pipe_cc)
+
+
 if __name__ == "__main__":
     unittest.main()
 
