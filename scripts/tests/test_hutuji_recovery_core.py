@@ -1277,6 +1277,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         start = job_cc.index("void Job::WaitForAudioOutputIdle()")
         wait_fn = job_cc[start:job_cc.index("\n}\n", start)]
         self.assertIn("kDeviceStateSpeaking", wait_fn)
+        # 2026-09-06 评审补洞：deferred-start 先切 Listening 再播完残余，等待必须
+        # 同时盖 drain 尾——IsPlaybackIdle 入等待条件（speaking 态 || 未排空）。
+        self.assertIn("IsPlaybackIdle()", wait_fn)
+        self.assertIn("|| !app.IsPlaybackIdle()", wait_fn)
         self.assertNotIn("output_enabled()", wait_fn)
         self.assertNotIn("GetAudioCodec()", wait_fn)
         self.assertIn("pdMS_TO_TICKS(100)", wait_fn)

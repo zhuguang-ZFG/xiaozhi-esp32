@@ -1551,16 +1551,23 @@ bool Job::AdoptPrefetch() {
 }
 
 void Job::WaitForAudioOutputIdle() {
-    if (Application::GetInstance().GetDeviceState() != kDeviceStateSpeaking) {
+    auto& app = Application::GetInstance();
+    // 2026-09-06 评审实证补洞：deferred-start 会先切 Listening 再播完残余音频，
+    // 只看 Speaking 会在 drain 尾提前放行，功放+WiFi 下载叠峰（VSYS 根因同类）；
+    // 故等待条件 = speaking 态 或 播放未排空。drain 尾很短（<1s 量级），30s 上限兜底。
+    if (app.GetDeviceState() != kDeviceStateSpeaking && app.IsPlaybackIdle()) {
         return;
     }
     // 功放 + Wi-Fi 下载是无电池 VSYS 的最大组合负载；等播报结束再开始下载。
-    // 等「真在播」（speaking 态）而不是 codec 的 output_enabled 标志：双工 codec
-    // 监听期间为保 RX 时钟永不关输出（audio_service 刻意设计），后者让本等待恒吃满
-    // 30s 上限（2026-08-23 HIL 实测预览与 G-code 两段下载各白等 30s）。
+    // 等「真在播/真未排空」（speaking 态 + IsPlaybackIdle）而不是 codec 的
+    // output_enabled 标志：双工 codec 监听期间为保 RX 时钟永不关输出
+    // （audio_service 刻意设计），后者让本等待恒吃满 30s 上限（2026-08-23 HIL
+    // 实测预览与 G-code 两段下载各白等 30s）。IsPlaybackIdle 在纯监听（无播放
+    // 排队）时为真，不会重蹈恒等。
     // 上限 30s 防止异常状态死等；abort 立即放行，由下载循环的 abort 检查收敛。
     ESP_LOGI(TAG, "等待播报结束再下载（功放/WiFi 错峰）");
-    for (int i = 0; i < 300 && Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking;
+    for (int i = 0; i < 300 &&
+                   (app.GetDeviceState() == kDeviceStateSpeaking || !app.IsPlaybackIdle());
          ++i) {
         if (abort_requested_.load()) {
             return;

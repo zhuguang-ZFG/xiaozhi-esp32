@@ -70,6 +70,10 @@ public:
     // 音频通道真实状态（区别于设备态：Listening 态下通道可能已被云端 goodbye 关闭）。
     // 2026-09-06 起供 hutuji_job 死会话闸门使用：通道关 = 进度播报无人可听，跳过。
     bool IsAudioChannelOpened() const;
+    // 播放排空真实状态（speaking 态之外的 drain 尾也为忙）：2026-09-06 评审实证
+    // deferred-start 会先切 Listening 再播完残余音频，只看 Speaking 的下载等待会
+    // 在 drain 尾提前放行，功放+WiFi 下载组合负载叠峰（VSYS 上午根因同类）。
+    bool IsPlaybackIdle();
     
     /**
      * Request state transition

@@ -798,6 +798,10 @@ bool Application::IsAudioChannelOpened() const {
     return protocol_ && protocol_->IsAudioChannelOpened();
 }
 
+bool Application::IsPlaybackIdle() {
+    return audio_service_.IsPlaybackIdle();
+}
+
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
