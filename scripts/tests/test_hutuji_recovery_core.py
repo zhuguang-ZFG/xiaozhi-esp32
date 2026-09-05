@@ -3616,6 +3616,35 @@ class StreamingLogGateTest(unittest.TestCase):
         )
         HutujiRecoveryCoreTest._compile_and_run(self, compiler, source, "stream_log_gate")
 
+
+    def test_quiet_stream_log_macro_default_and_override(self):
+        """HUTUJI_QUIET_STREAM_LOG 构建期开关：默认 1（压制），-D/源内 define 0 得对照组。
+
+        A/B 归因纪律（2026-09-05）：日志开/关两变体必须同 HEAD 同埋点只差此开关，
+        刷旧基线当对照会丢 9262618 埋点、两组数据不可比——宏存在性与可覆盖性钉死。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        default_src = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+            static_assert(HUTUJI_QUIET_STREAM_LOG == 1, "默认必须压制");
+            int main() { return 0; }
+            """
+        )
+        override_src = textwrap.dedent(
+            r"""
+            #define HUTUJI_QUIET_STREAM_LOG 0
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+            static_assert(HUTUJI_QUIET_STREAM_LOG == 0, "覆盖必须生效");
+            int main() { return 0; }
+            """
+        )
+        HutujiRecoveryCoreTest._compile_and_run(self, compiler, default_src, "quiet_log_default")
+        HutujiRecoveryCoreTest._compile_and_run(self, compiler, override_src, "quiet_log_override")
+
     def test_pipe_gates_per_line_logs_when_windowed(self):
         """pipe.cc 双向逐行日志必须只在窗口化（drain_on_send_==false）下被压制。"""
         pipe_cc = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(

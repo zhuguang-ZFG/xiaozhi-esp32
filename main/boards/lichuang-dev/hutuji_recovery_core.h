@@ -18,6 +18,15 @@ inline constexpr size_t kStreamWindowBytes = 512;
 inline constexpr size_t kResponseQueueDepth = (kStreamWindowBytes - 1u) / 2u;
 
 /**
+ * 逐行灌流日志压制开关（构建期）：默认开；编译变体 -DHUTUJI_QUIET_STREAM_LOG=0
+ * 得「日志全开」对照组。A/B 归因必须同 HEAD 同埋点只差此开关——刷旧基线当
+ * 对照会丢 9262618 埋点，两组数据不可比（2026-09-05 advisory 纠正）。
+ */
+#ifndef HUTUJI_QUIET_STREAM_LOG
+#define HUTUJI_QUIET_STREAM_LOG 1
+#endif
+
+/**
  * 窗口化灌流中「量大到值得压日志」的运动行判定：G0/G1/G2/G3 开头即真。
  *
  * 背景（2026-09-05 静态时序审计）：灌流稳态每行在 UART 115200 上阻塞打印

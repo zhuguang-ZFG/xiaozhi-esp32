@@ -1149,6 +1149,13 @@ if(HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
     endif()
 endif()
 
+# 2026-09-05 A/B 归因开关（fable 会诊）：ON = 日志全开对照组（HUTUJI_QUIET_STREAM_LOG=0），
+# 默认 OFF = 压制。两变体同 HEAD 同埋点只差此 option，避免刷旧基线当对照丢埋点。
+option(HUTUJI_STREAM_LOG_VERBOSE "A/B control: keep per-line streaming logs (disable suppression)" OFF)
+if(HUTUJI_STREAM_LOG_VERBOSE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_QUIET_STREAM_LOG=0)
+endif()
+
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}
