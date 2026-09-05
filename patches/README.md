@@ -22,3 +22,11 @@ git apply patches/<name>.patch
 （`git apply` 不要求目标文件被 git 跟踪；路径以仓根为基准。）
 
 升级 `78__esp-ml307` 组件版本前先 `git apply --check`；上下文漂移则按补丁注释手工移植。
+
+## sdkconfig 钉（2026-09-06）
+
+根 `sdkconfig` 被 gitignore，以下关键项已钉进 `sdkconfig.defaults.esp32s3`（tracked）：
+
+- `CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1` + `CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y` + `CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32`：WiFi TX 缓冲必须动态。静态 16 块会把内部 RAM 钉到 activation 任务 8KB 栈分配失败、启动链静默全停（当日实测：激活挂死、无 OTA/模型/MQTT/NTP）。
+
+**任何 reconfigure / fullclean / 换机构建后，必须复核 `sdkconfig` 里这两项与 defaults 一致**（构建目录 resync 根 sdkconfig 的漂移曾静默覆盖此配置）。验证：`grep -E "TX_BUFFER_TYPE|DYNAMIC_TX_BUFFER_NUM" sdkconfig` 应为 `=1` 和 `=32`。
