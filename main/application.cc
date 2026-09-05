@@ -794,6 +794,10 @@ void Application::HandleToggleChatEvent() {
     }
 }
 
+bool Application::IsAudioChannelOpened() const {
+    return protocol_ && protocol_->IsAudioChannelOpened();
+}
+
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {

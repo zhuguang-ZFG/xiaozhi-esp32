@@ -67,6 +67,9 @@ public:
 
     DeviceState GetDeviceState() const { return state_machine_.GetState(); }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
+    // 音频通道真实状态（区别于设备态：Listening 态下通道可能已被云端 goodbye 关闭）。
+    // 2026-09-06 起供 hutuji_job 死会话闸门使用：通道关 = 进度播报无人可听，跳过。
+    bool IsAudioChannelOpened() const;
     
     /**
      * Request state transition

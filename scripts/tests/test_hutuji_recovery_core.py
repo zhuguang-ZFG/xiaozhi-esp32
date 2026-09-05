@@ -1369,6 +1369,30 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1", defaults)
         self.assertIn("CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32", defaults)
 
+    def test_stream_stall_marker_and_dead_session_notify_gate(self):
+        """2026-09-06 满页写字停顿事件（85 次 ~1.2s 中途 Idle）两件套：
+        灌流环 ok 断粮满一个 1000ms 切片打 [stall] 埋点（停顿相位证据面）；
+        进度播报死会话闸门——音频通道已关时跳过播报（当日实证：死会话期间
+        每条 5s 播报都被云端回 goodbye，46 次 churn + 页尾 180 次 IDLE1 看门狗），
+        通道活着时播报行为不变。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        app_h = (ROOT / "main/application.h").read_text(encoding="utf-8")
+        app_cc = (ROOT / "main/application.cc").read_text(encoding="utf-8")
+        # ①停顿埋点：收环首个完整切片超时打一行，带在途数
+        self.assertIn('[stall] ok_starved', job_cc)
+        self.assertIn("waited == slice", job_cc)
+        # ②闸门：Application 暴露真实通道状态（设备态 Listening 可能通道已死）
+        self.assertIn("bool IsAudioChannelOpened() const;", app_h)
+        self.assertIn("return protocol_ && protocol_->IsAudioChannelOpened();", app_cc)
+        # 闸门包住且只包住播报的 Schedule（屏显 UpdateDisplayProgress 不受限）
+        notify_block = job_cc[job_cc.index('出图进度: %d%%'):]
+        notify_block = notify_block[: notify_block.index("} else if (wr == WaitResult::Failed)")]
+        self.assertIn("if (Application::GetInstance().IsAudioChannelOpened())", notify_block)
+        self.assertLess(
+            notify_block.index("IsAudioChannelOpened()"),
+            notify_block.index("Schedule([this, text]() { Notify(text); })"),
+        )
+
     def test_mqtt_session_goodbye_and_stale_hello_guards(self):
         """goodbye 排队关闭须复核会话；空通道关闭无副作用；迟到 hello 被丢弃。
 

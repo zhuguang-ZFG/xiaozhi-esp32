@@ -3226,6 +3226,14 @@ bool Job::StreamToGrbl() {
             // 暂停结束（恢复或超时取消）后重置累计，下一次暂停另起新额度。
             paused_recv_ms = 0;
             waited += step;
+            // [stall] 断粮埋点（2026-09-06）：非暂停态下 ok 缺席满一个切片（≥1s）=
+            // 机器排干规划缓冲落 Idle 的可视停顿（当日长写字 job 实证 85 次）。一集
+            // 只打一行（waited 按 slice=1000 累加，==slice 即首片超时）；精确恢复
+            // 延迟由灌流完成时的 ok 延迟直方图给出。
+            if (waited == slice) {
+                ESP_LOGW(TAG, "[stall] ok_starved >=%ums in_flight=%zu", waited,
+                         c_line.size());
+            }
         }
 
         // R11-PIPE-01：循环退出后必须再复核一次。暂停超时提交 abort 时，在途行的
@@ -3277,7 +3285,13 @@ bool Job::StreamToGrbl() {
                 char buf[64];
                 snprintf(buf, sizeof(buf), "出图进度: %d%%", pct);
                 std::string text(buf);
-                Application::GetInstance().Schedule([this, text]() { Notify(text); });
+                // 2026-09-06 死会话闸门：音频通道已关（长 job 超云端会话 TTL 被
+                // goodbye）时，播报没人听得到，唯一效果是云端对死会话回 goodbye
+                // 制造 churn（当日满页写字实证 46 次 goodbye + 页尾 180 次 IDLE1
+                // 看门狗）；通道活着时行为不变。屏显进度走另一条路不受影响。
+                if (Application::GetInstance().IsAudioChannelOpened()) {
+                    Application::GetInstance().Schedule([this, text]() { Notify(text); });
+                }
             }
         } else if (wr == WaitResult::Failed) {
             // error 只丢坏行；character-counting 已灌入 RX 的后续行仍会执行。
