@@ -278,6 +278,7 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
@@ -297,7 +298,10 @@ void Application::HandleNetworkConnectedEvent() {
             return;
         }
 
-        xTaskCreate(
+        // 2026-09-06 实机事故：内部堆碎片（largest <8KB）时 xTaskCreate 静默失败，
+        // 设备永久停在 activating（无 OTA/模型/协议任何日志），用户视角「机启中」定格。
+        // 必须检查返回值并大声报错（附带堆八字段定位碎片化程度）。
+        BaseType_t created = xTaskCreate(
             [](void* arg) {
                 Application* app = static_cast<Application*>(arg);
                 app->ActivationTask();
@@ -305,6 +309,10 @@ void Application::HandleNetworkConnectedEvent() {
                 vTaskDelete(NULL);
             },
             "activation", 4096 * 2, this, 2, &activation_task_handle_);
+        if (created != pdPASS) {
+            ESP_LOGE(TAG, "activation 任务创建失败（内部堆不足/碎片化）");
+            SystemInfo::LogHeapNow("activation-task-fail");
+        }
     }
 
     // Update the status bar immediately to show the network state

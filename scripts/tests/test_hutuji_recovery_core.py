@@ -1292,6 +1292,40 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertLess(gcode_fn.index("WaitForAudioOutputIdle();"),
                         gcode_fn.index("CreateHttp"))
 
+    def test_hutuji_downloads_bounded_retry_contract(self):
+        """下载三处（预览/gcode/预取）有界重试口径（2026-09-06 定稿）：只对传输态
+        失败（Open/Read/截断）重试，abort/取消是 fatal 绝不重试——防重构退回单发、
+        或把用户取消判成可重试（取消后再拉两次整包，当日评审实锤修复）。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        self.assertIn("enum class FetchOutcome { kOk, kRetryable, kFatal };", job_cc)
+        self.assertIn("kFetchRetryBackoffMs", job_cc)
+        for start_marker, end_marker in (
+            ("bool Job::DownloadAndShowPreview", "void Job::Run("),
+            ("void Job::PrefetchGcode", "bool Job::AdoptPrefetch"),
+        ):
+            body = job_cc[job_cc.index(start_marker):job_cc.index(end_marker)]
+            self.assertIn("kFetchMaxAttempts", body, start_marker)
+            self.assertIn("FetchOutcome::kFatal", body, start_marker)
+        # DownloadToPsram 是 continue/return 直接分流（无枚举）：钉「有界 + abort 直接 return 而非 continue」
+        gcode_fn = job_cc[job_cc.index("bool Job::DownloadToPsram"):job_cc.index("bool Job::VerifyCrc")]
+        self.assertIn("kFetchMaxAttempts", gcode_fn)
+        abort_at = gcode_fn.index('last_error_ = "aborted"')
+        self.assertIn("return false;", gcode_fn[abort_at:abort_at + 80])
+        # 非 200（TTL 过期/名字非法）是确定性失败：必须 return 出循环，不得 continue 重试
+        not200_at = gcode_fn.index('last_error_ = "HTTP status "')
+        self.assertIn("return false;", gcode_fn[not200_at:not200_at + 260])
+        self.assertNotIn("continue;", gcode_fn[not200_at:not200_at + 260])
+        # abort 分支窗口内不得出现 kRetryable（窗口刻意收窄，不碰下一分支的合法赋值）
+        preview_fn = job_cc[job_cc.index("bool Job::DownloadAndShowPreview"):job_cc.index("void Job::Run(")]
+        aborted_at = preview_fn.index("if (aborted)")
+        self.assertNotIn("kRetryable", preview_fn[aborted_at:aborted_at + 160])
+        # 预取取消分支（「取消/中止是 fatal」注释所在）向前窗口不得出现 kRetryable
+        prefetch_fn = job_cc[job_cc.index("void Job::PrefetchGcode"):job_cc.index("bool Job::AdoptPrefetch")]
+        cancel_at = prefetch_fn.index("取消/中止是 fatal")
+        cancel_ctx = prefetch_fn[cancel_at - 160:cancel_at]
+        self.assertIn("if (prefetch_cancel_", cancel_ctx)
+        self.assertNotIn("kRetryable", cancel_ctx)
+
     def test_toggle_chat_interrupts_speaking_into_default_listening(self):
         """点击切换钮打断播报后必须直接进入默认监听模式，而不是只静音。"""
         app = (ROOT / "main/application.cc").read_text(encoding="utf-8")
@@ -3337,7 +3371,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
 
                 // 命名函数供 StatusJson 序列化
                 assert(std::strcmp(PaperPresentStateName(PaperPresentState::Yes), "yes") == 0);
-                assert(std::strcmp(PaperPresentStateName(PaperPresentState::No), "no") == 0);
+                // 2026-09-06 语义纠偏：No 是换纸成功终态/空闲常态（走纸槽传感器），
+                // 对云只能报 unknown，不得给 LLM 递「缺纸」话柄
+                assert(std::strcmp(PaperPresentStateName(PaperPresentState::No), "unknown") == 0);
                 assert(std::strcmp(PaperPresentStateName(PaperPresentState::Unknown), "unknown") == 0);
                 assert(std::strcmp(MotorEnStateName(MotorEnState::On), "on") == 0);
                 assert(std::strcmp(PanelHoldStateName(PanelHoldState::Off), "off") == 0);

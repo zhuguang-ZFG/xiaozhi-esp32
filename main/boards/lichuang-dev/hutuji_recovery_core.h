@@ -915,7 +915,12 @@ inline const char* PaperPresentStateName(PaperPresentState state) {
         case PaperPresentState::Yes:
             return "yes";
         case PaperPresentState::No:
-            return "no";
+            // 2026-09-06 语义纠偏落地（用户拍板「有纸无纸不用机器管」+ troubleshooting.md
+            // 纸路语义）：Paper= 是走纸槽传感器 GPIO34，不是画台有无纸——自动换纸成功终态
+            // 与空闲常态都读 No（纸尾边越过传感器），对云上报 "no" 会被 LLM 误播「缺纸」
+            // （当日实机：PanelHold=On 纸在夹持仍被判缺纸）。No 一律按 unknown 上报；
+            // 真缺纸证据只有换纸时序的 error:90/OUT_OF_PAPER。
+            return "unknown";
         default:
             return "unknown";
     }

@@ -10,6 +10,7 @@
 #include "http.h"
 #include "lvgl_display.h"
 #include "lvgl_image.h"
+#include "system_info.h"
 #include "settings.h"
 
 #include <esp_heap_caps.h>
@@ -36,6 +37,15 @@ namespace hutuji {
 namespace {
 constexpr size_t kMaxGcodeBytes = 512 * 1024;
 constexpr size_t kMaxPreviewBytes = 512 * 1024;
+// 2026-09-06 下载重试口径（评审定稿）：只对「传输态」失败重试（Open 失败 / Read<0 /
+// 体长截断），确定性失败（abort、非 200、CRC 头缺失、PSRAM 分配失败、PNG 解码失败）
+// 立即出局——取消后再下两次、404 白等 60s 都是错。退避递增：低谷压力源是 listening
+// 态持续在跑的 AFE/编码链（不是刚关掉的 TLS 连接），400ms 等长退避会三次落同一窗口。
+enum class FetchOutcome { kOk, kRetryable, kFatal };
+constexpr int kFetchMaxAttempts = 3;
+constexpr uint32_t kFetchRetryBackoffMs[kFetchMaxAttempts - 1] = {1200, 3000};
+constexpr uint32_t kFetchFirstTimeoutMs = 60000;   // 首试维持原口径
+constexpr uint32_t kFetchRetryTimeoutMs = 20000;   // 重试态收紧，避免最坏 3×60s
 constexpr uint32_t kOkTimeoutMs = 60000;
 constexpr uint32_t kPaperOkTimeoutMs = 90000;
 constexpr uint32_t kMotionOkTimeoutMs = 30000;
@@ -1387,73 +1397,96 @@ void Job::PrefetchGcode() {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         url = url_;
     }
-    WaitForAudioOutputIdle();
-    // 预取失败永远静默回落：确认时 Run() 走正常下载，用户无感知。
+    // 2026-09-06：预取是正常流程的主下载路径（确认时 AdoptPrefetch 命中即画，
+    // DownloadToPsram 只在预取未中时兜底），此前单发即弃——预览确认窗口内的 TLS
+    // 瞬时低谷（esp-tls -0x0084）会让确认被迫走完整重下，体感「确认后才开始下载」。
+    // 与预览/DownloadToPsram 同口径有界重试；确定性失败立即出局；失败仍静默回落。
+    WaitForAudioOutputIdle();  // 首试前的功放/WiFi 错峰（原口径）；重试分支内另行再等
     uint8_t* buf = nullptr;
     size_t len = 0;
     uint32_t crc = 0;
     bool ok = false;
-    do {
+    for (int attempt = 0; attempt < kFetchMaxAttempts && !ok; ++attempt) {
         if (prefetch_cancel_.load() || abort_requested_.load()) {
             break;
         }
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(kFetchRetryBackoffMs[attempt - 1]));
+            WaitForAudioOutputIdle();
+        }
+        FetchOutcome outcome = FetchOutcome::kFatal;
         auto network = Board::GetInstance().GetNetwork();
         if (!network) {
             break;
         }
         auto http = network->CreateHttp(3);
         if (!http) {
-            break;
+            outcome = FetchOutcome::kRetryable;
         }
-        http->SetTimeout(60000);
-        if (!http->Open("GET", url)) {
-            break;
-        }
-        if (http->GetStatusCode() != 200) {
+        while (http && !ok && outcome == FetchOutcome::kFatal) {
+            http->SetTimeout(attempt == 0 ? kFetchFirstTimeoutMs : kFetchRetryTimeoutMs);
+            if (!http->Open("GET", url)) {
+                outcome = FetchOutcome::kRetryable;
+                break;
+            }
+            if (http->GetStatusCode() != 200) {
+                http->Close();
+                break;  // 非 200（TTL/名字）确定性失败
+            }
+            const size_t content_length = http->GetBodyLength();
+            if (content_length == 0 || content_length > kMaxGcodeBytes) {
+                http->Close();
+                break;
+            }
+            std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
+            if (crc_hdr.empty()) {
+                crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
+            }
+            if (!ParseCrc32Header(crc_hdr, crc)) {
+                http->Close();
+                break;
+            }
+            // 与 DownloadToPsram 同策：只用 PSRAM，不饿死内部堆。
+            // 每轮重试前 buf 必为空（retryable 路径已 free+置 nullptr；取消路径到函数尾统一 free）——
+            // 不变量被破时宁可早死也不漏一整包 PSRAM。
+            if (buf != nullptr) {
+                ESP_LOGE(TAG, "预取 buf 生命周期错误：重试轮 buf 非空");
+                break;
+            }
+            buf = static_cast<uint8_t*>(
+                heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (buf == nullptr) {
+                http->Close();
+                break;
+            }
+            size_t total = 0;
+            while (total < content_length) {
+                if (prefetch_cancel_.load() || abort_requested_.load()) {
+                    break;
+                }
+                int n = http->Read(reinterpret_cast<char*>(buf + total), content_length - total);
+                if (n <= 0) {
+                    break;
+                }
+                total += static_cast<size_t>(n);
+            }
             http->Close();
-            break;
-        }
-        const size_t content_length = http->GetBodyLength();
-        if (content_length == 0 || content_length > kMaxGcodeBytes) {
-            http->Close();
-            break;
-        }
-        std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
-        if (crc_hdr.empty()) {
-            crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
-        }
-        if (!ParseCrc32Header(crc_hdr, crc)) {
-            http->Close();
-            break;
-        }
-        // 与 DownloadToPsram 同策：只用 PSRAM，不饿死内部堆。
-        buf = static_cast<uint8_t*>(
-            heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (buf == nullptr) {
-            http->Close();
-            break;
-        }
-        size_t total = 0;
-        while (total < content_length) {
             if (prefetch_cancel_.load() || abort_requested_.load()) {
+                break;  // 取消/中止是 fatal（outcome 保持 kFatal），绝不重试
+            }
+            if (total != content_length || !Crc32Matches(crc, Crc32Ieee(buf, total))) {
+                heap_caps_free(buf);
+                buf = nullptr;
+                outcome = FetchOutcome::kRetryable;
                 break;
             }
-            int n = http->Read(reinterpret_cast<char*>(buf + total), content_length - total);
-            if (n <= 0) {
-                break;
-            }
-            total += static_cast<size_t>(n);
+            len = total;
+            ok = true;
         }
-        http->Close();
-        if (total != content_length) {
+        if (!ok && outcome == FetchOutcome::kFatal) {
             break;
         }
-        if (!Crc32Matches(crc, Crc32Ieee(buf, total))) {
-            break;
-        }
-        len = total;
-        ok = true;
-    } while (false);
+    }
     if (ok) {
         std::lock_guard<std::mutex> lock(prefetch_mutex_);
         // epoch 变了说明新任务已开始或本任务被作废：产物不得发布。
@@ -1527,81 +1560,111 @@ void Job::WaitForAudioOutputIdle() {
 }
 
 bool Job::DownloadAndShowPreview(const std::string& url) {
+    SystemInfo::LogHeapNow("preview-begin");  // 取证 2026-09-06：阶段归因 TLS 失败时谁在占内部 RAM
     auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay());
     if (display == nullptr) {
         ESP_LOGW(TAG, "无 LVGL 显示，跳过预览");
         return false;
     }
-    WaitForAudioOutputIdle();
-    auto network = Board::GetInstance().GetNetwork();
-    if (!network) {
-        return false;
-    }
-    auto http = network->CreateHttp(3);
-    if (!http) {
-        return false;
-    }
-    http->SetTimeout(60000);
-    if (!http->Open("GET", url)) {
-        return false;
-    }
-    if (http->GetStatusCode() != 200) {
-        ESP_LOGW(TAG, "预览 HTTP status %d", http->GetStatusCode());
-        http->Close();
-        return false;
-    }
-    const size_t content_length = http->GetBodyLength();
-    if (content_length == 0 || content_length > kMaxPreviewBytes) {
-        ESP_LOGW(TAG, "预览长度非法 %u", (unsigned)content_length);
-        http->Close();
-        return false;
-    }
-    std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
-    if (crc_hdr.empty()) {
-        crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
-    }
-    uint32_t expected_crc = 0;
-    if (!ParseCrc32Header(crc_hdr, expected_crc)) {
-        ESP_LOGW(TAG, "预览缺少或非法 X-Hutuji-CRC32");
-        http->Close();
-        return false;
-    }
-    // 与 G-code 同策：只用 PSRAM，不回落内部堆，避免饿死 WiFi/音频。
-    auto* data = static_cast<uint8_t*>(
-        heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (data == nullptr) {
-        http->Close();
-        return false;
-    }
-    size_t total = 0;
-    bool aborted = false;
-    while (total < content_length) {
-        if (abort_requested_.load()) {
-            aborted = true;
-            break;
-        }
-        int n = http->Read(reinterpret_cast<char*>(data + total), content_length - total);
-        if (n < 0) {
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        total += static_cast<size_t>(n);
-    }
-    http->Close();
-    if (aborted || total != content_length || !Crc32Matches(expected_crc, Crc32Ieee(data, total))) {
-        heap_caps_free(data);
-        return false;
-    }
-    // LvglAllocatedImage 构造成功即接管 data 的所有权（析构里 heap_caps_free）；
-    // 只有构造抛出（PNG 头非法）时才由本函数释放，否则就是 double free。
+    // 2026-09-06：TLS 读在音频活跃期会因内部堆瞬时低谷失败（esp-aes 的 1600B DMA
+    // 块分配不到，esp-tls -0x0084）——只对这类传输态失败重试；abort/非 200/CRC 头/
+    // PSRAM/解码等确定性失败立即出局（口径见 kFetchRetryBackoffMs 注释块）。
     std::unique_ptr<LvglAllocatedImage> image;
-    try {
-        image = std::make_unique<LvglAllocatedImage>(data, total);
-    } catch (const std::exception& exc) {
-        ESP_LOGW(TAG, "预览 PNG 解码失败: %s", exc.what());
-        heap_caps_free(data);
+    for (int attempt = 0; attempt < kFetchMaxAttempts && !image; ++attempt) {
+        if (abort_requested_.load()) {
+            break;
+        }
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "预览下载重试 %d/%d", attempt, kFetchMaxAttempts - 1);
+            vTaskDelay(pdMS_TO_TICKS(kFetchRetryBackoffMs[attempt - 1]));
+        }
+        FetchOutcome outcome = FetchOutcome::kFatal;
+        image = [this, &url, attempt, &outcome]() -> std::unique_ptr<LvglAllocatedImage> {
+            WaitForAudioOutputIdle();
+            auto network = Board::GetInstance().GetNetwork();
+            if (!network) {
+                return nullptr;
+            }
+            auto http = network->CreateHttp(3);
+            if (!http) {
+                outcome = FetchOutcome::kRetryable;  // 堆瞬态可致创建失败
+                return nullptr;
+            }
+            http->SetTimeout(attempt == 0 ? kFetchFirstTimeoutMs : kFetchRetryTimeoutMs);
+            if (!http->Open("GET", url)) {
+                outcome = FetchOutcome::kRetryable;
+                return nullptr;
+            }
+            if (http->GetStatusCode() != 200) {
+                ESP_LOGW(TAG, "预览 HTTP status %d", http->GetStatusCode());
+                http->Close();
+                return nullptr;
+            }
+            const size_t content_length = http->GetBodyLength();
+            if (content_length == 0 || content_length > kMaxPreviewBytes) {
+                ESP_LOGW(TAG, "预览长度非法 %u", (unsigned)content_length);
+                http->Close();
+                return nullptr;
+            }
+            std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
+            if (crc_hdr.empty()) {
+                crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
+            }
+            uint32_t expected_crc = 0;
+            if (!ParseCrc32Header(crc_hdr, expected_crc)) {
+                ESP_LOGW(TAG, "预览缺少或非法 X-Hutuji-CRC32");
+                http->Close();
+                return nullptr;
+            }
+            // 与 G-code 同策：只用 PSRAM，不回落内部堆，避免饿死 WiFi/音频。
+            auto* data = static_cast<uint8_t*>(
+                heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (data == nullptr) {
+                http->Close();
+                return nullptr;
+            }
+            size_t total = 0;
+            bool aborted = false;
+            while (total < content_length) {
+                if (abort_requested_.load()) {
+                    aborted = true;
+                    break;
+                }
+                int n = http->Read(reinterpret_cast<char*>(data + total), content_length - total);
+                if (n <= 0) {
+                    break;
+                }
+                total += static_cast<size_t>(n);
+            }
+            http->Close();
+            SystemInfo::LogHeapNow("preview-read-done");  // 取证：TLS 读谷底（成败都打）
+            if (aborted) {
+                heap_caps_free(data);
+                return nullptr;  // outcome 默认 kFatal：用户取消绝不重试
+            }
+            if (total != content_length || !Crc32Matches(expected_crc, Crc32Ieee(data, total))) {
+                heap_caps_free(data);
+                outcome = FetchOutcome::kRetryable;  // 传输截断/中途换文件
+                return nullptr;
+            }
+            // LvglAllocatedImage 构造成功即接管 data 的所有权（析构里 heap_caps_free）；
+            // 只有构造抛出（PNG 头非法）时才由本函数释放，否则就是 double free。
+            std::unique_ptr<LvglAllocatedImage> img;
+            try {
+                img = std::make_unique<LvglAllocatedImage>(data, total);
+            } catch (const std::exception& exc) {
+                ESP_LOGW(TAG, "预览 PNG 解码失败: %s", exc.what());
+                heap_caps_free(data);
+                return nullptr;
+            }
+            SystemInfo::LogHeapNow("preview-decoded");
+            return img;
+        }();
+        if (!image && outcome == FetchOutcome::kFatal) {
+            break;  // 确定性失败：立即出局，不做无谓重试
+        }
+    }
+    if (!image) {
         return false;
     }
     // 触屏按钮是主路径（绘图/嘈杂环境下语音最不可靠），语音确认仍并行有效。
@@ -1889,90 +1952,108 @@ void Job::Run() {
 }
 
 bool Job::DownloadToPsram(const std::string& url) {
-    WaitForAudioOutputIdle();
-    ReleaseBuffer();
-    auto network = Board::GetInstance().GetNetwork();
-    if (!network) {
-        last_error_ = "无网络";
-        return false;
-    }
-    auto http = network->CreateHttp(3);
-    if (!http) {
-        last_error_ = "CreateHttp 失败";
-        return false;
-    }
-    http->SetTimeout(60000);
-    // 生产域由 IsValidDrawUrl 强制 HTTPS；HTTP 只允许 RFC1918 联调主机。
-    if (!http->Open("GET", url)) {
-        last_error_ = "HTTP Open 失败";
-        return false;
-    }
-    if (http->GetStatusCode() != 200) {
-        last_error_ = "HTTP status " + std::to_string(http->GetStatusCode());
-        http->Close();
-        return false;
-    }
-
-    size_t content_length = http->GetBodyLength();
-    if (content_length == 0) {
-        last_error_ = "Content-Length 为 0";
-        http->Close();
-        return false;
-    }
-    if (content_length > kMaxGcodeBytes) {
-        last_error_ = "超过 512KB";
-        http->Close();
-        return false;
-    }
-
-    std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
-    if (crc_hdr.empty()) {
-        crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
-    }
-    if (!ParseCrc32Header(crc_hdr, expect_crc_)) {
-        last_error_ = crc_hdr.empty() ? "缺少 X-Hutuji-CRC32" : "X-Hutuji-CRC32 格式无效";
-        http->Close();
-        return false;
-    }
-
-    // 只用 PSRAM，不回落内部 RAM（S3-P3c）：中等文件回落可能成功但饿死内部堆，
-    // 把「下载失败」换成 WiFi/音频不可预期崩溃；fail closed 更可诊断。
-    buffer_ = static_cast<uint8_t*>(
-        heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (buffer_ == nullptr) {
-        last_error_ = "PSRAM 分配失败";
-        http->Close();
-        return false;
-    }
-
-    size_t total = 0;
-    while (total < content_length) {
+    // 2026-09-06：与预览同策的有界重试——只对传输态失败（Open/Read/截断）重试，
+    // 确定性失败（404/CRC 头/PSRAM）立即出局；退避与超时口径见 kFetchRetryBackoffMs 注释块。
+    for (int attempt = 0; attempt < kFetchMaxAttempts; ++attempt) {
         if (abort_requested_.load()) {
-            http->Close();
             last_error_ = "aborted";
             return false;
         }
-        int n = http->Read(reinterpret_cast<char*>(buffer_ + total), content_length - total);
-        if (n < 0) {
-            last_error_ = "HTTP Read 失败";
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "G-code 下载重试 %d/%d", attempt, kFetchMaxAttempts - 1);
+            vTaskDelay(pdMS_TO_TICKS(kFetchRetryBackoffMs[attempt - 1]));
+        }
+        WaitForAudioOutputIdle();
+        SystemInfo::LogHeapNow(attempt == 0 ? "gcode-dl-begin" : "gcode-dl-retry");
+        ReleaseBuffer();
+        auto network = Board::GetInstance().GetNetwork();
+        if (!network) {
+            last_error_ = "无网络";
+            return false;  // 无网络接口不是瞬态类，重试无意义
+        }
+        auto http = network->CreateHttp(3);
+        if (!http) {
+            last_error_ = "CreateHttp 失败";
+            continue;
+        }
+        http->SetTimeout(attempt == 0 ? kFetchFirstTimeoutMs : kFetchRetryTimeoutMs);
+        // 生产域由 IsValidDrawUrl 强制 HTTPS；HTTP 只允许 RFC1918 联调主机。
+        if (!http->Open("GET", url)) {
+            last_error_ = "HTTP Open 失败";
+            continue;
+        }
+        if (http->GetStatusCode() != 200) {
+            last_error_ = "HTTP status " + std::to_string(http->GetStatusCode());
+            http->Close();
+            return false;  // 404（TTL 过期/名字非法）是确定性失败，重试只会拖延报错
+        }
+
+        size_t content_length = http->GetBodyLength();
+        if (content_length == 0) {
+            last_error_ = "Content-Length 为 0";
             http->Close();
             return false;
         }
-        if (n == 0) {
-            break;
+        if (content_length > kMaxGcodeBytes) {
+            last_error_ = "超过 512KB";
+            http->Close();
+            return false;
         }
-        total += static_cast<size_t>(n);
-    }
-    http->Close();
 
-    if (total != content_length) {
-        last_error_ =
-            "长度不符 expect=" + std::to_string(content_length) + " got=" + std::to_string(total);
-        return false;
+        std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
+        if (crc_hdr.empty()) {
+            crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
+        }
+        if (!ParseCrc32Header(crc_hdr, expect_crc_)) {
+            last_error_ = crc_hdr.empty() ? "缺少 X-Hutuji-CRC32" : "X-Hutuji-CRC32 格式无效";
+            http->Close();
+            return false;
+        }
+
+        // 只用 PSRAM，不回落内部 RAM（S3-P3c）：中等文件回落可能成功但饿死内部堆，
+        // 把「下载失败」换成 WiFi/音频不可预期崩溃；fail closed 更可诊断。
+        buffer_ = static_cast<uint8_t*>(
+            heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (buffer_ == nullptr) {
+            last_error_ = "PSRAM 分配失败";
+            http->Close();
+            return false;
+        }
+
+        size_t total = 0;
+        bool read_failed = false;
+        while (total < content_length) {
+            if (abort_requested_.load()) {
+                http->Close();
+                last_error_ = "aborted";
+                return false;
+            }
+            int n = http->Read(reinterpret_cast<char*>(buffer_ + total), content_length - total);
+            if (n < 0) {
+                last_error_ = "HTTP Read 失败";
+                read_failed = true;
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+            total += static_cast<size_t>(n);
+        }
+        http->Close();
+        SystemInfo::LogHeapNow("gcode-dl-done");  // 取证：TLS 读谷底（成败都打）
+        if (total != content_length) {
+            if (!read_failed) {
+                last_error_ =
+                    "长度不符 expect=" + std::to_string(content_length) + " got=" + std::to_string(total);
+            }
+            ReleaseBuffer();  // 半截缓冲不得留给下一次重试/CRC
+            continue;
+        }
+        buffer_len_ = total;
+        ESP_LOGI(TAG, "下载完成 %u 字节 crc_hdr=%08x", (unsigned)buffer_len_, (unsigned)expect_crc_);
+        return true;
     }
-    buffer_len_ = total;
-    ESP_LOGI(TAG, "下载完成 %u 字节 crc_hdr=%08x", (unsigned)buffer_len_, (unsigned)expect_crc_);
-    return true;
+    return false;
 }
 
 bool Job::VerifyCrc() {
