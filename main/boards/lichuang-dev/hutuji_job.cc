@@ -9,6 +9,7 @@
 #include "display.h"
 #include "http.h"
 #include "lvgl_display.h"
+#include "lcd_display.h"
 #include "lvgl_image.h"
 #include "system_info.h"
 #include "settings.h"
@@ -190,6 +191,12 @@ void Job::StartPerformanceHold() {
         const uint32_t period_ms = hutuji::PerformanceReassertPeriodMs(kJogFreshStateTimeoutMs);
         esp_timer_start_periodic(performance_timer_, (uint64_t)period_ms * 1000ULL);
     }
+    // job 活跃期暂停 grobot 全脸动画：Render 与 TLS 加密同核（CPU1）互抢，
+    // 2026-09-06 晚实证下载窗口内 IDLE1 看门狗风暴 + TLS 握手被拖至数秒
+    // （「一直在下载中」5.5 分钟才报错）。失败路径（display 为空/无脸）空操作。
+    if (auto* lcd = dynamic_cast<LcdDisplay*>(Board::GetInstance().GetDisplay())) {
+        lcd->SetGrobotEyesPaused(true);
+    }
 }
 
 void Job::StopPerformanceHold() {
@@ -204,6 +211,10 @@ void Job::StopPerformanceHold() {
     // （与 application.cc 的就绪/音频关回调同口径）。此调用本身幂等。
     Board::GetInstance().SetPowerSaveLevel(AppNeedsPerformance() ? PowerSaveLevel::PERFORMANCE
                                                                  : PowerSaveLevel::LOW_POWER);
+    // 与 StartPerformanceHold 的暂停配对：job 窗口结束恢复全脸动画。
+    if (auto* lcd = dynamic_cast<LcdDisplay*>(Board::GetInstance().GetDisplay())) {
+        lcd->SetGrobotEyesPaused(false);
+    }
 }
 
 void Job::ReassertPerformance() {
@@ -1554,7 +1565,7 @@ void Job::WaitForAudioOutputIdle() {
     auto& app = Application::GetInstance();
     // 2026-09-06 评审实证补洞：deferred-start 会先切 Listening 再播完残余音频，
     // 只看 Speaking 会在 drain 尾提前放行，功放+WiFi 下载叠峰（VSYS 根因同类）；
-    // 故等待条件 = speaking 态 或 播放未排空。drain 尾很短（<1s 量级），30s 上限兜底。
+    // 故等待条件 = speaking 态 或 播放未排空。
     if (app.GetDeviceState() != kDeviceStateSpeaking && app.IsPlaybackIdle()) {
         return;
     }
@@ -1564,9 +1575,13 @@ void Job::WaitForAudioOutputIdle() {
     // （audio_service 刻意设计），后者让本等待恒吃满 30s 上限（2026-08-23 HIL
     // 实测预览与 G-code 两段下载各白等 30s）。IsPlaybackIdle 在纯监听（无播放
     // 排队）时为真，不会重蹈恒等。
-    // 上限 30s 防止异常状态死等；abort 立即放行，由下载循环的 abort 检查收敛。
+    // 上限分流：Speaking 态 30s（播报可能很长）；仅 drain 尾（非 Speaking）3s——
+    // 残余排空实测亚秒级，僵尸播放态下 30s×每轮重试会把下载拖成分钟级
+    // （2026-09-06 晚「一直在下载中」实证 5.5 分钟）。abort 立即放行，由下载循环
+    // 的 abort 检查收敛。
     ESP_LOGI(TAG, "等待播报结束再下载（功放/WiFi 错峰）");
-    for (int i = 0; i < 300 &&
+    const int cap = app.GetDeviceState() == kDeviceStateSpeaking ? 300 : 30;
+    for (int i = 0; i < cap &&
                    (app.GetDeviceState() == kDeviceStateSpeaking || !app.IsPlaybackIdle());
          ++i) {
         if (abort_requested_.load()) {

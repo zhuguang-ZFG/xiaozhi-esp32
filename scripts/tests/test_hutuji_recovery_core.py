@@ -1281,6 +1281,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 同时盖 drain 尾——IsPlaybackIdle 入等待条件（speaking 态 || 未排空）。
         self.assertIn("IsPlaybackIdle()", wait_fn)
         self.assertIn("|| !app.IsPlaybackIdle()", wait_fn)
+        # drain 尾等待 3s 分流（僵尸播放态 30s×重试轮 = 分钟级卡死，当日实证）
+        self.assertIn("kDeviceStateSpeaking ? 300 : 30", wait_fn)
         self.assertNotIn("output_enabled()", wait_fn)
         self.assertNotIn("GetAudioCodec()", wait_fn)
         self.assertIn("pdMS_TO_TICKS(100)", wait_fn)
@@ -1416,7 +1418,6 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("if (udp == nullptr) {", close_fn)
         self.assertLess(close_fn.index("if (udp == nullptr) {"),
                         close_fn.index("if (send_goodbye) {"))
-
         open_fn = mqtt_cc[mqtt_cc.index("bool MqttProtocol::OpenAudioChannel"):]
         open_fn = open_fn[: open_fn.index("std::string MqttProtocol::GetHelloMessage")]
         self.assertIn("hello_pending_ = true;", open_fn)
@@ -1431,6 +1432,26 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertLess(parse_fn.index("if (!hello_pending_) {"),
                         parse_fn.index('cJSON_GetObjectItem(root, "transport")'))
         self.assertIn("std::atomic<bool> hello_pending_", mqtt_h)
+
+    def test_grobot_eyes_paused_during_job_window(self):
+        """job 活跃期（Start/StopPerformanceHold 持有窗口）必须暂停 grobot 全脸动画：
+        2026-09-06 晚实证——眼睛 30fps Render 与 TLS 加密同核（CPU1）互抢，下载窗口
+        IDLE1 看门狗风暴 + TLS 握手拖至数秒，「一直在下载中」5.5 分钟才报错。
+        暂停/恢复必须配对，且经 LcdDisplay passthrough 带 DisplayLockGuard。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        eyes_cc = (ROOT / "main/boards/lichuang-dev/grobot_eyes.cc").read_text(encoding="utf-8")
+        lcd_cc = (ROOT / "main/display/lcd_display.cc").read_text(encoding="utf-8")
+        start = job_cc.index("void Job::StartPerformanceHold()")
+        start_fn = job_cc[start:job_cc.index("\n}\n", start)]
+        stop = job_cc.index("void Job::StopPerformanceHold()")
+        stop_fn = job_cc[stop:job_cc.index("\n}\n", stop)]
+        self.assertIn("SetGrobotEyesPaused(true)", start_fn)
+        self.assertIn("SetGrobotEyesPaused(false)", stop_fn)
+        self.assertIn("lv_timer_pause(timer_)", eyes_cc)
+        self.assertIn("lv_timer_resume(timer_)", eyes_cc)
+        passthrough = lcd_cc[lcd_cc.index("void LcdDisplay::SetGrobotEyesPaused"):]
+        self.assertIn("DisplayLockGuard", passthrough[:400])
+
 
     def test_waveshare_boot_button_wakes_power_save(self):
         """省电后按 BOOT 必须先恢复背光和正常电源状态，再切换聊天。"""

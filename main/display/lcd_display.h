@@ -194,6 +194,10 @@ public:
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
     virtual void SetupUI() override;
+    /** job 活跃期暂停 grobot 全脸动画（TLS 下载与 Render 同核互抢的实证修复，
+     *  2026-09-06 晚「一直在下载中」）；无眼睛实例时为空操作。调用方可跨任务，
+     *  内部自带 DisplayLockGuard。 */
+    void SetGrobotEyesPaused(bool on);
     // Add theme switching function
     virtual void SetTheme(Theme* theme) override;
 

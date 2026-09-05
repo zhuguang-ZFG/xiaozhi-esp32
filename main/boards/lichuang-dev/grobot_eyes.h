@@ -85,6 +85,10 @@ public:
     void SetSpeaking(bool on);
     /** 聆听中：瞳孔放大 ~18%（专注倾听的视觉反馈）。 */
     void SetListening(bool on);
+    /** 暂停/恢复 30fps 动画定时器（job 活跃期调用）：全脸 Render 与 TLS 加密
+     *  同核（CPU1）互抢，2026-09-06 晚实证下载期间眼睛动画致 IDLE1 看门狗风暴 +
+     *  TLS 握手被拖数秒（「一直在下载中」5.5 分钟）。暂停只停动画帧，静帧保留。 */
+    void SetPaused(bool on);
 
 private:
     static void TimerCb(lv_timer_t* t);

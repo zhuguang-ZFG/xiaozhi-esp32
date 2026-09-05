@@ -296,6 +296,17 @@ void GrobotEyes::SetSpeaking(bool on) { speaking_ = on; }
 
 void GrobotEyes::SetListening(bool on) { listening_ = on; }
 
+void GrobotEyes::SetPaused(bool on) {
+    if (timer_ == nullptr) {
+        return;
+    }
+    if (on) {
+        lv_timer_pause(timer_);
+    } else {
+        lv_timer_resume(timer_);
+    }
+}
+
 void GrobotEyes::BufHLine(int x0, int x1, int y, FacePaint p) {
     if (y < 0 || y >= h_)
         return;

@@ -2302,6 +2302,18 @@ void LcdDisplay::SetupUI() {
 #else
 #define MAX_MESSAGES 20
 #endif
+
+void LcdDisplay::SetGrobotEyesPaused(bool on) {
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
+    if (grobot_eyes_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    grobot_eyes_->SetPaused(on);
+#else
+    (void)on;
+#endif
+}
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
