@@ -4,6 +4,19 @@
 #include "audio_codec.h"
 #include "board.h"
 #include "display.h"
+// hutuji 编译面：waveshare 3.5 与 lichuang-dev 两块板都链入
+// boards/lichuang-dev/hutuji_*.cc（前者显式列入 CMake，后者经板级 glob），
+// 故会话上报的头与调用点必须同条件守卫；其余板型两者都不编。
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+#define HUTUJI_CONVERSATION_REPORT_ENABLED 1
+#endif
+#ifdef CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#include "boards/lichuang-dev/hutuji_activation_relay.h"
+#endif
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
+#include "boards/lichuang-dev/hutuji_conversation_report.h"
+#endif
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -265,6 +278,7 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
@@ -284,7 +298,10 @@ void Application::HandleNetworkConnectedEvent() {
             return;
         }
 
-        xTaskCreate(
+        // 2026-09-06 实机事故：内部堆碎片（largest <8KB）时 xTaskCreate 静默失败，
+        // 设备永久停在 activating（无 OTA/模型/协议任何日志），用户视角「机启中」定格。
+        // 必须检查返回值并大声报错（附带堆八字段定位碎片化程度）。
+        BaseType_t created = xTaskCreate(
             [](void* arg) {
                 Application* app = static_cast<Application*>(arg);
                 app->ActivationTask();
@@ -292,6 +309,10 @@ void Application::HandleNetworkConnectedEvent() {
                 vTaskDelete(NULL);
             },
             "activation", 4096 * 2, this, 2, &activation_task_handle_);
+        if (created != pdPASS) {
+            ESP_LOGE(TAG, "activation 任务创建失败（内部堆不足/碎片化）");
+            SystemInfo::LogHeapNow("activation-task-fail");
+        }
     }
 
     // Update the status bar immediately to show the network state
@@ -472,6 +493,13 @@ void Application::CheckNewVersion() {
         // Activation code is shown to the user and waiting for the user to input
         if (ota_->HasActivationCode()) {
             ShowActivationCode(ota_->GetActivationCode(), ota_->GetActivationMessage());
+#ifdef CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+            // 京东云中转（2026-08-20 用户决策，唯一干净注入点：激活码只在
+            // Application/Ota 内部可见）：把激活码上报给自建服务代绑控制台，
+            // 用户联网后无感完成绑定；尽力而为，失败不影响屏显输码兜底。
+            // 仅限本板编译面生效，其余板型上游行为不变。
+            hutuji::ReportActivationCode(ota_->GetActivationCode());
+#endif
         }
 
         // This will block the loop until the activation is done or timeout
@@ -576,10 +604,16 @@ void Application::InitializeProtocol() {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
+                    Schedule([this, display, message = std::string(text->valuestring),
                               glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
+                        if (protocol_) {
+                            hutuji::ReportConversationTurn(
+                                "assistant", message.c_str(), protocol_->session_id());
+                        }
+#endif
                     });
                 }
             }
@@ -592,10 +626,16 @@ void Application::InitializeProtocol() {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
+                Schedule([this, display, message = std::string(text->valuestring),
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
+                    if (protocol_) {
+                        hutuji::ReportConversationTurn("user", message.c_str(),
+                                                       protocol_->session_id());
+                    }
+#endif
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
@@ -734,10 +774,32 @@ void Application::HandleToggleChatEvent() {
         }
         SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
+        // Toggle is the on-screen talk button. Abort and clear buffered TTS before
+        // entering listening, otherwise auto mode waits for playback to drain.
         AbortSpeaking(kAbortReasonNone);
+        audio_service_.ResetDecoder();
+        ListeningMode mode = GetDefaultListeningMode();
+        if (!protocol_->IsAudioChannelOpened()) {
+            // 2026-08-22 HIL：通道已被上一轮关闭时直接进监听会无 UDP 上行，
+            // 编码队列永远满丢帧、服务器收不到音频（用户感知「卡死」）。重开。
+            // 状态机无 speaking→connecting 合法边，经 idle 中转（两步皆合法边）。
+            SetDeviceState(kDeviceStateIdle);
+            SetDeviceState(kDeviceStateConnecting);
+            Schedule([this, mode]() { ContinueOpenAudioChannel(mode); });
+            return;
+        }
+        SetListeningMode(mode);
     } else if (state == kDeviceStateListening) {
         protocol_->CloseAudioChannel();
     }
+}
+
+bool Application::IsAudioChannelOpened() const {
+    return protocol_ && protocol_->IsAudioChannelOpened();
+}
+
+bool Application::IsPlaybackIdle() {
+    return audio_service_.IsPlaybackIdle();
 }
 
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
@@ -953,8 +1015,14 @@ void Application::HandleStateChangedEvent() {
 
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
+#if CONFIG_USE_CUSTOM_WAKE_WORD
+                // MultiNet 唤醒词会从扬声器回灌误触发（如 TTS 说「小派」），
+                // 直接 AbortSpeaking 造成「说着说着没声」。speaking 期关检测。
+                audio_service_.EnableWakeWordDetection(false);
+#else
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#endif
             }
             audio_service_.ResetDecoder();
             break;

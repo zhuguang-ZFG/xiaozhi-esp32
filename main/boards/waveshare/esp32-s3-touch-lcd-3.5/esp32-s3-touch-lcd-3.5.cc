@@ -3,9 +3,21 @@
 #include "display/lcd_display.h"
 #include "system_reset.h"
 #include "application.h"
+#include "boards/lichuang-dev/hutuji_job.h"
+#include "boards/lichuang-dev/hutuji_pipe.h"
+#include "boards/lichuang-dev/hutuji_draw_bind.h"
+#include "boards/lichuang-dev/hutuji_ble_diag.h"
+#include "boards/lichuang-dev/hutuji_conversation_report.h"
+#include "boards/lichuang-dev/hutuji_recovery_core.h"
+#include "boards/lichuang-dev/hutuji_music.h"
+#include "boards/lichuang-dev/plotter_provision.h"
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
+#include "assets/lang_config.h"
+
+#include <cJSON.h>
+#include <cstring>
 
 #include <esp_log.h>
 #include "i2c_device.h"
@@ -16,6 +28,8 @@
 #include <esp_lcd_panel_ops.h>
 
 #include <esp_timer.h>
+#include <esp_wifi.h>
+#include <wifi_manager.h>
 #include "esp_io_expander_tca9554.h"
 
 #include "axp2101.h"
@@ -29,10 +43,41 @@
 #define TAG "waveshare_lcd_3_5"
 
 class Pmic : public Axp2101 {
+    uint8_t boot_poweroff_status_ = 0;
+    uint8_t boot_status1_ = 0;
+    uint8_t boot_status2_ = 0;
+    uint8_t boot_input_current_limit_ = 0;
+    uint8_t boot_irq_status1_ = 0;
+    uint8_t boot_irq_status2_ = 0;
+    uint8_t boot_irq_status3_ = 0;
+
     public:
         Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
-            WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
-            WriteReg(0x27, 0x10);  // hold 4s to power off
+            // 0x21 和 IRQ 状态会跨 PMIC 关机锁存；必须在任何电源配置写入前取证。
+            boot_poweroff_status_ = ReadReg(0x21);
+            boot_status1_ = ReadReg(0x00);
+            boot_status2_ = ReadReg(0x01);
+            boot_input_current_limit_ = ReadReg(0x16);
+            boot_irq_status1_ = ReadReg(0x48);
+            boot_irq_status2_ = ReadReg(0x49);
+            boot_irq_status3_ = ReadReg(0x4A);
+            LogBootStatus();
+            // AXP2101 0x10 bit2 对应 disablePwronShutPMIC()；0x22 bit1
+            // 对应 disableLongPressShutdown()。0x22 bit2 是过温关机保护，必须保留。
+            const uint8_t common_config = ReadReg(0x10);
+            WriteReg(0x10, common_config & ~0x04);
+            const uint8_t poweroff_enable = ReadReg(0x22);
+            WriteReg(0x22, (poweroff_enable | 0x04) & ~0x02);
+            // DCDC1 供 ESP32-S3、LCD、触摸和相机。bit2=Always PWM 改善语音播报与
+            // Wi-Fi/Telnet 并发时的负载阶跃响应；bits1:0=11 把 UVP 防抖从默认
+            // 60us 提到 240us（数据手册 0x81），吸收 NS4150B 功放阶跃造成的瞬态
+            // 下陷；UVP 阈值与过温保护全部保留，持续欠压仍会断电。
+            const uint8_t dc_force_pwm = ReadReg(0x81);
+            WriteReg(0x81, dc_force_pwm | 0x07);
+            const uint8_t configured_dc_mode = ReadReg(0x81);
+            ESP_LOGW(TAG, "pmic dcdc1 mode=%s reg81=0x%02x",
+                     (configured_dc_mode & 0x04) != 0 ? "always-pwm" : "auto",
+                     configured_dc_mode);
     
             // Disable All DCs but DC1
             WriteReg(0x80, 0x01);
@@ -57,6 +102,13 @@ class Pmic : public Axp2101 {
             WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
             WriteReg(0x62, 0x08); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
             WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
+        }
+
+        void LogBootStatus() const {
+            ESP_LOGW(TAG,
+                     "pmic boot status off=0x%02x status=0x%02x/0x%02x ilim=0x%02x irq=0x%02x/0x%02x/0x%02x",
+                     boot_poweroff_status_, boot_status1_, boot_status2_, boot_input_current_limit_,
+                     boot_irq_status1_, boot_irq_status2_, boot_irq_status3_);
         }
     };
 
@@ -107,19 +159,37 @@ private:
     LcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
     EspVideo* camera_;
+    // 断连看门狗（2026-08-20「找不到 WiFi 直接显二维码」决策）：已配网但持续
+    // 连不上（换路由器/改密码/AP 关机）时，上游只在 WifiManager 内无限重连、
+    // 永不进配网模式，用户只能摸实体 boot 键。Disconnected 起 120s 定时，
+    // Connected/进配网即撤；到期自动进配网、屏显二维码，全程无按键。
+    esp_timer_handle_t wifi_lost_timer_ = nullptr;
+
+    void ReplayPmicBootStatusAfterUsbReady() {
+        Pmic* pmic = pmic_;
+        BaseType_t created = xTaskCreate(
+            [](void* arg) {
+                auto* pmic = static_cast<Pmic*>(arg);
+                vTaskDelay(pdMS_TO_TICKS(15000));
+                pmic->LogBootStatus();
+                vTaskDelete(nullptr);
+            },
+            "pmic_boot_log", 2048, pmic, 1, nullptr);
+        if (created != pdTRUE) {
+            ESP_LOGE(TAG, "failed to create delayed PMIC boot log task");
+        }
+    }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // 写字机需长期保持 Wi-Fi/Telnet 待命；三分钟后只降到仍能辨识的亮度，禁用自动断电。
+        power_save_timer_ = new PowerSaveTimer(-1, 180, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(20);
+            GetBacklight()->SetBrightness(35);
         });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
-        });
-        power_save_timer_->OnShutdownRequest([this]() {
-            pmic_->PowerOff();
         });
         power_save_timer_->SetEnabled(true);
     }
@@ -157,6 +227,14 @@ private:
     }
 
     void InitializeAxp2101() {
+        // WAVESHARE 3.5 若无 AXP2101 PMIC 则探测不到 ACK，缺失则跳过。
+        // 用 i2c_master_probe（吃 bus handle）而非 i2c_master_transmit_receive
+        //（吃 device handle），与全仓 35 处板级探测用法一致。
+        esp_err_t ret = i2c_master_probe(i2c_bus_, 0x34, 100);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "no AXP2101 on I2C, skipping PMIC init");
+            return;
+        }
         ESP_LOGI(TAG, "Init AXP2101");
         pmic_ = new Pmic(i2c_bus_, 0x34);
     }
@@ -213,23 +291,24 @@ private:
         
     }
 
-    void InitializeTouch()
-    {
+    void InitializeTouch() {
         esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
-            .x_max = DISPLAY_WIDTH,
-            .y_max = DISPLAY_HEIGHT,
+            .x_max = DISPLAY_HEIGHT,
+            .y_max = DISPLAY_WIDTH,
             .rst_gpio_num = GPIO_NUM_NC,
             .int_gpio_num = GPIO_NUM_NC,
-            .levels = {
-                .reset = 0,
-                .interrupt = 0,
-            },
-            .flags = {
-                .swap_xy = 1,
-                .mirror_x = 1,
-                .mirror_y = 1,
-            },
+            .levels =
+                {
+                    .reset = 0,
+                    .interrupt = 0,
+                },
+            .flags =
+                {
+                    .swap_xy = 1,
+                    .mirror_x = 1,
+                    .mirror_y = 0,
+                },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = {
@@ -237,20 +316,117 @@ private:
             .control_phase_bytes = 1,
             .dc_bit_offset = 0,
             .lcd_cmd_bits = 8,
-            .flags =
-            {
+            .flags = {
                 .disable_control_phase = 1,
-            }
-        };
+            }};
         tp_io_config.scl_speed_hz = 400 * 1000;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
         ESP_LOGI(TAG, "Initialize touch controller");
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp));
+        constexpr int kFt6x36ThresholdReg = 0x80;
+        constexpr int kFt6x36PeakThresholdReg = 0x81;
+        constexpr int kFt6x36ActivePeriodReg = 0x88;
+        constexpr int kFt6x36ChipIdReg = 0xA3;
+        constexpr int kFt6x36VendorIdReg = 0xA8;
+        uint8_t threshold = 0;
+        // FT5x06 兼容寄存器（实值 = 4×寄存器值）。Espressif 驱动的 demo 初始化把
+        // 本板 FT6336 写死 TH_GROUP=70 / THPEAK=60（ft5x06.c touch_ft5x06_init），
+        // 面板出厂调校在创建驱动那一刻就被覆盖。GROUP 70→40→30 三轮后仍不灵敏：
+        // GROUP(0x80) 只管持续检测，慢速轻触的差分峰值过不了 PEAK(0x81) 门，
+        // GROUP 再低也无济于事。本轮双门齐调：GROUP 20 是 Linux edt-ft5x06 钳位
+        // 区间下限（最敏感的主流发布值），PEAK 40 为首个保守步长。提敏带来的静止
+        // 抖动由 24px 滚动阈值与 24px 拖动阈值兜底；开机日志打印前后值供串口归因。
+        constexpr uint8_t kTouchThreshold = 20;
+        constexpr uint8_t kTouchPeakThreshold = 40;
+        uint8_t peak_threshold = 0;
+        uint8_t active_period = 0;
+        uint8_t chip_id = 0;
+        uint8_t vendor_id = 0;
+        const esp_err_t threshold_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ThresholdReg, &threshold, 1);
+        const esp_err_t peak_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36PeakThresholdReg, &peak_threshold, 1);
+        const esp_err_t period_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ActivePeriodReg, &active_period, 1);
+        const esp_err_t chip_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ChipIdReg, &chip_id, 1);
+        const esp_err_t vendor_err =
+            esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36VendorIdReg, &vendor_id, 1);
+        if (threshold_err == ESP_OK && peak_err == ESP_OK && period_err == ESP_OK &&
+            chip_err == ESP_OK && vendor_err == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "Touch registers: threshold=%u peak=%u active_period=%u chip=0x%02X vendor=0x%02X",
+                     threshold, peak_threshold, active_period, chip_id, vendor_id);
+        } else {
+            ESP_LOGW(TAG,
+                     "Touch register read failed: threshold=%s peak=%s period=%s chip=%s vendor=%s",
+                     esp_err_to_name(threshold_err), esp_err_to_name(peak_err),
+                     esp_err_to_name(period_err), esp_err_to_name(chip_err),
+                     esp_err_to_name(vendor_err));
+        }
+        // 双门各自「读回→写→回读校验」：任一读失败就不动对应门（不盲写未知状态），
+        // 任一回读不符即告警保留现场值，绝不带着未验证的假设出初始化。
+        const bool group_need = threshold_err == ESP_OK && threshold != kTouchThreshold;
+        const bool peak_need = peak_err == ESP_OK && peak_threshold != kTouchPeakThreshold;
+        if (group_need || peak_need) {
+            const uint8_t old_threshold = threshold;
+            const uint8_t old_peak = peak_threshold;
+            const esp_err_t group_write =
+                group_need
+                    ? esp_lcd_panel_io_tx_param(tp_io_handle, kFt6x36ThresholdReg, &kTouchThreshold, 1)
+                    : ESP_OK;
+            const esp_err_t group_verify =
+                group_write == ESP_OK
+                    ? esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36ThresholdReg, &threshold, 1)
+                    : group_write;
+            const esp_err_t peak_write =
+                peak_need
+                    ? esp_lcd_panel_io_tx_param(tp_io_handle, kFt6x36PeakThresholdReg, &kTouchPeakThreshold, 1)
+                    : ESP_OK;
+            const esp_err_t peak_verify =
+                peak_write == ESP_OK
+                    ? esp_lcd_panel_io_rx_param(tp_io_handle, kFt6x36PeakThresholdReg, &peak_threshold, 1)
+                    : peak_write;
+            if (group_verify == ESP_OK && peak_verify == ESP_OK) {
+                ESP_LOGI(TAG, "Touch threshold tuned: %u -> %u peak %u -> %u",
+                         old_threshold, threshold, old_peak, peak_threshold);
+            } else {
+                ESP_LOGW(TAG,
+                         "Touch threshold tune failed: group w/v=%s/%s peak w/v=%s/%s value=%u/%u",
+                         esp_err_to_name(group_write), esp_err_to_name(group_verify),
+                         esp_err_to_name(peak_write), esp_err_to_name(peak_verify),
+                         threshold, peak_threshold);
+            }
+        }
         const lvgl_port_touch_cfg_t touch_cfg = {
-            .disp = lv_display_get_default(), 
+            .disp = lv_display_get_default(),
             .handle = tp,
         };
-        lvgl_port_add_touch(&touch_cfg);
+        lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);
+        if (touch_indev != nullptr) {
+            // 本板 FT5x06 阈值已调敏（上方 70->30），静止按压抖动超过 LVGL 默认 10px
+            // 滚动阈值（LV_INDEV_DEF_SCROLL_LIMIT，lv_indev.c:1375 越限即 PRESS_LOST）：
+            // 点按被误判成拖动、CLICKED 全数被吃（2026-08-20 HIL 坐实：绘图机抽屉
+            // 展开态按钮几乎全哑）。提到 24px 与抽屉触发钮点按阈值（lcd_display.cc
+            // kTriggerDragThresholdPx）同量级：抖动不触发滚动，明确拖动仍可经
+            // SCROLL_CHAIN 滚面板。断 chain 的替代方案会让面板无处起手滚动，已否决。
+            lv_indev_set_scroll_limit(touch_indev, 24);
+            // LV_DEF_REFR_PERIOD=33（sdkconfig 实测）：indev 读定时器默认 33ms 才
+            // 采一次触摸，是「不跟手」的主延迟源（LVGL issue #8152 同因）。FT6336
+            // INT 未接 GPIO 只能轮询，显式提到 10ms 一读——400kHz I2C 读状态+坐标
+            // 几字节约 0.2ms，CPU 代价可忽略。芯片侧 0x88 主动采样周期 12 已是官方
+            // 文档最小推荐值（FT5x06_registers.pdf「should not less than 12」），
+            // 无空间再降。
+            lv_timer_set_period(lv_indev_get_read_timer(touch_indev), 10);
+            lv_indev_add_event_cb(
+                touch_indev,
+                [](lv_event_t* event) {
+                    auto* timer = static_cast<PowerSaveTimer*>(lv_event_get_user_data(event));
+                    timer->WakeUp();
+                },
+
+                LV_EVENT_PRESSED, power_save_timer_);
+        }
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 
@@ -297,6 +473,7 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            power_save_timer_->WakeUp();
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -307,6 +484,52 @@ private:
     }
 
     // 初始化工具
+    using MachineControlRequest = std::string (hutuji::Job::*)();
+
+    static std::string MachineControlFeedback(const std::string& result) {
+        cJSON* root = cJSON_Parse(result.c_str());
+        if (root == nullptr) {
+            return Lang::Strings::MACHINE_ACTION_FAILED;
+        }
+        std::string message = Lang::Strings::MACHINE_ACTION_SENT;
+        if (cJSON_IsString(root)) {
+            const char* value = cJSON_GetStringValue(root);
+            if (value != nullptr) {
+                if (strcmp(value, "ok") == 0) {
+                    message = Lang::Strings::MACHINE_ACTION_SENT;
+                } else if (strcmp(value, "started") == 0 ||
+                           strcmp(value, "started_redownload") == 0) {
+                    message = Lang::Strings::MACHINE_ACTION_STARTED;
+                } else {
+                    message = value;
+                }
+            }
+        } else if (cJSON_IsObject(root)) {
+            const cJSON* error = cJSON_GetObjectItemCaseSensitive(root, "error");
+            if (cJSON_IsString(error) && error->valuestring != nullptr) {
+                message = error->valuestring;
+            }
+        }
+        cJSON_Delete(root);
+        return message;
+    }
+
+    void ScheduleMachineControl(const char* action, MachineControlRequest request) {
+        ESP_LOGI(TAG, "ui machine action=%s", action);
+        Application::GetInstance().Schedule([this, request]() {
+            const std::string result = (hutuji::Job::GetInstance().*request)();
+            display_->ShowNotification(MachineControlFeedback(result));
+        });
+    }
+    void ScheduleManualControl(const char* action) {
+        ESP_LOGI(TAG, "ui machine action=%s", action);
+        const std::string act = action;
+        Application::GetInstance().Schedule([this, act]() {
+            const std::string result = hutuji::Job::GetInstance().RequestManualControl(act);
+            display_->ShowNotification(MachineControlFeedback(result));
+        });
+    }
+
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
@@ -316,6 +539,276 @@ private:
                 EnterWifiConfigMode();
                 return true;
             });
+
+        // 对话上报 worker 须尽早用静态栈创建，勿拖到首句 STT（heap 低谷会失败）。
+        hutuji::InitConversationReport();
+
+        // hutuji 写字机 Telnet 哑管道（TCP 客户端 → Grbl_Esp32 Telnet:23）。
+        hutuji::Pipe::GetInstance().Start();
+
+        // BLE-DIAG 阶段 A 只读诊断广播；默认关闭，未启用时是空实现。
+        hutuji::ble_diag::Start();
+
+        display_->ConfigureMachineControls(
+            [this]() { ScheduleMachineControl("pause", &hutuji::Job::RequestPause); },
+            [this]() { ScheduleMachineControl("resume", &hutuji::Job::RequestResume); },
+            [this]() { ScheduleMachineControl("abort", &hutuji::Job::RequestAbort); },
+            [this]() { ScheduleMachineControl("repeat", &hutuji::Job::RequestRepeat); },
+            [this]() { ScheduleMachineControl("pen_test", &hutuji::Job::RequestPenTest); },
+            [this](const char* action) { ScheduleManualControl(action); },
+            []() { hutuji::PlotterProvision::GetInstance().RequestManual(); });
+
+        // boot 键功能上屏：「说话」与 boot 单击完全同语义（starting 态转配网，
+        // 否则 ToggleChatState）；触摸唤醒已由 LV_EVENT_PRESSED 钩子在板级完成，
+        // 这里不再重复 WakeUp。「配网」直接进配网模式，屏显二维码。
+        display_->ConfigureVoiceEntry(
+            [this]() {
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    EnterWifiConfigMode();
+                    return;
+                }
+                app.ToggleChatState();
+            },
+            [this]() { EnterWifiConfigMode(); });
+        // 二维码「关闭」= 退出配网：StopConfigAp→ConfigModeExit→WifiBoard 自动
+        // TryWifiConnect（有凭据回连；无凭据新机按上游流程弹回配网）。必须
+        // Schedule 回主循环：StopConfigAp 的事件回调是同步调用，新机无凭据时
+        // TryWifiConnect 内部有 vTaskDelay(1500)，在 taskLVGL 上跑会卡死 UI。
+        display_->SetProvisioningCancelHandler([this]() {
+            if (hutuji::IsDrawBindActive()) {
+                hutuji::StopDrawBind(display_);
+                return;
+            }
+            Application::GetInstance().Schedule(
+                []() { WifiManager::GetInstance().StopConfigAp(); });
+        });
+
+        display_->ConfigureDrawBind([this]() {
+            Application::GetInstance().Schedule([this]() {
+                hutuji::StartDrawBind(display_);
+            });
+        });
+
+#ifdef HUTUJI_AUTO_TEST_ABORT_ON_PAPER
+        // bringup §8.5（换纸中调 abort）脚手架，2026-08-28 从 lichuang_dev_board.cc
+        // 原样移植（逻辑只用 Job 通用接口，无板级依赖）。默认不定义此宏，正常镜像
+        // 行为不变；取证后必须回刷不带宏的镜像。paper_active 也覆盖断连恢复保护窗，
+        // 触发前后都打 status 自证窗口类型。
+        xTaskCreate(
+            [](void*) {
+                auto& job = hutuji::Job::GetInstance();
+                // 50ms 轮询、20 分钟上限，够覆盖单张 A4 出图到页尾换纸；
+                // 超时即退出，不让脚手架任务常驻。
+                for (int i = 0; i < 24000; ++i) {
+                    if (job.IsPaperActive()) {
+                        ESP_LOGW("AutoTest", "换纸窗口命中，abort 前 status: %s",
+                                 job.StatusJson().c_str());
+                        auto result = job.RequestAbort();
+                        ESP_LOGW("AutoTest", "换纸中 abort 返回: %s", result.c_str());
+                        ESP_LOGW("AutoTest", "abort 后 status: %s", job.StatusJson().c_str());
+                        vTaskDelete(nullptr);
+                        return;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+                ESP_LOGW("AutoTest", "20 分钟内未观察到换纸窗口，abort 脚手架退出");
+                vTaskDelete(nullptr);
+            },
+            "auto_test_abort", 3072, nullptr, 4, nullptr);
+#endif
+
+        mcp_server.AddTool("hutuji.status",
+            "查询本机与写字机的 Telnet 管道：是否已连接、Grbl 是否就绪、任务状态。"
+            "state 含 previewing 预览加载中、awaiting_confirmation 等用户确认。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().StatusJson();
+            });
+
+        mcp_server.AddTool("hutuji.draw",
+            "先出预览：url 是云端 hutuji_draw 返回的 G-code 地址，preview_url 是同一次返回的 PNG "
+            "预览地址。只把预览显示到屏幕上，不启动任何机械动作；屏幕会出现「开始画」「取消」"
+            "按钮，用户确认后才调 hutuji.confirm。"
+            "写文章/写诗多页时：把云端 hutuji_write 返回的 pages 数组原样转成 JSON 字符串传给 "
+            "pages 参数（形如 [{\"url\":\"...\",\"preview_url\":\"...\"}, ...]），并把第 1 页两个地址"
+            "同时填到 url/preview_url；设备逐页写、每页写完自动换纸。单页出图时 pages 留空。",
+            PropertyList({Property("url", kPropertyTypeString),
+                          Property("preview_url", kPropertyTypeString),
+                          Property("pages", kPropertyTypeString, std::string(""))}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string& url = properties["url"].value<std::string>();
+                const std::string& preview_url = properties["preview_url"].value<std::string>();
+                const std::string& pages = properties["pages"].value<std::string>();
+                return hutuji::Job::GetInstance().StartDraw(url, preview_url, pages);
+            });
+
+        mcp_server.AddTool("hutuji.confirm",
+            "用户看过屏幕预览后确认出图：说「开始画/可以/就这个」时用。"
+            "仅在 state 为 awaiting_confirmation 时有效；等价于用户点屏幕「开始画」按钮。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestConfirm();
+            });
+
+        mcp_server.AddTool("hutuji.abort", "中止当前绘图转发，或取消尚未确认的预览。",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestAbort();
+            });
+
+        mcp_server.AddTool("hutuji.pause", "暂停当前绘图（可恢复）。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestPause();
+            });
+
+        mcp_server.AddTool("hutuji.resume", "恢复之前暂停的绘图。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestResume();
+            });
+
+        mcp_server.AddTool("hutuji.repeat", "把上一张画再画一遍。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestRepeat();
+            });
+
+        mcp_server.AddTool("hutuji.pen_test", "笔测试：落笔停 1 秒再抬笔。", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestPenTest();
+            });
+
+        // 语音手动控制：描述与 lichuang_dev_board 保持逐字一致，避免双板行为漂移。
+        mcp_server.AddTool(
+            "hutuji.manual",
+            "手动控制写字机轴运动，仅空闲可用。action 取值："
+            "\"jog_x+\"/\"jog_x-\"/\"jog_y+\"/\"jog_y-\" 按当前步距点动（步距用 "
+            "\"jog_step_1\"/\"jog_step_10\" 切 1mm/10mm；方向：左=X- 右=X+ 前=Y+ 后=Y-）；"
+            "\"pen_up\" 抬笔、\"pen_down\" 落笔（落笔先做 Z0 校准，笔尖会碰纸；"
+            "已落笔时重复调用无动作，返回 已处于落笔状态）；\"home\" 回左下原点。"
+            "用户说「往左/右/前/后挪一点」「抬笔/落笔」「回原点」「步距调大/调小」时用。"
+            "返回 started 表示已开始执行，完成后设备会播报；正忙或未连接返回 error。"
+            "set_origin/unlock/motor_off/reset 是维护动作，语音不开放。",
+            PropertyList({Property("action", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string action = properties["action"].value<std::string>();
+                if (!hutuji::IsVoiceAllowedAction(action)) {
+                    return std::string("{\"error\":\"语音不开放该手动动作\"}");
+                }
+                return hutuji::Job::GetInstance().RequestManualControl(action);
+            });
+
+        // 唱歌与绘图完全解耦：只走 AudioService 播放泵，不碰写字机管道。
+        // 工具描述与 lichuang_dev_board 保持逐字一致，避免双板行为漂移。
+        mcp_server.AddTool(
+            "hutuji.sing",
+            "播放歌曲：url 是云端 hutuji_sing 返回的歌曲地址，title 是歌名。"
+            "只放歌不碰写字机；下载完成后自动开始唱，唱完自动停。"
+            "想换一首直接再调本工具（自动切歌）；用户说停下时用 hutuji.stop_song。"
+            "不要瞎编 url——用户点歌时应先走云端 hutuji_sing 查目录。",
+            PropertyList({Property("url", kPropertyTypeString),
+                          Property("title", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string& url = properties["url"].value<std::string>();
+                const std::string& title = properties["title"].value<std::string>();
+                auto& music = hutuji::HutujiMusic::GetInstance();
+                if (music.Play(url, title)) {
+                    return std::string("{\"ok\":true}");
+                }
+                return std::string("{\"ok\":false,\"error\":\"") + music.LastError() +
+                       "\"}";
+            });
+
+        mcp_server.AddTool("hutuji.stop_song",
+                           "停止当前播放的歌曲。用户说别唱了/停下/安静时用。没歌在放时调用也安全。",
+                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                               hutuji::HutujiMusic::GetInstance().Stop();
+                               return true;
+                           });
+
+    }
+    // 同室部署写字机：10dBm(40=0.25dBm 单位) 足够覆盖，显著降低 Wi-Fi 峰值电流，
+    // 与 Always PWM、UVP 240us 防抖共同缓解无电池 VSYS 的瞬态下陷。
+    void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        const esp_err_t tx_err = esp_wifi_set_max_tx_power(40);
+        if (tx_err != ESP_OK) {
+            ESP_LOGW(TAG, "set max tx power failed: %s", esp_err_to_name(tx_err));
+        }
+    }
+
+    void SetNetworkEventCallback(NetworkEventCallback callback) override {
+        WifiBoard::SetNetworkEventCallback(
+            [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
+                if (event == NetworkEvent::WifiConfigModeEnter) {
+                    StopWifiLostWatchdog();
+                    const std::string ap_ssid = WifiManager::GetInstance().GetApSsid();
+                    display_->ShowProvisioningQr(
+                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid),
+                        "Scan: " + ap_ssid + "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
+                } else if (event == NetworkEvent::WifiConfigModeExit ||
+                           event == NetworkEvent::Connected) {
+                    StopWifiLostWatchdog();
+                    display_->HideProvisioningQr();
+                } else if (event == NetworkEvent::Disconnected) {
+                    // 配网跳窗内的断连是流程一部分：看门狗若在 120s 触发会把
+                    // 回切途中的设备踹进配网模式，跳窗期间不武装。
+                    if (!hutuji::PlotterProvision::GetInstance().IsBusy()) {
+                        StartWifiLostWatchdog();
+                    }
+                }
+                if (event == NetworkEvent::Connected) {
+                    // 户网连上后巡检写字机：找不到且出厂热点在场则自动跳配
+                    // （零接触配网；用户只扫过一次码）。
+                    hutuji::PlotterProvision::GetInstance().OnHomeNetworkConnected();
+                }
+                if (callback) {
+                    callback(event, data);
+                }
+            });
+    }
+
+    void StartWifiLostWatchdog() {
+        constexpr uint64_t kWifiLostTimeoutUs = 120ULL * 1000 * 1000;
+        if (wifi_lost_timer_ == nullptr) {
+            const esp_timer_create_args_t args = {
+                .callback = [](void* arg) {
+                    auto* self = static_cast<CustomBoard*>(arg);
+                    // 先原地续表再 Schedule：EnterWifiConfigMode 对 Connecting/配网中/
+                    // 升级中等状态门控早退（wifi_board.cc 的 state 检查），one-shot 若
+                    // 不重武装，AP 关停期间「断连 120s 自动显码」静默失效（2026-08-20
+                    // 复审 P1-1）。成功进配网由 WifiConfigModeEnter 事件 Stop，连上由
+                    // Connected 事件 Stop；esp_timer 回调上下文内 stop/start_once 合法。
+                    self->StartWifiLostWatchdog();
+                    // esp_timer 任务上下文不直接碰网络状态机：Schedule 回主循环执行。
+                    Application::GetInstance().Schedule([self]() {
+                        if (WifiManager::GetInstance().IsConnected()) {
+                            // 起到主循环执行的间隙里已恢复（Connected 事件会停表），
+                            // 不把已连上的设备踹进配网。
+                            return;
+                        }
+                        ESP_LOGW(TAG, "WiFi lost >120s, entering config mode (QR on screen)");
+                        self->EnterWifiConfigMode();
+                    });
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "wifi_lost_wd",
+                .skip_unhandled_events = true,
+            };
+            if (esp_timer_create(&args, &wifi_lost_timer_) != ESP_OK) {
+                wifi_lost_timer_ = nullptr;
+                // 安全网静默缺失比日志噪音更糟：alloc 失败时 esp_timer 自身不打日志。
+                ESP_LOGW(TAG, "wifi lost watchdog create failed");
+                return;
+            }
+        }
+        // 重复 Disconnected 重新起表：看的是「最后一次断连起持续 120s 未恢复」。
+        esp_timer_stop(wifi_lost_timer_);
+        esp_timer_start_once(wifi_lost_timer_, kWifiLostTimeoutUs);
+    }
+
+    void StopWifiLostWatchdog() {
+        if (wifi_lost_timer_ != nullptr) {
+            esp_timer_stop(wifi_lost_timer_);
+        }
     }
 
 public:
@@ -335,8 +828,16 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeCamera();
+        // 无电池缓冲（PMIC status1 无电池位）时，NS4150B 功放是 VSYS 最大瞬态负载；
+        // 音量直接线性放大播报峰值电流。启动时把音量钳到 50，用户仍可语音再调。
+        auto* codec = GetAudioCodec();
+        if (codec->output_volume() > 50) {
+            codec->SetOutputVolume(50);
+        }
         InitializeTools();
         GetBacklight()->RestoreBrightness();
+        // USB CDC 枚举较晚，15 秒后复述同一份启动锁存值，不重新读寄存器。
+        ReplayPmicBootStatusAfterUsbReady();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -368,9 +869,22 @@ public:
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
-        if (level != PowerSaveLevel::LOW_POWER) {
-            power_save_timer_->WakeUp();
+        // 稳态 LOW_POWER(MAX_MODEM) 降为 BALANCED(MIN_MODEM)：MAX_MODEM 长睡眠是
+        // 写字机断联（WiFi reason 3 AP 去关联 + errno=113）与慢发现（首包 ~200ms）
+        // 的头号嫌疑（2026-08-23 取证，troubleshooting RTT 实测）。插电为主场景。
+        if (level == PowerSaveLevel::LOW_POWER) {
+            level = PowerSaveLevel::BALANCED;
         }
+        // 出图活跃窗口内拒绝任何省电回落：音频通道关闭（application.cc
+        // OnAudioChannelClosed）等路径每几秒无条件踩回，与 ReassertPerformance
+        // 互踩造成 Telnet RTT 尖峰（实测 ok 间隔 200-290ms，笔运动肉眼卡顿）。
+        // 映射后须连 BALANCED 一起拦，故拦一切非 PERFORMANCE。
+        if (level != PowerSaveLevel::PERFORMANCE &&
+            hutuji::Job::GetInstance().HoldsPerformanceForRadio()) {
+            return;
+        }
+        // 省电定时器只在「真实空闲」时不重置；映射后 LOW_POWER 已不存在于此路径。
+        power_save_timer_->WakeUp();
         WifiBoard::SetPowerSaveLevel(level);
     }
 

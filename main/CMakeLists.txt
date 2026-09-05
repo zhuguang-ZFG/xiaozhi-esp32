@@ -158,7 +158,7 @@ elseif(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
     set(BOARD_TYPE "lichuang-dev")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
-    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_128)
+    unset(DEFAULT_EMOJI_COLLECTION)
 elseif(CONFIG_BOARD_TYPE_QUANDONG_S3_DEV)
     set(BOARD_TYPE "quandong-s3-dev")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -439,6 +439,7 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    set(HUTUJI_GROBOT_FACE TRUE)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-touch-lcd-3.5b")
@@ -887,6 +888,22 @@ else()
     )
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
+    list(APPEND SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pipe.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_job.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_activation_relay.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_conversation_report.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_draw_bind.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_ble_diag.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_music.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pi_splash.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/plotter_provision.cc
+    )
+endif()
+if(HUTUJI_GROBOT_FACE AND NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+    list(APPEND SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/grobot_eyes.cc)
+endif()
 
 # Select one audio engine for each chip family
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
@@ -1082,6 +1099,7 @@ idf_component_register(SRCS ${SOURCES}
                         fatfs
                         xiaozhi-fonts
                         ${MAIN_PRIV_REQUIRES_EXTRA}
+                        hutuji_qrcode
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
@@ -1100,6 +1118,43 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     PRIVATE TEXT_FONT_SIZE=${TEXT_FONT_SIZE} TEXT_FONT_BPP=${TEXT_FONT_BPP}
                     )
+if(HUTUJI_GROBOT_FACE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE CONFIG_HUTUJI_GROBOT_FACE=1)
+endif()
+
+option(HUTUJI_AUTO_TEST_DRAW "Enable hutuji auto-test draw on lichuang-dev after pipe ready" OFF)
+set(HUTUJI_AUTO_TEST_DRAW_URL "" CACHE STRING "hutuji auto-test G-code URL; keep empty unless building a local test image")
+set(HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL "" CACHE STRING "hutuji auto-test PNG preview URL from the same hutuji_draw call")
+if(HUTUJI_AUTO_TEST_DRAW)
+    if(NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+        message(FATAL_ERROR "HUTUJI_AUTO_TEST_DRAW is only supported for lichuang-dev")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_DRAW)
+    if(HUTUJI_AUTO_TEST_DRAW_URL STREQUAL "" OR HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL STREQUAL "")
+        message(WARNING "HUTUJI_AUTO_TEST_DRAW enabled without both HUTUJI_AUTO_TEST_DRAW_URL and HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL")
+    else()
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_DRAW_URL="${HUTUJI_AUTO_TEST_DRAW_URL}")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL="${HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL}")
+    endif()
+endif()
+
+option(HUTUJI_AUTO_TEST_ABORT_ON_PAPER "Enable hutuji bringup 8.5 scaffold: call abort as soon as paper-change window opens" OFF)
+if(HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
+    if(NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 AND NOT CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
+        message(FATAL_ERROR "HUTUJI_AUTO_TEST_ABORT_ON_PAPER is only supported for lichuang-dev / waveshare-3.5")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
+    if(NOT HUTUJI_AUTO_TEST_DRAW)
+        message(WARNING "HUTUJI_AUTO_TEST_ABORT_ON_PAPER without HUTUJI_AUTO_TEST_DRAW: paper window only opens if a draw is triggered from the cloud")
+    endif()
+endif()
+
+# 2026-09-05 A/B 归因开关（fable 会诊）：ON = 日志全开对照组（HUTUJI_QUIET_STREAM_LOG=0），
+# 默认 OFF = 压制。两变体同 HEAD 同埋点只差此 option，避免刷旧基线当对照丢埋点。
+option(HUTUJI_STREAM_LOG_VERBOSE "A/B control: keep per-line streaming logs (disable suppression)" OFF)
+if(HUTUJI_STREAM_LOG_VERBOSE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_QUIET_STREAM_LOG=0)
+endif()
 
 # Add generation rules
 add_custom_command(
