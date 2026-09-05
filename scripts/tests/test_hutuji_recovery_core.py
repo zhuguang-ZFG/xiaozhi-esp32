@@ -1352,6 +1352,23 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             speaking.index("SetListeningMode(mode);"),
         )
 
+    def test_wifi_tx_buffer_compile_guard(self):
+        """WiFi 静态 TX 缓冲必须构建即红（2026-09-06 启动回归根因：静态 16 块钉死
+        内部 RAM，activation 任务 8KB 栈分配静默失败）。根 sdkconfig 被 gitignore、
+        defaults 只在 sdkconfig 缺席时生效，故须在 tracked 源码放编译期断言。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        self.assertIn('#include "sdkconfig.h"', job_cc)
+        self.assertIn(
+            "#if defined(CONFIG_ESP_WIFI_STATIC_TX_BUFFER) || "
+            "CONFIG_ESP_WIFI_TX_BUFFER_TYPE == 0",
+            job_cc,
+        )
+        self.assertIn('#error "WiFi 静态 TX 缓冲会吃掉约 25KB 内部 RAM', job_cc)
+        # 默认值钉在 s3 defaults（sdkconfig 缺席时的出厂值）。
+        defaults = (ROOT / "sdkconfig.defaults.esp32s3").read_text(encoding="utf-8")
+        self.assertIn("CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1", defaults)
+        self.assertIn("CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32", defaults)
+
     def test_mqtt_session_goodbye_and_stale_hello_guards(self):
         """goodbye 排队关闭须复核会话；空通道关闭无副作用；迟到 hello 被丢弃。
 

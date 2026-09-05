@@ -30,6 +30,16 @@
 #include <deque>
 #include <string>
 
+#include "sdkconfig.h"
+
+// 2026-09-06 启动回归防复发（根 sdkconfig 被 gitignore，defaults 只在 sdkconfig 缺席时
+// 生效，挡不住既有 sdkconfig 再漂移）：静态 TX 缓冲会把内部 RAM 钉到 activation 任务
+// 8KB 栈分配失败、启动链静默全停。任何配置漂移至此即构建失败。正确值钉在
+// sdkconfig.defaults.esp32s3；复核规程见 patches/README.md。
+#if defined(CONFIG_ESP_WIFI_STATIC_TX_BUFFER) || CONFIG_ESP_WIFI_TX_BUFFER_TYPE == 0
+#error "WiFi 静态 TX 缓冲会吃掉约 25KB 内部 RAM 导致 activation 栈分配失败；TX 缓冲必须动态（CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1, DYNAMIC_TX_BUFFER_NUM=32）"
+#endif
+
 #define TAG "HutujiJob"
 
 namespace hutuji {
