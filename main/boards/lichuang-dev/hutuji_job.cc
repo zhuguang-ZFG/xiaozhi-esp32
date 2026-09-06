@@ -19,6 +19,7 @@
 #include <cJSON.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>
 
 #include <cctype>
 #include <cmath>
@@ -49,7 +50,8 @@ namespace {
 constexpr size_t kMaxGcodeBytes = 512 * 1024;
 constexpr size_t kMaxPreviewBytes = 512 * 1024;
 // 2026-09-06 下载重试口径（评审定稿）：只对「传输态」失败重试（Open 失败 / Read<0 /
-// 体长截断），确定性失败（abort、非 200、CRC 头缺失、PSRAM 分配失败、PNG 解码失败）
+// 体长截断 / Open 成功但响应头未达——TLS 读败以 status=-1 暴露，凡 <100 归传输态），
+// 确定性失败（abort、HTTP 级非 200、CRC 头缺失、PSRAM 分配失败、PNG 解码失败）
 // 立即出局——取消后再下两次、404 白等 60s 都是错。退避递增：低谷压力源是 listening
 // 态持续在跑的 AFE/编码链（不是刚关掉的 TLS 连接），400ms 等长退避会三次落同一窗口。
 enum class FetchOutcome { kOk, kRetryable, kFatal };
@@ -57,6 +59,17 @@ constexpr int kFetchMaxAttempts = 3;
 constexpr uint32_t kFetchRetryBackoffMs[kFetchMaxAttempts - 1] = {1200, 3000};
 constexpr uint32_t kFetchFirstTimeoutMs = 60000;   // 首试维持原口径
 constexpr uint32_t kFetchRetryTimeoutMs = 20000;   // 重试态收紧，避免最坏 3×60s
+// ssl_receive 任务栈 = 4096（esp_ssl.cc；现改 SPIRAM，见 R8），
+// 预览任务栈也改 SPIRAM——二者不再与内部连续块互抢。
+//
+// 真因链（2026-09-06 COM14）：
+//   hutuji_preview 旧口径占内部 6144 → preview-begin largest 稳态钉 6144；
+//   ssl_receive 再要内部 4096 → 碎片期创建失败或读超时；
+//   抬门限到 12KiB 在预览任务存活期数学不可达（已回退）。
+// R8：两栈进 PSRAM（CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y 已开），
+// 内部 largest 留给 mbedtls/DMA；门限只作「内部仍极低」的保险丝。
+constexpr size_t kMinTlsInternalLargest = 4 * 1024;
+constexpr int kTlsHeapWaitSlices = 20;  // 100ms × 20 = 2s
 constexpr uint32_t kOkTimeoutMs = 60000;
 constexpr uint32_t kPaperOkTimeoutMs = 90000;
 constexpr uint32_t kMotionOkTimeoutMs = 30000;
@@ -400,7 +413,10 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     // 新任务作废旧预取：上一个任务的预取可能仍在跑，epoch 推进后其发布会被拒绝。
     CancelPrefetch();
     SetState("previewing");
-    BaseType_t ok = xTaskCreate(PreviewTaskEntry, "hutuji_preview", 6144, this, 4, nullptr);
+    // R8：预览任务栈进 PSRAM，把内部连续块留给 ssl_receive/mbedtls（COM14 实锤
+    // 内部 6144 栈与 TLS 4KB 栈互抢是预览终态不呈现的根因之一）。
+    BaseType_t ok = xTaskCreateWithCaps(PreviewTaskEntry, "hutuji_preview", 8192, this, 4,
+                                        nullptr, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdTRUE) {
         busy_.store(false);
         SetState("idle");
@@ -410,25 +426,48 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
 }
 
 std::string Job::RequestConfirm() {
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (!busy_.load() || !awaiting_confirmation_.load()) {
+            return "{\"error\":\"当前没有待确认的预览\"}";
+        }
+        auto& pipe = Pipe::GetInstance();
+        if (!pipe.IsConnected() || !pipe.IsReady()) {
+            return "{\"error\":\"写字机未连接或未就绪\"}";
+        }
+        if (!pipe.IsAuthorized()) {
+            return "{\"error\":\"写字机未授权，请联系卖家协助激活\"}";
+        }
+        if (!pipe.IsSettingsVerified()) {
+            return "{\"error\":\"grbl_settings_mismatch\"}";
+        }
+        awaiting_confirmation_.store(false);
+        SetState("downloading");
+    }
+    // 预览/预取 keep-alive 的 ssl_receive 占 ~4KB 内部栈；2026-09-06 COM14 实证
+    // awaiting 期 largest=6144，建不出 8192 的 hutuji_draw → confirm 立刻滚回
+    // awaiting（串口：downloading→awaiting_confirmation）。AdoptPrefetch 命中不需
+    // 该连接；未命中 DownloadToPsram 会重新 Acquire。必须在 stream_mutex_ 外释放并
+    // 短等，避免握锁 delay 卡住 abort/status。
+    ReleaseFetchClient();
+    vTaskDelay(pdMS_TO_TICKS(50));
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-    if (!busy_.load() || !awaiting_confirmation_.load()) {
-        return "{\"error\":\"当前没有待确认的预览\"}";
+    // 释放窗口内可能已被取消：勿再起出图任务。
+    const bool aborted = abort_requested_.exchange(false);
+    if (aborted || !busy_.load()) {
+        ClearPreview();
+        SetState(aborted ? "aborted" : "idle");
+        busy_.store(false, std::memory_order_release);
+        awaiting_confirmation_.store(false);
+        return JsonString(aborted ? "预览已取消" : "ok");
     }
-    auto& pipe = Pipe::GetInstance();
-    if (!pipe.IsConnected() || !pipe.IsReady()) {
-        return "{\"error\":\"写字机未连接或未就绪\"}";
-    }
-    if (!pipe.IsAuthorized()) {
-        return "{\"error\":\"写字机未授权，请联系卖家协助激活\"}";
-    }
-    if (!pipe.IsSettingsVerified()) {
-        return "{\"error\":\"grbl_settings_mismatch\"}";
-    }
-    awaiting_confirmation_.store(false);
-    SetState("downloading");
     // 灌流可持续数分钟，优先级必须低于 AFE 与编解码，避免挤占语音处理。
     BaseType_t ok = xTaskCreate(TaskEntry, "hutuji_draw", 8192, this, 1, nullptr);
     if (ok != pdTRUE) {
+        ESP_LOGE(TAG,
+                 "无法创建出图任务：internal free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         // 回滚必须保留屏上预览：否则用户看到空屏却仍处于待确认。
         awaiting_confirmation_.store(true);
         SetState("awaiting_confirmation");
@@ -861,51 +900,66 @@ std::string Job::RequestResume() {
 }
 
 std::string Job::RequestRepeat() {
-    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-    if (busy_.exchange(true)) {
-        return JsonString("写字机正忙，请稍候再试");
+    bool replay = false;
+    {
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (busy_.exchange(true)) {
+            return JsonString("写字机正忙，请稍候再试");
+        }
+        auto& pipe = Pipe::GetInstance();
+        if (!pipe.IsConnected()) {
+            busy_.store(false);
+            return "{\"error\":\"写字机 Telnet 未连接\"}";
+        }
+        if (!pipe.IsReady()) {
+            busy_.store(false);
+            return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
+        }
+        // 有留存 buffer 走快路（跳下载+CRC）；否则回落重新下载上次 url_。
+        // 文章模式禁用快路：buffer 留存的只是最后一页，重画语义是整篇重写，
+        // 从第 1 页重新下载（TTL 内有效；过期按下载失败如实报错，同单页回落）。
+        replay = article_pages_.empty() && buffer_replayable_.load() &&
+                 buffer_ != nullptr && buffer_len_ > 0;
+        if (!replay && article_pages_.empty() && url_.empty()) {
+            busy_.store(false);
+            return "{\"error\":\"还没画过东西，没有可重画的内容\"}";
+        }
+        if (!article_pages_.empty()) {
+            // 文章重画从第 1 页重来；页码原子回到 1，status 立刻反映真实进度。
+            article_index_ = 0;
+            article_page_.store(1u, std::memory_order_relaxed);
+            url_ = article_pages_.front().first;
+            ReleaseBuffer();
+        }
+        if (!ResetAbortResetState()) {
+            busy_.store(false);
+            return "{\"error\":\"上一 reset owner 尚未收敛\"}";
+        }
+        stream_quiescence_.store(StreamQuiescence::Idle, std::memory_order_release);
+        abort_hold_confirmed_.store(false);
+        abort_requested_.store(false);
+        paused_.store(false);
+        paper_active_.store(false);
+        repeat_mode_.store(replay);
+        last_error_.clear();
+        SetState(replay ? "streaming" : "downloading");
     }
-    auto& pipe = Pipe::GetInstance();
-    if (!pipe.IsConnected()) {
-        busy_.store(false);
-        return "{\"error\":\"写字机 Telnet 未连接\"}";
-    }
-    if (!pipe.IsReady()) {
-        busy_.store(false);
-        return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
-    }
-    // 有留存 buffer 走快路（跳下载+CRC）；否则回落重新下载上次 url_。
-    // 文章模式禁用快路：buffer 留存的只是最后一页，重画语义是整篇重写，
-    // 从第 1 页重新下载（TTL 内有效；过期按下载失败如实报错，同单页回落）。
-    bool replay = article_pages_.empty() && buffer_replayable_.load() &&
-                  buffer_ != nullptr && buffer_len_ > 0;
-    if (!replay && article_pages_.empty() && url_.empty()) {
-        busy_.store(false);
-        return "{\"error\":\"还没画过东西，没有可重画的内容\"}";
-    }
-    if (!article_pages_.empty()) {
-        // 文章重画从第 1 页重来；页码原子回到 1，status 立刻反映真实进度。
-        article_index_ = 0;
-        article_page_.store(1u, std::memory_order_relaxed);
-        url_ = article_pages_.front().first;
-        ReleaseBuffer();
-    }
-    if (!ResetAbortResetState()) {
-        busy_.store(false);
-        return "{\"error\":\"上一 reset owner 尚未收敛\"}";
-    }
-    stream_quiescence_.store(StreamQuiescence::Idle, std::memory_order_release);
-    abort_hold_confirmed_.store(false);
-    abort_requested_.store(false);
-    paused_.store(false);
-    paper_active_.store(false);
-    repeat_mode_.store(replay);
-    last_error_.clear();
-    SetState(replay ? "streaming" : "downloading");
 
+    // 与 RequestConfirm 同因：空闲期残留 TLS keep-alive 会挤掉 8192 栈分配。
+    ReleaseFetchClient();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    if (!busy_.load()) {
+        return JsonString("ok");
+    }
     // 重画也可能持续数分钟，必须与确认出图使用相同的音频让行优先级。
     BaseType_t ok = xTaskCreate(TaskEntry, "hutuji_draw", 8192, this, 1, nullptr);
     if (ok != pdTRUE) {
+        ESP_LOGE(TAG,
+                 "无法创建出图任务：internal free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         busy_.store(false);
         repeat_mode_.store(false);
         SetState("idle");
@@ -1332,14 +1386,40 @@ std::string Job::StatusJson() const {
 
 void Job::PreviewTaskEntry(void* arg) {
     static_cast<Job*>(arg)->Preview();
-    vTaskDelete(nullptr);
+    // WithCaps 创建的任务必须用 WithCaps 删除，否则 PSRAM 栈泄漏。
+    vTaskDeleteWithCaps(nullptr);
+}
+
+bool Job::WaitForTlsHeapBudget() {
+    // 等之前先卸掉可能残留的相位 TLS：否则「等堆」本身还被 ssl_receive 占着。
+    ReleaseFetchClient();
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    if (largest >= kMinTlsInternalLargest) {
+        return true;
+    }
+    ESP_LOGW(TAG, "TLS 前等内部堆 largest=%u < %u", (unsigned)largest,
+             (unsigned)kMinTlsInternalLargest);
+    for (int i = 0; i < kTlsHeapWaitSlices && !abort_requested_.load(); ++i) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        if (largest >= kMinTlsInternalLargest) {
+            ESP_LOGI(TAG, "TLS 堆预算就绪 largest=%u after %dms", (unsigned)largest,
+                     (i + 1) * 100);
+            return true;
+        }
+    }
+    SystemInfo::LogHeapNow("tls-heap-budget-timeout");
+    // 仍不够起 ssl_receive（<6KiB）才硬拒；预览任务活着时 L≈6144 是常态，必须放行。
+    return false;
 }
 
 void Job::Preview() {
-    // 占位卡先上屏：不用等 PNG 落地，用户立刻知道「在准备预览」。
+    // 占位卡立刻上屏：播报可能还要十几秒，先让用户看见「在准备预览」，
+    // 再等功放空闲后才 HTTPS（VSYS 错峰仍在下载前，不挡观感）。
     if (auto* display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay())) {
         display->ShowDrawPreviewLoading();
     }
+    WaitForAudioOutputIdle();
     // P1-1 遥测刷新（消费式）：预览期用户最可能问「还有纸吗」——此刻必为 idle，
     // 发 [ESP901] 并在本任务内 WaitResponse 收掉 ok（普通命令的应答绝不留队，
     // 见 StatusJson 只读注释）；失败/超时静默——刷新只是尽力而为，不挡预览。
@@ -1435,14 +1515,20 @@ void Job::PrefetchGcode() {
             vTaskDelay(pdMS_TO_TICKS(kFetchRetryBackoffMs[attempt - 1]));
             WaitForAudioOutputIdle();
         }
+        if (!WaitForTlsHeapBudget()) {
+            ESP_LOGW(TAG, "预取 TLS 堆预算不足，跳过本轮");
+            continue;  // 传输态：等堆失败当可重试
+        }
         FetchOutcome outcome = FetchOutcome::kFatal;
         auto network = Board::GetInstance().GetNetwork();
         if (!network) {
             break;
         }
-        auto http = network->CreateHttp(3);
+        // R7：相位内 keep-alive；锁每次尝试重取，退避/等堆不持锁。
+        std::lock_guard<std::mutex> fetch_lock(fetch_mutex_);
+        Http* http = AcquireFetchClient();
         if (!http) {
-            outcome = FetchOutcome::kRetryable;
+            outcome = FetchOutcome::kRetryable;  // 堆瞬态可致创建失败
         }
         while (http && !ok && outcome == FetchOutcome::kFatal) {
             http->SetTimeout(attempt == 0 ? kFetchFirstTimeoutMs : kFetchRetryTimeoutMs);
@@ -1450,9 +1536,13 @@ void Job::PrefetchGcode() {
                 outcome = FetchOutcome::kRetryable;
                 break;
             }
-            if (http->GetStatusCode() != 200) {
+            const int status = http->GetStatusCode();
+            if (status != 200) {
                 http->Close();
-                break;  // 非 200（TTL/名字）确定性失败
+                if (status < 100) {
+                    outcome = FetchOutcome::kRetryable;  // status=-1=TLS 读败，传输态同预览口径
+                }
+                break;  // 非 200（TTL/名字）确定性失败；<100 传输态外层继续重试
             }
             const size_t content_length = http->GetBodyLength();
             if (content_length == 0 || content_length > kMaxGcodeBytes) {
@@ -1491,23 +1581,25 @@ void Job::PrefetchGcode() {
                 }
                 total += static_cast<size_t>(n);
             }
-            http->Close();
             if (prefetch_cancel_.load() || abort_requested_.load()) {
+                http->Close();  // R7：取消即断连，不把半读连接留给下一取
                 break;  // 取消/中止是 fatal（outcome 保持 kFatal），绝不重试
             }
             if (total != content_length || !Crc32Matches(crc, Crc32Ieee(buf, total))) {
+                http->Close();  // R7：半读连接已污染，Close 后下次 Open 重建
                 heap_caps_free(buf);
                 buf = nullptr;
                 outcome = FetchOutcome::kRetryable;
                 break;
             }
             len = total;
-            ok = true;
+            ok = true;  // 相位内可读下一次；函数尾统一 Release，不跨 awaiting
         }
         if (!ok && outcome == FetchOutcome::kFatal) {
             break;
         }
     }
+    bool published = false;
     if (ok) {
         std::lock_guard<std::mutex> lock(prefetch_mutex_);
         // epoch 变了说明新任务已开始或本任务被作废：产物不得发布。
@@ -1517,16 +1609,18 @@ void Job::PrefetchGcode() {
             prefetch_crc_ = crc;
             prefetch_url_ = url;
             prefetch_state_.store(PrefetchState::Ready, std::memory_order_release);
+            published = true;
             ESP_LOGI(TAG, "G-code 预取完成 %zu 字节，确认即画", len);
-            return;
         }
     }
-    if (buf != nullptr) {
+    if (!published && buf != nullptr) {
         heap_caps_free(buf);
     }
-    if (prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
+    if (!published && prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
         prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
     }
+    // R7：预取相位结束必卸 TLS——成功早退也曾漏卸，待确认期占着 4KB 栈。
+    ReleaseFetchClient();
 }
 
 bool Job::AdoptPrefetch() {
@@ -1580,14 +1674,29 @@ void Job::WaitForAudioOutputIdle() {
     // （2026-09-06 晚「一直在下载中」实证 5.5 分钟）。abort 立即放行，由下载循环
     // 的 abort 检查收敛。
     ESP_LOGI(TAG, "等待播报结束再下载（功放/WiFi 错峰）");
+    bool waited = false;
     const int cap = app.GetDeviceState() == kDeviceStateSpeaking ? 300 : 30;
     for (int i = 0; i < cap &&
                    (app.GetDeviceState() == kDeviceStateSpeaking || !app.IsPlaybackIdle());
          ++i) {
+        waited = true;
         if (abort_requested_.load()) {
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    // 2026-09-06 17:07 HIL 实证补洞：播报结束瞬间 listening 重开麦克风，AFE/opus
+    // 编码链要 2-4s 追帧（Encode queue full dropping 17），首试 TLS 读正撞分配低谷
+    // （esp-aes DMA 块拿不到 → status=-1 → 旧口径 fatal 直报错）。真等过播报才静置
+    // 3s 让堆抖动平息；写中途下载 playback 本就 idle，早退不吃这 3s。abort 立即放行。
+    if (waited && !abort_requested_.load()) {
+        ESP_LOGI(TAG, "播报刚结束，静置 3s 等麦克风追帧平息");
+        for (int i = 0; i < 30; ++i) {
+            if (abort_requested_.load()) {
+                return;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
 }
 
@@ -1598,6 +1707,8 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
         ESP_LOGW(TAG, "无 LVGL 显示，跳过预览");
         return false;
     }
+    // R7：新预览开始先卸上一相位 TLS；成功读完也不跨 Notify 播报/预取等待占栈。
+    ReleaseFetchClient();
     // 2026-09-06：TLS 读在音频活跃期会因内部堆瞬时低谷失败（esp-aes 的 1600B DMA
     // 块分配不到，esp-tls -0x0084）——只对这类传输态失败重试；abort/非 200/CRC 头/
     // PSRAM/解码等确定性失败立即出局（口径见 kFetchRetryBackoffMs 注释块）。
@@ -1613,11 +1724,17 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
         FetchOutcome outcome = FetchOutcome::kFatal;
         image = [this, &url, attempt, &outcome]() -> std::unique_ptr<LvglAllocatedImage> {
             WaitForAudioOutputIdle();
+            if (!WaitForTlsHeapBudget()) {
+                outcome = FetchOutcome::kRetryable;
+                return nullptr;
+            }
+            // R7：相位内 keep-alive（同锁串行）。等堆/播报不持锁、不占 ssl_receive。
+            std::lock_guard<std::mutex> fetch_lock(fetch_mutex_);
             auto network = Board::GetInstance().GetNetwork();
             if (!network) {
                 return nullptr;
             }
-            auto http = network->CreateHttp(3);
+            Http* http = AcquireFetchClient();
             if (!http) {
                 outcome = FetchOutcome::kRetryable;  // 堆瞬态可致创建失败
                 return nullptr;
@@ -1627,9 +1744,16 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
                 outcome = FetchOutcome::kRetryable;
                 return nullptr;
             }
-            if (http->GetStatusCode() != 200) {
-                ESP_LOGW(TAG, "预览 HTTP status %d", http->GetStatusCode());
+            const int status = http->GetStatusCode();
+            if (status != 200) {
+                ESP_LOGW(TAG, "预览 HTTP status %d", status);
                 http->Close();
+                if (status < 100) {
+                    // 2026-09-06 17:08 HIL 实证：TLS 传输态失败（SSL read -132，
+                    // esp-aes DMA 块分配不到）在 Open 成功后仍以 status=-1 暴露；
+                    // 旧口径把 -1 当确定性失败，重试环被本分支截胡直报错。
+                    outcome = FetchOutcome::kRetryable;
+                }
                 return nullptr;
             }
             const size_t content_length = http->GetBodyLength();
@@ -1668,17 +1792,21 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
                 }
                 total += static_cast<size_t>(n);
             }
-            http->Close();
+            if (aborted) {
+                http->Close();  // R7：取消即断连
+            }
             SystemInfo::LogHeapNow("preview-read-done");  // 取证：TLS 读谷底（成败都打）
             if (aborted) {
                 heap_caps_free(data);
                 return nullptr;  // outcome 默认 kFatal：用户取消绝不重试
             }
             if (total != content_length || !Crc32Matches(expected_crc, Crc32Ieee(data, total))) {
+                http->Close();  // R7：半读连接已污染，Close 后下次 Open 重建
                 heap_caps_free(data);
                 outcome = FetchOutcome::kRetryable;  // 传输截断/中途换文件
                 return nullptr;
             }
+            // 相位内可读下一轮重试；函数返回前统一 Release，不把 TLS 带进 Notify 播报。
             // LvglAllocatedImage 构造成功即接管 data 的所有权（析构里 heap_caps_free）；
             // 只有构造抛出（PNG 头非法）时才由本函数释放，否则就是 double free。
             std::unique_ptr<LvglAllocatedImage> img;
@@ -1696,6 +1824,8 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
             break;  // 确定性失败：立即出局，不做无谓重试
         }
     }
+    // R7：预览相位结束必卸 TLS——成功后还要 Notify 播报再预取，不可跨相位占栈。
+    ReleaseFetchClient();
     if (!image) {
         return false;
     }
@@ -1812,6 +1942,7 @@ void Job::Run() {
         // 下载/校验期间就被暂停时，不能把状态改回 streaming——否则 status 谎报
         // 正在画，实际转发循环一进去就卡在暂停门上。
         int disconnect_replays = 0;
+        SystemInfo::LogHeapNow("page-draw-begin");  // R6 取证：TLS 复用连接整段页绘期钉住的堆对照
         while (true) {
             SetStreamingOrPaused();
             // 奎享完整会话会在首个笔控前旁路 G92 Z0；下载文件本身仍不含 G92。
@@ -1841,6 +1972,7 @@ void Job::Run() {
             ESP_LOGW(TAG, "断连恢复完成，从 PSRAM 第 1 行重画（%d/%d）", disconnect_replays,
                      kDisconnectReplayMaxRetries);
         }
+        SystemInfo::LogHeapNow("page-draw-end");  // R6 取证：与 begin 成对；流式期若谷底劣化须回退每页释放
         // character-counting 的 error 只丢坏行，RX/planner 中后续块仍可能继续运动。
         // StreamToGrbl 已先发 `!` 并发布 Quiesced；在发布 error/busy=false 前同步
         // 完成既有受控 reset 事务，保证软件终态与物理终态一致。
@@ -1962,6 +2094,9 @@ void Job::Run() {
             buffer_replayable_.store(false);
             ReleaseBuffer();
         }
+        // R6：任务终结释放 Job 级 TLS 连接（成功/失败/中止都走这里；含 ssl_receive
+        // 任务的 4KB 内部栈，不留到空闲期挤压下一次预取的分配余量）。
+        ReleaseFetchClient();
         paper_active_.store(false);
         paused_.store(false);
         repeat_mode_.store(false);
@@ -1983,12 +2118,39 @@ void Job::Run() {
     }
 }
 
+Http* Job::AcquireFetchClient() {
+    // 调用方必须已持 fetch_mutex_（R7）。
+    if (!fetch_http_) {
+        auto network = Board::GetInstance().GetNetwork();
+        if (!network) {
+            return nullptr;
+        }
+        fetch_http_ = network->CreateHttp(3);
+        if (fetch_http_) {
+            // 请求侧带 Connection: keep-alive（BuildHttpRequest 据此选择），响应侧
+            // server_keep_alive_ 置位见 http_client.cc R5 补丁（HTTP/1.1 默认持久）。
+            // 仅相位内复用；相位尾 ReleaseFetchClient 卸 ssl_receive 栈。
+            fetch_http_->SetKeepAlive(true);
+        }
+    }
+    return fetch_http_.get();
+}
+
+void Job::ReleaseFetchClient() {
+    std::lock_guard<std::mutex> lock(fetch_mutex_);
+    if (fetch_http_) {
+        fetch_http_->Close();  // Close 幂等：未连接直接返回
+        fetch_http_.reset();
+    }
+}
+
 bool Job::DownloadToPsram(const std::string& url) {
     // 2026-09-06：与预览同策的有界重试——只对传输态失败（Open/Read/截断）重试，
     // 确定性失败（404/CRC 头/PSRAM）立即出局；退避与超时口径见 kFetchRetryBackoffMs 注释块。
     for (int attempt = 0; attempt < kFetchMaxAttempts; ++attempt) {
         if (abort_requested_.load()) {
             last_error_ = "aborted";
+            ReleaseFetchClient();
             return false;
         }
         if (attempt > 0) {
@@ -1996,14 +2158,22 @@ bool Job::DownloadToPsram(const std::string& url) {
             vTaskDelay(pdMS_TO_TICKS(kFetchRetryBackoffMs[attempt - 1]));
         }
         WaitForAudioOutputIdle();
+        if (!WaitForTlsHeapBudget()) {
+            last_error_ = "TLS 堆预算不足";
+            continue;
+        }
         SystemInfo::LogHeapNow(attempt == 0 ? "gcode-dl-begin" : "gcode-dl-retry");
         ReleaseBuffer();
+        // R7：相位内 keep-alive；锁每次尝试重取（unique_lock，continue/return 解锁）。
+        std::unique_lock<std::mutex> fetch_lock(fetch_mutex_);
         auto network = Board::GetInstance().GetNetwork();
         if (!network) {
             last_error_ = "无网络";
+            fetch_lock.unlock();
+            ReleaseFetchClient();
             return false;  // 无网络接口不是瞬态类，重试无意义
         }
-        auto http = network->CreateHttp(3);
+        Http* http = AcquireFetchClient();
         if (!http) {
             last_error_ = "CreateHttp 失败";
             continue;
@@ -2014,9 +2184,16 @@ bool Job::DownloadToPsram(const std::string& url) {
             last_error_ = "HTTP Open 失败";
             continue;
         }
-        if (http->GetStatusCode() != 200) {
-            last_error_ = "HTTP status " + std::to_string(http->GetStatusCode());
+        const int status = http->GetStatusCode();
+        if (status != 200) {
             http->Close();
+            if (status < 100) {
+                last_error_ = "HTTP 传输失败 status " + std::to_string(status);
+                continue;  // status=-1=TLS 读败，传输态同预览口径，重试
+            }
+            last_error_ = "HTTP status " + std::to_string(status);
+            fetch_lock.unlock();
+            ReleaseFetchClient();
             return false;  // 404（TTL 过期/名字非法）是确定性失败，重试只会拖延报错
         }
 
@@ -2024,11 +2201,15 @@ bool Job::DownloadToPsram(const std::string& url) {
         if (content_length == 0) {
             last_error_ = "Content-Length 为 0";
             http->Close();
+            fetch_lock.unlock();
+            ReleaseFetchClient();
             return false;
         }
         if (content_length > kMaxGcodeBytes) {
             last_error_ = "超过 512KB";
             http->Close();
+            fetch_lock.unlock();
+            ReleaseFetchClient();
             return false;
         }
 
@@ -2039,6 +2220,8 @@ bool Job::DownloadToPsram(const std::string& url) {
         if (!ParseCrc32Header(crc_hdr, expect_crc_)) {
             last_error_ = crc_hdr.empty() ? "缺少 X-Hutuji-CRC32" : "X-Hutuji-CRC32 格式无效";
             http->Close();
+            fetch_lock.unlock();
+            ReleaseFetchClient();
             return false;
         }
 
@@ -2049,6 +2232,8 @@ bool Job::DownloadToPsram(const std::string& url) {
         if (buffer_ == nullptr) {
             last_error_ = "PSRAM 分配失败";
             http->Close();
+            fetch_lock.unlock();
+            ReleaseFetchClient();
             return false;
         }
 
@@ -2058,6 +2243,8 @@ bool Job::DownloadToPsram(const std::string& url) {
             if (abort_requested_.load()) {
                 http->Close();
                 last_error_ = "aborted";
+                fetch_lock.unlock();
+                ReleaseFetchClient();
                 return false;
             }
             int n = http->Read(reinterpret_cast<char*>(buffer_ + total), content_length - total);
@@ -2071,9 +2258,9 @@ bool Job::DownloadToPsram(const std::string& url) {
             }
             total += static_cast<size_t>(n);
         }
-        http->Close();
-        SystemInfo::LogHeapNow("gcode-dl-done");  // 取证：TLS 读谷底（成败都打）
         if (total != content_length) {
+            http->Close();  // R7：半读/截断连接已污染，Close 后下次 Open 重建
+            SystemInfo::LogHeapNow("gcode-dl-done");  // 取证：TLS 读谷底（成败都打）
             if (!read_failed) {
                 last_error_ =
                     "长度不符 expect=" + std::to_string(content_length) + " got=" + std::to_string(total);
@@ -2081,10 +2268,15 @@ bool Job::DownloadToPsram(const std::string& url) {
             ReleaseBuffer();  // 半截缓冲不得留给下一次重试/CRC
             continue;
         }
+        SystemInfo::LogHeapNow("gcode-dl-done");  // 取证：TLS 读谷底（成败都打）
         buffer_len_ = total;
         ESP_LOGI(TAG, "下载完成 %u 字节 crc_hdr=%08x", (unsigned)buffer_len_, (unsigned)expect_crc_);
+        fetch_lock.unlock();
+        // R7：下载相位结束即卸 TLS——灌流可达数分钟，不得占着 ssl_receive 栈。
+        ReleaseFetchClient();
         return true;
     }
+    ReleaseFetchClient();
     return false;
 }
 

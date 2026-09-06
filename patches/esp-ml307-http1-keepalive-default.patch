@@ -1,0 +1,71 @@
+diff --git a/managed_components/78__esp-ml307/src/http_client.cc b/managed_components/78__esp-ml307/src/http_client.cc
+index 3cc25d1..4ea4a0f 100644
+--- a/managed_components/78__esp-ml307/src/http_client.cc
++++ b/managed_components/78__esp-ml307/src/http_client.cc
+@@ -330,17 +330,26 @@ void HttpClient::ProcessReceivedData() {
+                 // GetNextLine 已经移除了 \r，所以空行就是 empty()
+                 if (line.empty()) {
+                     // 检查服务器是否支持 Keep-Alive
++                    // 2026-09-06 hutuji 修复（R5）：RFC 7230 §6.3——HTTP/1.1+ 默认持久，
++                    // 仅 Connection: close 显式禁用。原实现只在响应出现显式
++                    // 「Connection: keep-alive」时置 server_keep_alive_；生产 nginx
++                    // 恰好配了该头（2026-09-06 curl 实证 404 也带）复用才可用，
++                    // 换 vhost/直连 uvicorn 即静默失效。改为版本判定兜底。
+                     auto conn_it = response_headers_.find("connection");
++                    bool conn_close = false;
++                    bool conn_keepalive = false;
+                     if (conn_it != response_headers_.end()) {
+                         std::string conn_value = conn_it->second.value;
+                         std::transform(conn_value.begin(), conn_value.end(), conn_value.begin(), ::tolower);
+-                        if (conn_value.find("keep-alive") != std::string::npos) {
+-                            server_keep_alive_ = true;
+-                            ESP_LOGD(TAG, "Server supports Keep-Alive");
+-                        } else if (conn_value.find("close") != std::string::npos) {
+-                            server_keep_alive_ = false;
+-                            ESP_LOGD(TAG, "Server will close connection");
+-                        }
++                        conn_close = conn_value.find("close") != std::string::npos;
++                        conn_keepalive = conn_value.find("keep-alive") != std::string::npos;
++                    }
++                    if (conn_close) {
++                        server_keep_alive_ = false;
++                        ESP_LOGD(TAG, "Server will close connection");
++                    } else if (conn_keepalive || response_http_1_1_) {
++                        server_keep_alive_ = true;
++                        ESP_LOGD(TAG, "Server supports Keep-Alive");
+                     }
+                     
+                     // 检查是否为 chunked 编码
+@@ -464,6 +473,11 @@ bool HttpClient::ParseStatusLine(const std::string& line) {
+         ESP_LOGE(TAG, "Invalid status line: %s", line.c_str());
+         return false;
+     }
++    // 2026-09-06 hutuji 修复（R5）：记录响应 HTTP 版本——持久连接在 HTTP/1.1+ 是
++    // 默认语义（RFC 7230 §6.3），头部区据此判定（见 HEADERS 空行分支）。
++    response_http_1_1_ = version.rfind("HTTP/1.1", 0) == 0 ||
++                         version.rfind("HTTP/2", 0) == 0 ||
++                         version.rfind("HTTP/3", 0) == 0;
+ 
+     std::getline(iss, reason);  // 获取剩余部分作为原因短语
+ 
+@@ -810,6 +824,8 @@ void HttpClient::ResetRequestState() {
+     response_chunked_ = false;
+     request_chunked_ = false;  // 重置请求 chunked 标志
+     connection_error_ = false;
++    server_keep_alive_ = false;   // R5：逐响应重判（IsConnectionReusable 在本函数前读旧值）
++    response_http_1_1_ = false;
+     parse_state_ = ParseState::STATUS_LINE;
+     chunk_size_ = 0;
+     chunk_received_ = 0;
+diff --git a/managed_components/78__esp-ml307/include/http_client.h b/managed_components/78__esp-ml307/include/http_client.h
+index 8f9a9c1..a16e246 100644
+--- a/managed_components/78__esp-ml307/include/http_client.h
++++ b/managed_components/78__esp-ml307/include/http_client.h
+@@ -122,6 +122,7 @@ private:
+     bool connection_error_ = false;  // 新增：标记连接是否异常断开
+     bool keep_alive_ = false;  // 新增：是否启用 Keep-Alive（默认不启用）
+     bool server_keep_alive_ = false;  // 新增：服务器是否支持 Keep-Alive
++    bool response_http_1_1_ = false;  // 新增：响应 HTTP 版本 ≥1.1（持久连接默认语义）
+     int last_error_ = 0;  // 存储最后一次错误码
+     
+     // HTTP 协议解析状态

@@ -2,10 +2,12 @@
 #define HUTUJI_JOB_H
 
 #include "hutuji_recovery_core.h"
+#include "http.h"
 
 #include <esp_timer.h>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -114,6 +116,11 @@ private:
     /** 播报期间 PA 与 HTTPS 下载并发会拉垮无电池 VSYS；下载前等音频输出空闲。 */
     void WaitForAudioOutputIdle();
     /**
+     * TLS 建连前等内部堆最大连续块 ≥ 保险丝门限（R8 后 ssl/预览栈已在 PSRAM）。
+     * 超时且仍不足才返回 false；调用方按传输态重试。
+     */
+    bool WaitForTlsHeapBudget();
+    /**
      * 等 ok 超时后的兜底判定：Grbl WebUI Telnet 输出无 TX 缓冲，`ok` 与 `?` 状态
      * 报告在同核并发写同一 socket，被抢占的部分写会静默吃掉一个 `ok`（不产生
      * error）。此时机器其实已经把在途行走完。取一份 `?` 之后的新状态报告，若为
@@ -141,6 +148,9 @@ private:
     bool ChangePaperAfterDraw();
     bool RecoverDisconnectedDraw();
     void ReleaseBuffer();
+    // R7（2026-09-06）：相位内 keep-alive 取数客户端管理。调用方须已持 fetch_mutex_。
+    Http* AcquireFetchClient();
+    void ReleaseFetchClient();
     void SetState(const char* state);
     /** 按 paused_ 真值写 streaming/paused，避免状态谎报。 */
     void SetStreamingOrPaused();
@@ -232,6 +242,13 @@ private:
     size_t prefetch_len_ = 0;
     uint32_t prefetch_crc_ = 0;
     std::string prefetch_url_;
+    // R7（2026-09-06）：相位级 TLS，不是「待确认全程 keep-alive」。
+    // 单次下载突发（预览重试环 / 预取重试环 / G-code 重试环）内 SetKeepAlive 复用，
+    // 避免同相位反复握手；相位结束（含成功）必须 ReleaseFetchClient()，禁止跨
+    // 播报等待、awaiting_confirmation、灌流占着 ssl_receive ~4KB 内部栈——那是
+    // 预览三连 200 仍失败 + confirm 建不出 8192 任务的根因。fetch_mutex_ 串行三取数点。
+    std::mutex fetch_mutex_;
+    std::unique_ptr<Http> fetch_http_;
     uint8_t* buffer_ = nullptr;  // 出图 PSRAM 缓冲：Adopt 接管或 DownloadToPsram 分配，Run 尾决定留存或释放
     size_t buffer_len_ = 0;
     uint32_t expect_crc_ = 0;
