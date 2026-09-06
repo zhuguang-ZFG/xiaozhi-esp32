@@ -1868,6 +1868,16 @@ LcdDisplay::~LcdDisplay() {
         accent_drift_timer_ = nullptr;
     }
 #endif
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+    if (electronbot_blink_timer_ != nullptr) {
+        lv_timer_delete(electronbot_blink_timer_);
+        electronbot_blink_timer_ = nullptr;
+    }
+    if (electronbot_blink_restore_timer_ != nullptr) {
+        lv_timer_delete(electronbot_blink_restore_timer_);
+        electronbot_blink_restore_timer_ = nullptr;
+    }
+#endif
     if (machine_hud_timer_ != nullptr) {
         lv_timer_delete(machine_hud_timer_);
         machine_hud_timer_ = nullptr;
@@ -2323,14 +2333,19 @@ void LcdDisplay::SetupUI() {
 void LcdDisplay::SetGrobotEyesPaused(bool on) {
 #if CONFIG_HUTUJI_ELECTRONBOT_FACE
     if (electronbot_face_active_) {
-        // 与 grobot 版同语义：job 高压窗口冻结动画（GIF 解码器/LVGL 与 TLS 同核互抢
-        // 的实证修复延续）；暂停停帧停在当前帧，恢复重放当前情绪。
+        // 与 grobot 版同语义：job 高压窗口冻结动画。Pause/Resume 冻结在当前帧且零
+        // 重分配（Stop 倒带虽也不释放，但重播打断当前帧位）；恢复时 neutral 走常驻
+        // 槽零分配重播，情绪循环段有控制器则续播、缺失才重建。
         DisplayLockGuard lock(this);
         electronbot_paused_ = on;
         if (on) {
-            if (gif_controller_ != nullptr) {
-                gif_controller_->Stop();
-            }
+            if (gif_controller_ != nullptr) gif_controller_->Pause();
+            if (electronbot_neutral_gif_ != nullptr) electronbot_neutral_gif_->Pause();
+            if (electronbot_blink_gif_ != nullptr) electronbot_blink_gif_->Pause();
+        } else if (electronbot_emotion_ == "neutral") {
+            ElectronBotShow("neutral");
+        } else if (gif_controller_ != nullptr) {
+            gif_controller_->Resume();
         } else {
             ElectronBotShow(electronbot_emotion_.c_str());
         }
@@ -2875,6 +2890,10 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
         preview_image_cached_.reset();
         if (gif_controller_) {
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+            // electronbot 脸暂停期（job 高压窗口）不得借预览超时回放动画
+            if (!electronbot_paused_)
+#endif
             gif_controller_->Start();
         }
         return;
@@ -2990,7 +3009,10 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         DisplayLockGuard lock(this);
         // 记录归一化后的情绪供暂停恢复重放；集合内别名映射兜底 neutral
         electronbot_emotion_ = ElectronBotEmojiCollection::MapEmotion(emotion);
-        ElectronBotShow(electronbot_emotion_.c_str());
+        if (!electronbot_paused_) {
+            // 暂停期（job 高压窗口）只记录不播放：恢复时由暂停钩子按最新情绪重放
+            ElectronBotShow(electronbot_emotion_.c_str());
+        }
         return;
     }
 #endif
@@ -3302,43 +3324,92 @@ void LcdDisplay::InitElectronBotFace(LvglTheme* theme) {
     }
     SetEmojiCollection(electronbot_collection_);
     lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-    // 240x240 源图放大到脸盒（460x300 横屏取 300 边）：ElectronBot 900² 原稿眼区
-    // 约占中幅，1.25 倍后大小与 grobot 版脸相当
-    lv_image_set_scale(emoji_image_, 320);
+    // 256² 源图 1.5x 放大到 384 贴脸盒高（460x300 横屏）：情绪/眨眼只在状态切换时
+    // 换源，非每帧动画——一次性变换成本可忽略（advisory 否决的是常驻动画每帧缩放）
+    lv_image_set_scale(emoji_image_, 384);
+    ElectronBotMakeCached_(electronbot_neutral_gif_, "neutral");
+    ElectronBotMakeCached_(electronbot_blink_gif_, "blink_once");
     ElectronBotShow("neutral");
-    // 眨眼偶发：5s 一拍单/双眨轮换；眨眼片段 0.5s@12fps，650ms 后回静态帧
     electronbot_blink_timer_ = lv_timer_create(ElectronBotBlinkTimerCb, 5000, this);
     ESP_LOGI(TAG, "ElectronBot face initialized (GIF collection embedded)");
+}
+
+void LcdDisplay::ElectronBotMakeCached_(std::unique_ptr<LvglGif>& slot, const char* key) {
+    const LvglImage* image = electronbot_collection_->GetEmojiImage(key);
+    if (image == nullptr) {
+        return;
+    }
+    slot = std::make_unique<LvglGif>(image->image_dsc());
+    if (!slot->IsLoaded()) {
+        ESP_LOGE(TAG, "ElectronBot face: bad GIF for %s", key);
+        slot.reset();
+        return;
+    }
+    slot->SetFrameCallback(
+        [this, &slot]() { lv_image_set_src(emoji_image_, slot->image_dsc()); });
 }
 
 void LcdDisplay::ElectronBotShow(const char* key) {
     if (emoji_image_ == nullptr) {
         return;
     }
-    auto* theme = static_cast<LvglTheme*>(current_theme_);
-    auto* coll = theme != nullptr ? theme->emoji_collection().get() : nullptr;
-    const LvglImage* image = coll != nullptr ? coll->GetEmojiImage(key) : nullptr;
-    if (image == nullptr) {
-        return;
+    // 互斥：先停两个常驻控制器（目标槽除外），否则对方的帧回调会覆盖当前画面
+    LvglGif* keep = nullptr;
+    if (strcmp(key, "neutral") == 0) {
+        keep = electronbot_neutral_gif_.get();
+    } else if (strcmp(key, "blink_once") == 0) {
+        keep = electronbot_blink_gif_.get();
     }
-    if (gif_controller_) {
-        gif_controller_->Stop();
-        gif_controller_.reset();
+    if (electronbot_neutral_gif_ && electronbot_neutral_gif_.get() != keep) {
+        electronbot_neutral_gif_->Pause();
     }
-    if (image->IsGif()) {
-        gif_controller_ = std::make_unique<LvglGif>(image->image_dsc());
-        if (gif_controller_->IsLoaded()) {
-            gif_controller_->SetFrameCallback(
-                [this]() { lv_image_set_src(emoji_image_, gif_controller_->image_dsc()); });
-            lv_image_set_src(emoji_image_, gif_controller_->image_dsc());
-            gif_controller_->Start();
-        } else {
-            ESP_LOGE(TAG, "ElectronBot face: bad GIF for %s", key);
+    if (electronbot_blink_gif_ && electronbot_blink_gif_.get() != keep) {
+        electronbot_blink_gif_->Pause();
+    }
+    // 常驻槽位（neutral/blink）复用既有控制器——Stop 倒带不释放，全程零重分配；
+    // 情绪循环段随情绪在 gif_controller_ 上换（LLM 语句级频率，可接受）
+    LvglGif* target = nullptr;
+    if (strcmp(key, "neutral") == 0) {
+        target = electronbot_neutral_gif_.get();
+    } else if (strcmp(key, "blink_once") == 0) {
+        target = electronbot_blink_gif_.get();
+    }
+    if (target != nullptr) {
+        if (gif_controller_) {
+            gif_controller_->Stop();
             gif_controller_.reset();
+        }
+        target->Stop();  // 倒带+渲首帧，从头播
+        lv_image_set_src(emoji_image_, target->image_dsc());
+        target->Start();
+    } else {
+        auto* theme = static_cast<LvglTheme*>(current_theme_);
+        auto* coll = theme != nullptr ? theme->emoji_collection().get() : nullptr;
+        const LvglImage* image = coll != nullptr ? coll->GetEmojiImage(key) : nullptr;
+        if (image == nullptr) {
             return;
         }
-    } else {
-        lv_image_set_src(emoji_image_, image->image_dsc());
+        if (electronbot_neutral_gif_) electronbot_neutral_gif_->Pause();
+        if (electronbot_blink_gif_) electronbot_blink_gif_->Pause();
+        if (gif_controller_) {
+            gif_controller_->Stop();
+            gif_controller_.reset();
+        }
+        if (image->IsGif()) {
+            gif_controller_ = std::make_unique<LvglGif>(image->image_dsc());
+            if (gif_controller_->IsLoaded()) {
+                gif_controller_->SetFrameCallback(
+                    [this]() { lv_image_set_src(emoji_image_, gif_controller_->image_dsc()); });
+                lv_image_set_src(emoji_image_, gif_controller_->image_dsc());
+                gif_controller_->Start();
+            } else {
+                ESP_LOGE(TAG, "ElectronBot face: bad GIF for %s", key);
+                gif_controller_.reset();
+                return;
+            }
+        } else {
+            lv_image_set_src(emoji_image_, image->image_dsc());
+        }
     }
     lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
@@ -3350,15 +3421,20 @@ void LcdDisplay::ElectronBotBlinkTimerCb(lv_timer_t* timer) {
     if (self->electronbot_paused_ || self->electronbot_emotion_ != "neutral") {
         return;
     }
-    self->ElectronBotShow(self->electronbot_blink_twice_next_ ? "blink_twice" : "blink_once");
-    self->electronbot_blink_twice_next_ = !self->electronbot_blink_twice_next_;
-    lv_timer_t* restore = lv_timer_create(ElectronBotBlinkRestoreCb, 650, self);
-    lv_timer_set_repeat_count(restore, 1);
+    if (self->electronbot_blink_restore_timer_ != nullptr) {
+        return;  // 上一眨还没回静态帧（不应发生，守卫）
+    }
+    self->ElectronBotShow("blink_once");
+    // 眨眼片段 0.5s@12fps，650ms 后回静态帧；restore 存成员供析构删除（裸 lv_timer
+    // 回调持有 this，析构夹在窗口内就是 UAF——2026-09-06 advisory 评审实锤）
+    self->electronbot_blink_restore_timer_ = lv_timer_create(ElectronBotBlinkRestoreCb, 650, self);
+    lv_timer_set_repeat_count(self->electronbot_blink_restore_timer_, 1);
 }
 
 void LcdDisplay::ElectronBotBlinkRestoreCb(lv_timer_t* timer) {
     auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
     DisplayLockGuard lock(self);
+    self->electronbot_blink_restore_timer_ = nullptr;  // 一次性定时器自动删除自身
     // 眨眼途中来了真情绪：恢复帧不得盖回去（SetEmotion 已把 emotion_ 换走）
     if (!self->electronbot_paused_ && self->electronbot_emotion_ == "neutral") {
         self->ElectronBotShow("neutral");

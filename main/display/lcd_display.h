@@ -152,8 +152,15 @@ protected:
     std::string electronbot_emotion_{"neutral"};
     lv_timer_t* electronbot_blink_timer_ = nullptr;
     bool electronbot_paused_ = false;
+    // neutral 静态帧与眨眼各持一个常驻控制器（Stop=倒带不释放，复用零分配）；
+    // 情绪循环段仍走 gif_controller_ 随情绪换——避免每 5s 一次的 288KB 级 PSRAM
+    // 申请/释放循环（长期碎片化风险，2026-09-06 advisory 评审实锤）
+    std::unique_ptr<LvglGif> electronbot_neutral_gif_;
+    std::unique_ptr<LvglGif> electronbot_blink_gif_;
+    lv_timer_t* electronbot_blink_restore_timer_ = nullptr;
     bool electronbot_blink_twice_next_ = false;
     void InitElectronBotFace(LvglTheme* theme);
+    void ElectronBotMakeCached_(std::unique_ptr<LvglGif>& slot, const char* key);
     void ElectronBotShow(const char* key);
     static void ElectronBotBlinkTimerCb(lv_timer_t* timer);
     static void ElectronBotBlinkRestoreCb(lv_timer_t* timer);

@@ -49,34 +49,55 @@ class ElectronBotFaceTest(unittest.TestCase):
     def test_setemotion_electronbot_records_mapped_emotion(self):
         # SetEmotion 的 electronbot 分支：归一化记录 + 定向播放 + return
         m = re.search(
-            r'if \(electronbot_face_active_\) \{\s*DisplayLockGuard lock\(this\);[^}]*?'
-            r'electronbot_emotion_ = ElectronBotEmojiCollection::MapEmotion\(emotion\);[^}]*?'
-            r'ElectronBotShow\(electronbot_emotion_\.c_str\(\)\);\s*return;',
+            r'if \(electronbot_face_active_\) \{\s*DisplayLockGuard lock\(this\);[^;]*?'
+            r'electronbot_emotion_ = ElectronBotEmojiCollection::MapEmotion\(emotion\);\s*'
+            r'if \(!electronbot_paused_\) \{\s*[^}]*?'
+            r'ElectronBotShow\(electronbot_emotion_\.c_str\(\)\);\s*\}\s*return;',
             self.lcd_cc, re.S)
         self.assertIsNotNone(m, "SetEmotion 缺 electronbot 映射+播放分支")
 
-    def test_pause_hook_freezes_and_replays(self):
+    def test_pause_hook_pauses_and_resumes_without_realloc(self):
+        """暂停钩子：Pause/Resume 冻结续播零重分配（Stop 重放会打断帧位且情绪段重建
+        是 288KB 级 PSRAM 申请——2026-09-06 advisory 评审实锤的碎片化风险）。"""
         m = re.search(r'void LcdDisplay::SetGrobotEyesPaused\(bool on\) \{(.*?)\n\}',
                       self.lcd_cc, re.S)
         self.assertIsNotNone(m)
         body = m.group(1)
         self.assertIn('electronbot_face_active_', body)
         self.assertIn('electronbot_paused_ = on;', body)
-        self.assertIn('gif_controller_->Stop();', body)
-        # 恢复重放当前情绪（不停在停帧上卡死）
-        self.assertIn('ElectronBotShow(electronbot_emotion_.c_str());', body)
+        # 暂停：三个控制器全部 Pause（情绪循环 + neutral + blink 常驻槽）
+        self.assertIn('gif_controller_->Pause();', body)
+        self.assertIn('electronbot_neutral_gif_->Pause();', body)
+        self.assertIn('electronbot_blink_gif_->Pause();', body)
+        # 恢复：neutral 走常驻槽重放；情绪段有控制器续播、缺失才重建
+        self.assertIn('ElectronBotShow("neutral");', body)
+        self.assertIn('gif_controller_->Resume();', body)
         # grobot 路径保留
         self.assertIn('grobot_eyes_->SetPaused(on);', body)
 
-    def test_blink_timer_and_restore_guard(self):
+    def test_setemotion_paused_records_only(self):
+        """暂停期 SetEmotion 只记录不播放（恢复时由钩子按最新情绪重放）。"""
+        m = re.search(r'electronbot_emotion_ = ElectronBotEmojiCollection::MapEmotion\(emotion\);'
+                      r'\s*if \(!electronbot_paused_\)', self.lcd_cc, re.S)
+        self.assertIsNotNone(m)
+
+    def test_blink_uses_cached_controllers_no_realloc(self):
+        """neutral/blink 常驻控制器在 init 建好；眨眼 5s 复用（Stop 倒带不释放）。"""
+        self.assertIn('ElectronBotMakeCached_(electronbot_neutral_gif_, "neutral");', self.lcd_cc)
+        self.assertIn('ElectronBotMakeCached_(electronbot_blink_gif_, "blink_once");', self.lcd_cc)
+        # Show 里常驻槽位复用：Stop+Start 于同一控制器，不 new
+        m = re.search(r'void LcdDisplay::ElectronBotShow\(.*?target->Stop\(\);', self.lcd_cc, re.S)
+        self.assertIsNotNone(m)
+        # 眨眼定时与恢复守卫；restore 存成员供析构删除（防 UAF）
         self.assertIn('lv_timer_create(ElectronBotBlinkTimerCb, 5000, this)', self.lcd_cc)
-        self.assertIn('lv_timer_set_repeat_count(restore, 1)', self.lcd_cc)
-        # 恢复帧只在仍是 neutral 时才回，不盖真情绪
+        self.assertIn('electronbot_blink_restore_timer_ = lv_timer_create', self.lcd_cc)
         m = re.search(r'void LcdDisplay::ElectronBotBlinkRestoreCb.*?'
                       r'electronbot_emotion_ == "neutral"', self.lcd_cc, re.S)
         self.assertIsNotNone(m)
-        # 眨眼途中暂停/真情绪到达都被拦
-        self.assertIn('electronbot_paused_', self.lcd_cc)
+        # 析构删除两个眨眼定时器
+        dtor = self.lcd_cc[self.lcd_cc.index('LcdDisplay::~LcdDisplay()'):]
+        self.assertIn('lv_timer_delete(electronbot_blink_timer_)', dtor)
+        self.assertIn('lv_timer_delete(electronbot_blink_restore_timer_)', dtor)
 
     def test_theme_switch_reattaches_collection(self):
         m = re.search(r'void LcdDisplay::SetTheme\(Theme\* theme\) \{(.*?)\n\}',
@@ -89,7 +110,13 @@ class ElectronBotFaceTest(unittest.TestCase):
         self.assertIsNotNone(m)
         grobot_names = re.findall(r'"(\w+)"', m.group(1))
         self.assertGreaterEqual(len(grobot_names), 20)
-        mapped = set(re.findall(r'"(\w+)"', self.face_cc))
+        # 只从六个映射数组字面量收集（防注释里的词混进集合造成假绿）
+        mapped = set()
+        for arr in ('kHappyNames', 'kSadNames', 'kAngryNames',
+                    'kShockedNames', 'kDisdainNames', 'kNeutralNames'):
+            am = re.search(rf'{arr}\[\] = \{{(.*?)\}};', self.face_cc, re.S)
+            self.assertIsNotNone(am, arr)
+            mapped.update(re.findall(r'"(\w+)"', am.group(1)))
         missing = [n for n in grobot_names if n not in mapped]
         self.assertEqual(missing, [], f"情绪名未映射: {missing}")
         # canonical 键与眨眼键都在
