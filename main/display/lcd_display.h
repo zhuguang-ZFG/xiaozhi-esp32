@@ -8,10 +8,14 @@
 #include <esp_lcd_panel_ops.h>
 #include <atomic>
 #include <memory>
+#include <string>
 #include <vector>
 
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
 class GrobotEyes;
+#endif
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+class ElectronBotEmojiCollection;
 #endif
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
 class HutujiPiSplash;
@@ -140,6 +144,23 @@ protected:
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     std::unique_ptr<GrobotEyes> grobot_eyes_;
 #endif
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+    // ElectronBot 桌宠脸（2026-09-06 用户拍板替掉 grobot 程序绘眼）：情绪走
+    // SetEmotion 既有 GIF 路径播 emoji_image_；眨眼偶发由定时器驱动；暂停钩子
+    // 复用 SetGrobotEyesPaused（job 高压窗口冻结动画，TLS/渲染不互抢）。
+    std::shared_ptr<ElectronBotEmojiCollection> electronbot_collection_;
+    std::string electronbot_emotion_{"neutral"};
+    lv_timer_t* electronbot_blink_timer_ = nullptr;
+    bool electronbot_paused_ = false;
+    bool electronbot_blink_twice_next_ = false;
+    void InitElectronBotFace(LvglTheme* theme);
+    void ElectronBotShow(const char* key);
+    static void ElectronBotBlinkTimerCb(lv_timer_t* timer);
+    static void ElectronBotBlinkRestoreCb(lv_timer_t* timer);
+#endif
+    // 脸模式判定常量编译期化会散布 #if 碎块；留无条件 bool（默认 false），
+    // 非 electronbot 构建恒走假分支，调用点零 #if。
+    bool electronbot_face_active_ = false;
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
     // 开机 π logo 启动画面；播完自行拆掉所有 LVGL 对象，仅析构时兜底。
     std::unique_ptr<HutujiPiSplash> pi_splash_;
@@ -156,6 +177,7 @@ protected:
     void EnsureMachineControlUi();
     void ApplyMachineControlState();
     void SetGrobotSubtitle(const char* content);
+    void CreateGrobotSubtitleBar(lv_obj_t* screen, LvglTheme* theme);
     void SetMachineDrawerPage(int page);
     void InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme, const lv_font_t* large_icon_font);
     virtual bool Lock(int timeout_ms = 0) override;

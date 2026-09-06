@@ -33,6 +33,9 @@
 #include "boards/lichuang-dev/grobot_eyes.h"
 #include "boards/lichuang-dev/hutuji_pi_splash_core.h"
 #endif
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+#include "boards/lichuang-dev/electronbot_face.h"
+#endif
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
 #include "boards/lichuang-dev/hutuji_pi_splash.h"
 #endif
@@ -2012,8 +2015,6 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    // Grobot 自己从 π splash 的共享渐变取色；主题 accent 仍只用于按钮/状态语义。
-    auto eyes = std::make_unique<GrobotEyes>(theme->background_color());
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
     // 480x320 横屏：四边仅留约 10px 安全边距，状态栏继续独立叠在最前层。
     constexpr int kFaceWidth = 460;
@@ -2036,34 +2037,50 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     if (status_bar_ != nullptr) {
         lv_obj_move_foreground(status_bar_);
     }
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+    // ElectronBot 桌宠脸（2026-09-06 用户拍板）：不建 grobot 程序绘眼画布，
+    // emoji_image_ 直接播内嵌 GIF 集合；底部字幕条与 grobot 版共用同一套。
+    InitElectronBotFace(theme);
+    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    CreateGrobotSubtitleBar(screen, theme);
+#else
+    // Grobot 自己从 π splash 的共享渐变取色；主题 accent 仍只用于按钮/状态语义。
+    auto eyes = std::make_unique<GrobotEyes>(theme->background_color());
     if (eyes->Init(emoji_box_, kFaceWidth, kFaceHeight)) {
         grobot_eyes_ = std::move(eyes);
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-        grobot_subtitle_bar_ = lv_obj_create(screen);
-        lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES * 72 / 100, 40);
-        lv_obj_align(grobot_subtitle_bar_, LV_ALIGN_BOTTOM_MID, 0, -8);
-        lv_obj_set_style_radius(grobot_subtitle_bar_, 20, 0);
-        lv_obj_set_style_border_width(grobot_subtitle_bar_, 1, 0);
-        lv_obj_set_style_border_color(grobot_subtitle_bar_, theme->border_color(), 0);
-        lv_obj_set_style_bg_color(grobot_subtitle_bar_, theme->surface_color(), 0);
-        lv_obj_set_style_bg_opa(grobot_subtitle_bar_, LV_OPA_80, 0);
-        lv_obj_set_style_pad_all(grobot_subtitle_bar_, 0, 0);
-        lv_obj_clear_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_SCROLLABLE);
-        grobot_subtitle_label_ = lv_label_create(grobot_subtitle_bar_);
-        lv_obj_set_width(grobot_subtitle_label_, LV_HOR_RES * 72 / 100 - 24);
-        lv_label_set_long_mode(grobot_subtitle_label_, LV_LABEL_LONG_DOT);
-        lv_obj_set_style_text_align(grobot_subtitle_label_, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(grobot_subtitle_label_, theme->text_color(), 0);
-        lv_label_set_text(grobot_subtitle_label_, "");
-        lv_obj_center(grobot_subtitle_label_);
-        lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
+        CreateGrobotSubtitleBar(screen, theme);
         ESP_LOGI(TAG, "GrobotEyes initialized: %dx%d", kFaceWidth, kFaceHeight);
     } else {
         ESP_LOGE(TAG, "Failed to initialize GrobotEyes; using emoji fallback");
     }
 #endif
+#endif
 }
+
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
+void LcdDisplay::CreateGrobotSubtitleBar(lv_obj_t* screen, LvglTheme* theme) {
+    grobot_subtitle_bar_ = lv_obj_create(screen);
+    lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES * 72 / 100, 40);
+    lv_obj_align(grobot_subtitle_bar_, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_radius(grobot_subtitle_bar_, 20, 0);
+    lv_obj_set_style_border_width(grobot_subtitle_bar_, 1, 0);
+    lv_obj_set_style_border_color(grobot_subtitle_bar_, theme->border_color(), 0);
+    lv_obj_set_style_bg_color(grobot_subtitle_bar_, theme->surface_color(), 0);
+    lv_obj_set_style_bg_opa(grobot_subtitle_bar_, LV_OPA_80, 0);
+    lv_obj_set_style_pad_all(grobot_subtitle_bar_, 0, 0);
+    lv_obj_clear_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_SCROLLABLE);
+    grobot_subtitle_label_ = lv_label_create(grobot_subtitle_bar_);
+    lv_obj_set_width(grobot_subtitle_label_, LV_HOR_RES * 72 / 100 - 24);
+    lv_label_set_long_mode(grobot_subtitle_label_, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(grobot_subtitle_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(grobot_subtitle_label_, theme->text_color(), 0);
+    lv_label_set_text(grobot_subtitle_label_, "");
+    lv_obj_center(grobot_subtitle_label_);
+    lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
+}
+#endif
 
 void LcdDisplay::SetGrobotSubtitle(const char* content) {
     if (grobot_subtitle_bar_ == nullptr || grobot_subtitle_label_ == nullptr) {
@@ -2304,6 +2321,22 @@ void LcdDisplay::SetupUI() {
 #endif
 
 void LcdDisplay::SetGrobotEyesPaused(bool on) {
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+    if (electronbot_face_active_) {
+        // 与 grobot 版同语义：job 高压窗口冻结动画（GIF 解码器/LVGL 与 TLS 同核互抢
+        // 的实证修复延续）；暂停停帧停在当前帧，恢复重放当前情绪。
+        DisplayLockGuard lock(this);
+        electronbot_paused_ = on;
+        if (on) {
+            if (gif_controller_ != nullptr) {
+                gif_controller_->Stop();
+            }
+        } else {
+            ElectronBotShow(electronbot_emotion_.c_str());
+        }
+        return;
+    }
+#endif
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     if (grobot_eyes_ == nullptr) {
         return;
@@ -2320,7 +2353,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
                  role, content);
     }
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    if (grobot_eyes_ != nullptr) {
+    if (grobot_eyes_ != nullptr || electronbot_face_active_) {
         DisplayLockGuard lock(this);
         SetGrobotSubtitle(content);
         return;
@@ -2628,7 +2661,7 @@ void LcdDisplay::ClearChatMessages() {
 
     // Grobot 全脸没有独立 AI logo；其它 LVGL 聊天界面清屏后才恢复 logo。
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    if (grobot_eyes_ == nullptr && emoji_label_ != nullptr) {
+    if (grobot_eyes_ == nullptr && !electronbot_face_active_ && emoji_label_ != nullptr) {
         lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
 #else
@@ -2871,7 +2904,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
                  role, content);
     }
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    if (grobot_eyes_ != nullptr) {
+    if (grobot_eyes_ != nullptr || electronbot_face_active_) {
         DisplayLockGuard lock(this);
         SetGrobotSubtitle(content);
         return;
@@ -2952,6 +2985,15 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
                  emotion);
     }
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+    if (electronbot_face_active_) {
+        DisplayLockGuard lock(this);
+        // 记录归一化后的情绪供暂停恢复重放；集合内别名映射兜底 neutral
+        electronbot_emotion_ = ElectronBotEmojiCollection::MapEmotion(emotion);
+        ElectronBotShow(electronbot_emotion_.c_str());
+        return;
+    }
+#endif
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     if (grobot_eyes_) {
         DisplayLockGuard lock(this);
@@ -3050,6 +3092,13 @@ void LcdDisplay::SetTheme(Theme* theme) {
     DisplayLockGuard lock(this);
 
     auto lvgl_theme = static_cast<LvglTheme*>(theme);
+
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+    // 主题切换会换 LvglTheme 实例：electronbot 表情集合挂回新主题，否则 SetEmotion 落空
+    if (electronbot_collection_ != nullptr) {
+        lvgl_theme->set_emoji_collection(electronbot_collection_);
+    }
+#endif
 
     // Get the active screen
     lv_obj_t* screen = lv_screen_active();
@@ -3242,3 +3291,77 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
         }
     }
 }
+
+#if CONFIG_HUTUJI_ELECTRONBOT_FACE
+void LcdDisplay::InitElectronBotFace(LvglTheme* theme) {
+    electronbot_face_active_ = true;
+    electronbot_emotion_ = "neutral";
+    electronbot_collection_ = std::make_shared<ElectronBotEmojiCollection>();
+    if (theme != nullptr) {
+        theme->set_emoji_collection(electronbot_collection_);
+    }
+    SetEmojiCollection(electronbot_collection_);
+    lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    // 240x240 源图放大到脸盒（460x300 横屏取 300 边）：ElectronBot 900² 原稿眼区
+    // 约占中幅，1.25 倍后大小与 grobot 版脸相当
+    lv_image_set_scale(emoji_image_, 320);
+    ElectronBotShow("neutral");
+    // 眨眼偶发：5s 一拍单/双眨轮换；眨眼片段 0.5s@12fps，650ms 后回静态帧
+    electronbot_blink_timer_ = lv_timer_create(ElectronBotBlinkTimerCb, 5000, this);
+    ESP_LOGI(TAG, "ElectronBot face initialized (GIF collection embedded)");
+}
+
+void LcdDisplay::ElectronBotShow(const char* key) {
+    if (emoji_image_ == nullptr) {
+        return;
+    }
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    auto* coll = theme != nullptr ? theme->emoji_collection().get() : nullptr;
+    const LvglImage* image = coll != nullptr ? coll->GetEmojiImage(key) : nullptr;
+    if (image == nullptr) {
+        return;
+    }
+    if (gif_controller_) {
+        gif_controller_->Stop();
+        gif_controller_.reset();
+    }
+    if (image->IsGif()) {
+        gif_controller_ = std::make_unique<LvglGif>(image->image_dsc());
+        if (gif_controller_->IsLoaded()) {
+            gif_controller_->SetFrameCallback(
+                [this]() { lv_image_set_src(emoji_image_, gif_controller_->image_dsc()); });
+            lv_image_set_src(emoji_image_, gif_controller_->image_dsc());
+            gif_controller_->Start();
+        } else {
+            ESP_LOGE(TAG, "ElectronBot face: bad GIF for %s", key);
+            gif_controller_.reset();
+            return;
+        }
+    } else {
+        lv_image_set_src(emoji_image_, image->image_dsc());
+    }
+    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void LcdDisplay::ElectronBotBlinkTimerCb(lv_timer_t* timer) {
+    auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
+    DisplayLockGuard lock(self);
+    if (self->electronbot_paused_ || self->electronbot_emotion_ != "neutral") {
+        return;
+    }
+    self->ElectronBotShow(self->electronbot_blink_twice_next_ ? "blink_twice" : "blink_once");
+    self->electronbot_blink_twice_next_ = !self->electronbot_blink_twice_next_;
+    lv_timer_t* restore = lv_timer_create(ElectronBotBlinkRestoreCb, 650, self);
+    lv_timer_set_repeat_count(restore, 1);
+}
+
+void LcdDisplay::ElectronBotBlinkRestoreCb(lv_timer_t* timer) {
+    auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
+    DisplayLockGuard lock(self);
+    // 眨眼途中来了真情绪：恢复帧不得盖回去（SetEmotion 已把 emotion_ 换走）
+    if (!self->electronbot_paused_ && self->electronbot_emotion_ == "neutral") {
+        self->ElectronBotShow("neutral");
+    }
+}
+#endif

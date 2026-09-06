@@ -440,6 +440,9 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
     set(HUTUJI_GROBOT_FACE TRUE)
+    # ElectronBot 桌宠脸默认开（2026-09-06 用户拍板）；用户 -D=OFF 时 CACHE 已存在，
+    # 不带 FORCE 的 set 不覆盖——回退 grobot 眼睛的逃生通道保留。
+    set(HUTUJI_ELECTRONBOT_FACE ON CACHE BOOL "Replace grobot eyes with ElectronBot GIF face")
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-touch-lcd-3.5b")
@@ -1120,6 +1123,14 @@ target_compile_definitions(${COMPONENT_LIB}
                     )
 if(HUTUJI_GROBOT_FACE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE CONFIG_HUTUJI_GROBOT_FACE=1)
+endif()
+
+# 2026-09-06 用户拍板：ElectronBot 桌宠脸（GIF 集合）替换 grobot 程序绘眼。
+# 默认只在 waveshare-3.5 板分支打开（该板 460x300 脸盒与 240²×1.25 缩放配套）；
+# lichuang-dev 等其他板不受影响；-DHUTUJI_ELECTRONBOT_FACE=OFF 退回 grobot 眼睛。
+if(HUTUJI_ELECTRONBOT_FACE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE CONFIG_HUTUJI_ELECTRONBOT_FACE=1)
+    target_sources(${COMPONENT_LIB} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/electronbot_face.cc)
 endif()
 
 option(HUTUJI_AUTO_TEST_DRAW "Enable hutuji auto-test draw on lichuang-dev after pipe ready" OFF)
