@@ -8,7 +8,26 @@
  *     背景：grobot 时代 30fps 全脸重绘与 TLS 同核互抢致下载饿死）。
  *  2. face_malloc_canvas 改 SPIRAM 优先——内部 SRAM 是 TLS/音频命脉
  *     （音频会话期最大连续块仅 ~8KB 史），~155KB 画布不许压内部堆。
+ *  3. Eilik 风（2026-09-06 用户拍板「方案 1」）——黑底大亮眼、无眼白框、
+ *     虹膜偏青白发光、眼宽 ~88%、细眉弱腮红、闭嘴淡弧线；不动情绪映射。
  */
+
+/* 补丁 3：Eilik 风可调常量（host 测钉字面量）
+ * 虹膜默认 = 活泼淡青 0xB4F0FF（用户 2026-09-06 目视认定比冷静青绿更可爱）；
+ * Init 传入 has_accent 时以主题 accent 覆盖——主题已同此色，眼/钮同源。 */
+#define FACE_EILIK_EYE_RATIO_NUM 88
+#define FACE_EILIK_EYE_RATIO_DEN 100
+#define FACE_EILIK_IRIS_R 180
+#define FACE_EILIK_IRIS_G 240
+#define FACE_EILIK_IRIS_B 255
+#define FACE_EILIK_IRIS_BORDER_R 90
+#define FACE_EILIK_IRIS_BORDER_G 190
+#define FACE_EILIK_IRIS_BORDER_B 230
+#define FACE_EILIK_BROW_W 2
+#define FACE_EILIK_BLUSH_DIV 5
+#define FACE_EILIK_MOUTH_W_NUM 50
+#define FACE_EILIK_MOUTH_W_DEN 100
+
 
 #include "lvgl_kawaii_face.h"
 #include <stdlib.h>
@@ -135,6 +154,12 @@ typedef struct
     uint16_t mouth_cw;
     uint16_t mouth_ch;
 
+    /* Eilik：与 UI 按钮同 accent */
+    lv_color_t iris_color;
+    lv_color_t iris_border;
+    lv_color_t accent_line;
+    lv_color_t accent_glow;
+
     lv_timer_t *anim_timer;
     bool initialized;
 } face_state_t;
@@ -167,7 +192,21 @@ esp_err_t face_animation_init(face_config_t *config)
         face_state.config.animation_speed = DEFAULT_ANIM_SPEED_MS;
         face_state.config.blink_interval = DEFAULT_BLINK_INTERVAL;
         face_state.config.auto_blink = true;
+        face_state.config.has_accent = false;
     }
+
+    if (face_state.config.has_accent)
+    {
+        face_state.iris_color = face_state.config.accent;
+    }
+    else
+    {
+        face_state.iris_color = lv_color_make(FACE_EILIK_IRIS_R, FACE_EILIK_IRIS_G,
+                                             FACE_EILIK_IRIS_B);
+    }
+    face_state.iris_border = lv_color_mix(lv_color_black(), face_state.iris_color, LV_OPA_40);
+    face_state.accent_line = lv_color_mix(lv_color_white(), face_state.iris_color, LV_OPA_30);
+    face_state.accent_glow = lv_color_mix(lv_color_black(), face_state.iris_color, LV_OPA_60);
 
     lv_obj_t *parent_obj = (face_state.config.parent != NULL)
                                ? face_state.config.parent
@@ -175,21 +214,34 @@ esp_err_t face_animation_init(face_config_t *config)
     lv_obj_update_layout(parent_obj);
     int32_t parent_w = lv_obj_get_width(parent_obj);
     int32_t parent_h = lv_obj_get_height(parent_obj);
+    if (parent_w < 32)
+        parent_w = 32;
+    if (parent_h < 32)
+        parent_h = 32;
     uint16_t face_sz = (uint16_t)((parent_w < parent_h) ? parent_w : parent_h);
 
     face_state.face_sz = face_sz;
-    face_state.eye_cw = (uint16_t)(face_sz * 0.45f);
-    face_state.mouth_cw = (uint16_t)(face_sz * 0.45f);
-    face_state.mouth_ch = (uint16_t)(face_sz * 0.38f);
+    /* Eilik 铺满：容器 = 整父盒（不再裁成 min 方块）；双眼按宽高吃满 */
+    face_state.eye_cw = (uint16_t)(parent_w * 0.46f);
+    if (face_state.eye_cw > (uint16_t)(parent_h * 0.62f))
+        face_state.eye_cw = (uint16_t)(parent_h * 0.62f);
+    if (face_state.eye_cw < 48)
+        face_state.eye_cw = 48;
+    face_state.mouth_cw = (uint16_t)(parent_w * 0.30f);
+    face_state.mouth_ch = (uint16_t)(parent_h * 0.16f);
+    if (face_state.mouth_ch < 24)
+        face_state.mouth_ch = 24;
 
-    FACE_LOGI(TAG, "Parent: %dx%d, face_sz: %u, eye: %upx, mouth: %ux%upx",
-              parent_w, parent_h, face_sz,
+    FACE_LOGI(TAG, "Parent: %dx%d, face fill, eye: %upx, mouth: %ux%upx (Eilik)",
+              parent_w, parent_h,
               face_state.eye_cw, face_state.mouth_cw, face_state.mouth_ch);
 
     face_state.face_container = lv_obj_create(parent_obj);
-    lv_obj_set_size(face_state.face_container, face_sz, face_sz);
+    lv_obj_set_size(face_state.face_container, parent_w, parent_h);
     lv_obj_center(face_state.face_container);
-    lv_obj_set_style_bg_opa(face_state.face_container, LV_OPA_TRANSP, 0);
+    /* Eilik：头盔黑底（上游透明，白眼白嘴会漏出主题浅色） */
+    lv_obj_set_style_bg_color(face_state.face_container, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(face_state.face_container, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(face_state.face_container, 0, 0);
     lv_obj_set_style_pad_all(face_state.face_container, 0, 0);
 
@@ -209,12 +261,15 @@ esp_err_t face_animation_init(face_config_t *config)
         return ESP_ERR_NO_MEM;
     }
 
-    int16_t eye_gap = face_state.eye_cw / 4;
-    int16_t eye_y = (int16_t)(face_sz * 0.12f);
-    int16_t left_eye_x = (int16_t)(face_sz / 2) - face_state.eye_cw - eye_gap / 2;
-    int16_t right_eye_x = (int16_t)(face_sz / 2) + eye_gap / 2;
-    int16_t mouth_y = (int16_t)(face_sz * 0.62f);
-    int16_t mouth_x = (int16_t)(face_sz / 2) - (int16_t)(face_state.mouth_cw / 2);
+    int16_t eye_gap = (int16_t)(parent_w * 0.03f);
+    if (eye_gap < 4)
+        eye_gap = 4;
+    int16_t eyes_span = (int16_t)(2 * face_state.eye_cw + eye_gap);
+    int16_t left_eye_x = (int16_t)((parent_w - eyes_span) / 2);
+    int16_t right_eye_x = left_eye_x + (int16_t)face_state.eye_cw + eye_gap;
+    int16_t eye_y = (int16_t)(parent_h * 0.05f);
+    int16_t mouth_y = (int16_t)(parent_h * 0.74f);
+    int16_t mouth_x = (int16_t)((parent_w - (int16_t)face_state.mouth_cw) / 2);
 
     face_state.left_eye_canvas = lv_canvas_create(face_state.face_container);
     lv_canvas_set_buffer(face_state.left_eye_canvas, face_state.left_eye_buf,
@@ -287,12 +342,12 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
     uint16_t width = face_state.eye_cw;
     uint16_t height = face_state.eye_cw;
 
-    lv_canvas_fill_bg(canvas, lv_color_white(), LV_OPA_COVER);
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
 
     lv_layer_t layer;
     lv_canvas_init_layer(canvas, &layer);
 
-    int16_t eye_width = width * 0.75;
+    int16_t eye_width = (width * FACE_EILIK_EYE_RATIO_NUM) / FACE_EILIK_EYE_RATIO_DEN;
     int16_t eye_height = (eye_width * openness) / 100;
     if (eye_height < 8)
         eye_height = 8;
@@ -301,9 +356,10 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
 
     lv_draw_line_dsc_t line_dsc;
     lv_draw_line_dsc_init(&line_dsc);
-    line_dsc.color = lv_color_make(80, 60, 40);
-    line_dsc.width = 4;
-    line_dsc.opa = LV_OPA_COVER;
+    /* 黑底上细眉：与按钮同色系、略提亮 */
+    line_dsc.color = face_state.accent_line;
+    line_dsc.width = FACE_EILIK_BROW_W;
+    line_dsc.opa = LV_OPA_70;
 
     int8_t eyebrow_angle = is_left ? face_state.left_eyebrow_angle : face_state.right_eyebrow_angle;
     int16_t eyebrow_y = center_y - eye_width / 2 - 6 + face_state.eyebrow_height;
@@ -332,12 +388,14 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
 
     lv_draw_line(&layer, &line_dsc);
 
-    if (face_state.blush_intensity > 0)
+    if (face_state.blush_intensity > 30)
     {
         lv_draw_rect_dsc_t blush_dsc;
         lv_draw_rect_dsc_init(&blush_dsc);
         blush_dsc.bg_color = lv_color_make(255, 150, 180);
-        blush_dsc.bg_opa = (face_state.blush_intensity * LV_OPA_COVER) / 100;
+        /* Eilik 屏几乎无腮红：强度 /5 */
+        blush_dsc.bg_opa = (face_state.blush_intensity * LV_OPA_COVER) /
+                           (100 * FACE_EILIK_BLUSH_DIV);
         blush_dsc.radius = 8;
         blush_dsc.border_width = 0;
 
@@ -474,53 +532,52 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
     }
     else if (openness > 20)
     {
-
-        rect_dsc.bg_color = lv_color_white();
-        rect_dsc.bg_opa = LV_OPA_COVER;
-        rect_dsc.border_color = lv_color_black();
-        rect_dsc.border_width = 3;
-        rect_dsc.border_opa = LV_OPA_COVER;
-        rect_dsc.radius = 15;
-
-        lv_area_t eye_area;
-        eye_area.x1 = center_x - eye_width / 2;
-        eye_area.y1 = center_y - eye_height / 2;
-        eye_area.x2 = center_x + eye_width / 2;
-        eye_area.y2 = center_y + eye_height / 2;
-
-        lv_draw_rect(&layer, &rect_dsc, &eye_area);
-
+        /* Eilik：去掉眼白框，整眼即发光虹膜球 */
         if (openness > 30 && eye_height > 16)
         {
-            int16_t iris_width = eye_width * 0.55;
-            int16_t iris_height = eye_height * 0.75;
+            int16_t iris_width = eye_width * 0.92;
+            int16_t iris_height = eye_height * 0.92;
             if (iris_height > iris_width)
                 iris_height = iris_width;
 
             int16_t iris_center_x = center_x + face_state.pupil_offset_x;
             int16_t iris_center_y = center_y + face_state.pupil_offset_y;
 
-            if (iris_center_x - iris_width / 2 < center_x - eye_width / 2 + 3)
+            if (iris_center_x - iris_width / 2 < center_x - eye_width / 2 + 2)
             {
-                iris_center_x = center_x - eye_width / 2 + iris_width / 2 + 3;
+                iris_center_x = center_x - eye_width / 2 + iris_width / 2 + 2;
             }
-            if (iris_center_x + iris_width / 2 > center_x + eye_width / 2 - 3)
+            if (iris_center_x + iris_width / 2 > center_x + eye_width / 2 - 2)
             {
-                iris_center_x = center_x + eye_width / 2 - iris_width / 2 - 3;
+                iris_center_x = center_x + eye_width / 2 - iris_width / 2 - 2;
             }
-            if (iris_center_y - iris_height / 2 < center_y - eye_height / 2 + 3)
+            if (iris_center_y - iris_height / 2 < center_y - eye_height / 2 + 2)
             {
-                iris_center_y = center_y - eye_height / 2 + iris_height / 2 + 3;
+                iris_center_y = center_y - eye_height / 2 + iris_height / 2 + 2;
             }
-            if (iris_center_y + iris_height / 2 > center_y + eye_height / 2 - 3)
+            if (iris_center_y + iris_height / 2 > center_y + eye_height / 2 - 2)
             {
-                iris_center_y = center_y + eye_height / 2 - iris_height / 2 - 3;
+                iris_center_y = center_y + eye_height / 2 - iris_height / 2 - 2;
             }
 
-            rect_dsc.bg_color = lv_color_make(50, 180, 255);
+            /* 外晕：accent 暗色光晕 */
+            rect_dsc.bg_color = face_state.accent_glow;
+            rect_dsc.bg_opa = LV_OPA_50;
+            rect_dsc.border_width = 0;
+            rect_dsc.radius = LV_RADIUS_CIRCLE;
+            lv_area_t glow_area;
+            glow_area.x1 = iris_center_x - iris_width / 2 - 3;
+            glow_area.y1 = iris_center_y - iris_height / 2 - 3;
+            glow_area.x2 = iris_center_x + iris_width / 2 + 3;
+            glow_area.y2 = iris_center_y + iris_height / 2 + 3;
+            lv_draw_rect(&layer, &rect_dsc, &glow_area);
+
+            rect_dsc.bg_color = face_state.iris_color;
+            rect_dsc.bg_opa = LV_OPA_COVER;
             rect_dsc.border_width = 2;
-            rect_dsc.border_color = lv_color_make(30, 140, 230);
-            rect_dsc.radius = 8;
+            rect_dsc.border_color = face_state.iris_border;
+            rect_dsc.border_opa = LV_OPA_COVER;
+            rect_dsc.radius = LV_RADIUS_CIRCLE;
 
             lv_area_t iris_area;
             iris_area.x1 = iris_center_x - iris_width / 2;
@@ -530,11 +587,11 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
 
             lv_draw_rect(&layer, &rect_dsc, &iris_area);
 
-            int16_t pupil_width = iris_width * 0.5;
-            int16_t pupil_height = iris_height * 0.6;
-            rect_dsc.bg_color = lv_color_black();
+            int16_t pupil_width = iris_width * 0.38;
+            int16_t pupil_height = iris_height * 0.42;
+            rect_dsc.bg_color = lv_color_make(10, 20, 40);
             rect_dsc.border_width = 0;
-            rect_dsc.radius = 6;
+            rect_dsc.radius = LV_RADIUS_CIRCLE;
 
             lv_area_t pupil_area;
             pupil_area.x1 = iris_center_x - pupil_width / 2;
@@ -544,15 +601,15 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
 
             lv_draw_rect(&layer, &rect_dsc, &pupil_area);
 
-            int16_t highlight_w = pupil_width * 0.4;
-            int16_t highlight_h = pupil_height * 0.4;
-            if (highlight_w < 4)
-                highlight_w = 4;
-            if (highlight_h < 4)
-                highlight_h = 4;
+            int16_t highlight_w = pupil_width * 0.55;
+            int16_t highlight_h = pupil_height * 0.55;
+            if (highlight_w < 5)
+                highlight_w = 5;
+            if (highlight_h < 5)
+                highlight_h = 5;
 
             rect_dsc.bg_color = lv_color_white();
-            rect_dsc.radius = 3;
+            rect_dsc.radius = LV_RADIUS_CIRCLE;
 
             lv_area_t highlight_area;
             highlight_area.x1 = iris_center_x - pupil_width / 3 - highlight_w / 2;
@@ -569,14 +626,26 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
             if (small_h < 2)
                 small_h = 2;
 
-            rect_dsc.radius = 2;
-
             highlight_area.x1 = iris_center_x + pupil_width / 4 - small_w / 2;
             highlight_area.y1 = iris_center_y - pupil_height / 4 - small_h / 2;
             highlight_area.x2 = iris_center_x + pupil_width / 4 + small_w / 2;
             highlight_area.y2 = iris_center_y - pupil_height / 4 + small_h / 2;
 
             lv_draw_rect(&layer, &rect_dsc, &highlight_area);
+        }
+        else
+        {
+            /* 半睁：一条 accent 光缝 */
+            line_dsc.color = face_state.iris_color;
+            line_dsc.width = 3;
+            line_dsc.opa = LV_OPA_COVER;
+            line_dsc.round_start = 1;
+            line_dsc.round_end = 1;
+            line_dsc.p1.x = center_x - eye_width / 2;
+            line_dsc.p1.y = center_y;
+            line_dsc.p2.x = center_x + eye_width / 2;
+            line_dsc.p2.y = center_y;
+            lv_draw_line(&layer, &line_dsc);
         }
 
         if (face_state.sparkle_phase > 0)
@@ -604,9 +673,9 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
     }
     else
     {
-
-        line_dsc.color = lv_color_black();
-        line_dsc.width = 4;
+        /* 闭眼：黑底上用 accent 线 */
+        line_dsc.color = face_state.accent_line;
+        line_dsc.width = 3;
         line_dsc.opa = LV_OPA_COVER;
         line_dsc.round_start = 1;
         line_dsc.round_end = 1;
@@ -737,13 +806,13 @@ static void draw_mouth(lv_obj_t *canvas, int8_t curve)
     uint16_t width = face_state.mouth_cw;
     uint16_t height = face_state.mouth_ch;
 
-    lv_canvas_fill_bg(canvas, lv_color_white(), LV_OPA_COVER);
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
 
     lv_layer_t layer;
     lv_canvas_init_layer(canvas, &layer);
 
     int16_t center_x = width / 2;
-    int16_t mouth_width = width * 0.85;
+    int16_t mouth_width = (width * FACE_EILIK_MOUTH_W_NUM) / FACE_EILIK_MOUTH_W_DEN;
 
     int16_t curve_offset = (height * curve) / 140;
 
@@ -1083,36 +1152,27 @@ static void draw_mouth(lv_obj_t *canvas, int8_t curve)
 
     else
     {
-        int16_t mouth_h = height * 0.28;
-        int16_t smile_width = mouth_width * 0.65;
+        /* Eilik：闭嘴/浅笑 = accent 淡弧，与按钮同色 */
+        int16_t smile_width = mouth_width * 0.70;
+        int16_t arc_drop = (curve > 5) ? 4 : 1;
 
-        bool is_slight_smile = (curve > 5);
+        line_dsc.color = face_state.accent_line;
+        line_dsc.width = 2;
+        line_dsc.opa = LV_OPA_80;
+        line_dsc.round_start = 1;
+        line_dsc.round_end = 1;
 
-        if (is_slight_smile)
-        {
+        line_dsc.p1.x = center_x - smile_width / 2;
+        line_dsc.p1.y = center_y;
+        line_dsc.p2.x = center_x;
+        line_dsc.p2.y = center_y + arc_drop;
+        lv_draw_line(&layer, &line_dsc);
 
-            rect_dsc.bg_color = lv_color_make(210, 80, 100);
-            rect_dsc.bg_opa = LV_OPA_80;
-        }
-        else
-        {
-
-            rect_dsc.bg_color = lv_color_make(190, 60, 80);
-            rect_dsc.bg_opa = LV_OPA_90;
-        }
-
-        rect_dsc.border_color = lv_color_black();
-        rect_dsc.border_width = 2;
-        rect_dsc.border_opa = LV_OPA_COVER;
-        rect_dsc.radius = 6;
-
-        lv_area_t mouth_area;
-        mouth_area.x1 = center_x - smile_width / 2;
-        mouth_area.y1 = center_y;
-        mouth_area.x2 = center_x + smile_width / 2;
-        mouth_area.y2 = center_y + mouth_h;
-
-        lv_draw_rect(&layer, &rect_dsc, &mouth_area);
+        line_dsc.p1.x = center_x;
+        line_dsc.p1.y = center_y + arc_drop;
+        line_dsc.p2.x = center_x + smile_width / 2;
+        line_dsc.p2.y = center_y;
+        lv_draw_line(&layer, &line_dsc);
     }
 
     lv_canvas_finish_layer(canvas, &layer);

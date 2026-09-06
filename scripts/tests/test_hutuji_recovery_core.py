@@ -379,6 +379,70 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertNotIn('xTaskCreate(TaskEntry, "hutuji_draw"', start_body)
         self.assertIn('SetState("awaiting_confirmation")', job)
         self.assertIn('xTaskCreate(TaskEntry, "hutuji_draw"', confirm_body)
+        # 2026-09-06：确认前必须先 ReleaseFetchClient，否则 keep-alive ssl_receive
+        # 占内部栈导致 largest≈6144 建不出 8192 出图任务（COM14 实证）。
+        release_at = confirm_body.index("ReleaseFetchClient()")
+        create_at = confirm_body.index('xTaskCreate(TaskEntry, "hutuji_draw"')
+        self.assertLess(release_at, create_at)
+        self.assertIn("internal free=", confirm_body)
+        self.assertIn("largest=", confirm_body)
+
+    def test_preview_waits_for_tls_heap_budget_before_fetch(self):
+        """预览下载前须等内部堆；R8 后预览/ssl 栈在 PSRAM，门限只作保险丝。"""
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        job_h = (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(encoding="utf-8")
+        self.assertIn("bool WaitForTlsHeapBudget();", job_h)
+        self.assertIn("kMinTlsInternalLargest", job)
+        self.assertIn("TLS 前等内部堆", job)
+        # R8：预览栈进 PSRAM，禁止再把 hutuji_preview 建在内部 6144。
+        self.assertIn("xTaskCreateWithCaps(PreviewTaskEntry, \"hutuji_preview\"", job)
+        self.assertIn("MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT", job)
+        self.assertIn("vTaskDeleteWithCaps(nullptr)", job)
+        self.assertNotIn('xTaskCreate(PreviewTaskEntry, "hutuji_preview", 6144', job)
+        self.assertIn("kMinTlsInternalLargest = 4 * 1024", job)
+        self.assertNotIn("kMinTlsInternalLargest = 12 * 1024", job)
+        budget = job[job.index("bool Job::WaitForTlsHeapBudget()") : job.index("void Job::Preview()")]
+        self.assertIn("return false;", budget)
+        self.assertIn("ReleaseFetchClient()", budget)
+        preview = job.index("void Job::Preview()")
+        download = job.index("bool Job::DownloadAndShowPreview", preview)
+        preview_body = job[preview:download]
+        self.assertLess(
+            preview_body.index("ShowDrawPreviewLoading()"),
+            preview_body.index("WaitForAudioOutputIdle()"),
+        )
+        dl_body = job[download : job.index("void Job::TaskEntry", download)]
+        self.assertIn("if (!WaitForTlsHeapBudget())", dl_body)
+        self.assertIn("FetchOutcome::kRetryable", dl_body)
+
+    def test_ssl_receive_stack_uses_spiram(self):
+        """ssl_receive 栈必须在 PSRAM，避免与预览任务抢内部连续块。"""
+        ssl = (
+            ROOT / "managed_components/78__esp-ml307/src/esp/esp_ssl.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn("xTaskCreateWithCaps(", ssl)
+        self.assertIn('"ssl_receive"', ssl)
+        self.assertIn("MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT", ssl)
+        self.assertIn("vTaskDeleteWithCaps(NULL)", ssl)
+        self.assertNotIn('xTaskCreate([](void* arg)', ssl)
+
+    def test_tls_released_at_end_of_each_fetch_phase(self):
+        """R7：TLS 相位结束必卸——禁止跨播报/待确认/灌流占 ssl_receive 栈。"""
+        job = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        preview_fn = job[job.index("bool Job::DownloadAndShowPreview") : job.index("void Job::TaskEntry")]
+        # 成功上屏前必须 Release（Notify 播报前卸栈）
+        show_at = preview_fn.index("ShowDrawPreview")
+        releases_before_show = preview_fn[:show_at].count("ReleaseFetchClient()")
+        self.assertGreaterEqual(releases_before_show, 2)  # 入口清理 + 相位尾
+        prefetch_fn = job[job.index("void Job::PrefetchGcode") : job.index("bool Job::AdoptPrefetch")]
+        self.assertIn("预取相位结束必卸 TLS", prefetch_fn)
+        self.assertTrue(prefetch_fn.rstrip().endswith("}") or "ReleaseFetchClient();" in prefetch_fn[-200:])
+        self.assertIn("ReleaseFetchClient();", prefetch_fn[-120:])
+        gcode_fn = job[job.index("bool Job::DownloadToPsram") : job.index("bool Job::VerifyCrc")]
+        self.assertIn("下载相位结束即卸 TLS", gcode_fn)
+        success_at = gcode_fn.index('下载完成')
+        self.assertIn("ReleaseFetchClient();", gcode_fn[success_at : success_at + 280])
+        self.assertIn("相位级 TLS", (ROOT / "main/boards/lichuang-dev/hutuji_job.h").read_text(encoding="utf-8"))
 
 
     def test_final_hil_emits_stable_ui_and_job_markers(self):
@@ -1291,12 +1355,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                             job_cc.index("void Job::Run(")]
         self.assertIn("WaitForAudioOutputIdle();", preview_fn)
         self.assertLess(preview_fn.index("WaitForAudioOutputIdle();"),
-                        preview_fn.index("CreateHttp"))
+                        preview_fn.index("AcquireFetchClient"))
         gcode_fn = job_cc[job_cc.index("bool Job::DownloadToPsram"):
                           job_cc.index("bool Job::VerifyCrc")]
         self.assertIn("WaitForAudioOutputIdle();", gcode_fn)
         self.assertLess(gcode_fn.index("WaitForAudioOutputIdle();"),
-                        gcode_fn.index("CreateHttp"))
+                        gcode_fn.index("AcquireFetchClient"))
 
     def test_hutuji_downloads_bounded_retry_contract(self):
         """下载三处（预览/gcode/预取）有界重试口径（2026-09-06 定稿）：只对传输态
@@ -1316,7 +1380,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         gcode_fn = job_cc[job_cc.index("bool Job::DownloadToPsram"):job_cc.index("bool Job::VerifyCrc")]
         self.assertIn("kFetchMaxAttempts", gcode_fn)
         abort_at = gcode_fn.index('last_error_ = "aborted"')
-        self.assertIn("return false;", gcode_fn[abort_at:abort_at + 80])
+        self.assertIn("return false;", gcode_fn[abort_at:abort_at + 120])
         # 非 200（TTL 过期/名字非法）是确定性失败：必须 return 出循环，不得 continue 重试
         not200_at = gcode_fn.index('last_error_ = "HTTP status "')
         self.assertIn("return false;", gcode_fn[not200_at:not200_at + 260])
@@ -1331,6 +1395,33 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         cancel_ctx = prefetch_fn[cancel_at - 160:cancel_at]
         self.assertIn("if (prefetch_cancel_", cancel_ctx)
         self.assertNotIn("kRetryable", cancel_ctx)
+
+    def test_hutuji_transport_status_retryable_and_post_speech_settle(self):
+        """2026-09-06 17:08 HIL 实证钉死：TLS 读败（esp-aes DMA 块分配不到，SSL
+        read -132）在 Open 成功后以 status=-1 暴露，三处 fetch 必须把 <100 归传输态
+        重试——旧口径在 status!=200 分支按确定性失败出局，重试环被截胡直报
+        「预览图加载失败」（小派口中的「有错误」主源）。另钉播报尾静置：
+        listening 重开麦克风后 AFE/opus 追帧 2-4s（Encode queue full dropping），
+        真等过播报才补 3s 静置，中途下载不吃。"""
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        for start_marker, end_marker in (
+            ("bool Job::DownloadAndShowPreview", "void Job::Run("),
+            ("void Job::PrefetchGcode", "bool Job::AdoptPrefetch"),
+            ("bool Job::DownloadToPsram", "bool Job::VerifyCrc"),
+        ):
+            body = job_cc[job_cc.index(start_marker):job_cc.index(end_marker)]
+            self.assertIn("if (status < 100)", body, start_marker)
+        # DownloadToPsram 的传输态必须 continue 重试，且在 fatal 分支（"HTTP status "）之前
+        gcode_fn = job_cc[job_cc.index("bool Job::DownloadToPsram"):job_cc.index("bool Job::VerifyCrc")]
+        retry_at = gcode_fn.index('last_error_ = "HTTP 传输失败 status "')
+        self.assertIn("continue;", gcode_fn[retry_at:retry_at + 120])
+        fatal_at = gcode_fn.index('last_error_ = "HTTP status "')
+        self.assertLess(retry_at, fatal_at)
+        # 播报尾静置：waited 标记 + 3s 静置 + abort 放行
+        wait_fn = job_cc[job_cc.index("void Job::WaitForAudioOutputIdle"):
+                         job_cc.index("bool Job::DownloadAndShowPreview")]
+        self.assertIn("bool waited = false;", wait_fn)
+        self.assertIn("静置 3s", wait_fn)
 
     def test_toggle_chat_interrupts_speaking_into_default_listening(self):
         """点击切换钮打断播报后必须直接进入默认监听模式，而不是只静音。"""
@@ -2389,10 +2480,16 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("(speaking_ || listening_) ? 0.90f : 0.85f", eyes_cc)
         self.assertIn("mood_index_ != kSleepyMoodIndex", eyes_cc)
         self.assertIn("BuildShadeLut(mood_base_phase_ + tide", eyes_cc)
-        # 按钮呼吸 + 说话钮光晕：只刷 accent 系，安全语义色恒定
+        # 按钮呼吸 + 说话钮光晕：Grobot 绕 π 色相；kawaii 锁主题 accent 明暗呼吸
         self.assertIn("AccentDriftTimerCb", lcd_cc)
         self.assertIn("0.10f * sinf", lcd_cc)
         self.assertIn("kPiBrandGradientT + drift", lcd_cc)
+        self.assertIn("#if CONFIG_HUTUJI_KAWAII_FACE", lcd_cc)
+        # AccentDrift 内 kawaii 分支必须读 accent，否则每 100ms 盖掉淡青
+        drift_start = lcd_cc.index("void LcdDisplay::AccentDriftTimerCb")
+        drift_end = lcd_cc.index("\n}", drift_start)
+        drift_body = lcd_cc[drift_start:drift_end]
+        self.assertIn("theme->accent_color()", drift_body)
         self.assertIn("lv_obj_set_style_shadow_width(self->voice_talk_btn_", lcd_cc)
         self.assertIn("tick % 2500", lcd_cc)
         self.assertIn("lv_timer_create(AccentDriftTimerCb, 100, this)", lcd_cc)
@@ -2476,6 +2573,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("theme->assistant_bubble_color()", ui_body)
         # 提示语置顶单行截断，再长也不挤压图片与按钮。
         self.assertIn("LV_LABEL_LONG_DOT", ui_body)
+        # 2026-09-06：预览铺满（立创 320×240 旧卡片预算图区过小）；禁止再钉死 zoom≤256。
+        self.assertIn("预览铺满屏", ui_body)
+        show_fn = lcd_cc[lcd_cc.index("void LcdDisplay::ShowDrawPreview(") :
+                         lcd_cc.index("void LcdDisplay::HideDrawPreview")]
+        self.assertIn("max_height = LV_VER_RES - button_height", show_fn)
+        self.assertNotIn("if (zoom > 256)", show_fn)
         # 主题字体会被 SetTextFont 替换释放：预览层不得持有主题字体裸指针。
         self.assertNotIn("lv_obj_set_style_text_font", ui_body)
         # 预览层建好即隐藏，不得一创建就盖住脸/聊天。

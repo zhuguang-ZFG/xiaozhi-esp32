@@ -74,6 +74,45 @@ class KawaiiFaceTest(unittest.TestCase):
         self.assertIsNotNone(m)
         body = m.group(1)
         self.assertLess(body.index('MALLOC_CAP_SPIRAM'), body.index('MALLOC_CAP_INTERNAL'))
+        # 补丁 3：Eilik 风（2026-09-06 用户拍板方案 1）
+        self.assertIn('FACE_EILIK_EYE_RATIO_NUM 88', self.kawaii_c)
+        self.assertIn('FACE_EILIK_IRIS_R 180', self.kawaii_c)
+        self.assertIn('FACE_EILIK_IRIS_G 240', self.kawaii_c)
+        self.assertIn('FACE_EILIK_IRIS_B 255', self.kawaii_c)
+        self.assertIn('FACE_EILIK_BLUSH_DIV 5', self.kawaii_c)
+        self.assertIn('FACE_EILIK_ACCENT_HEX 0xB4F0FF', self.kawaii_h)
+        self.assertIn('0xB4F0FF', self.lcd_cc)
+        # kawaii 开时主题 accent 必须走淡青分支，不能被 GROBOT π 蓝紫盖住
+        self.assertIn('#if CONFIG_HUTUJI_KAWAII_FACE', self.lcd_cc)
+        m = re.search(r'#if CONFIG_HUTUJI_KAWAII_FACE\s*(.*?)#elif CONFIG_HUTUJI_GROBOT_FACE',
+                      self.lcd_cc, re.S)
+        self.assertIsNotNone(m, "缺 KAWAII 优先于 GROBOT 的 accent 分支")
+        self.assertIn('0xB4F0FF', m.group(1))
+        self.assertIn('has_accent = true', self.lcd_cc)
+        self.assertIn('theme->accent_color()', self.lcd_cc)
+        # AccentDrift 在 kawaii 下必须读主题 accent，禁止每 100ms 刷回 π 蓝紫
+        drift = self.lcd_cc[self.lcd_cc.index('void LcdDisplay::AccentDriftTimerCb'):
+                            self.lcd_cc.index('void LcdDisplay::SetupUI')]
+        self.assertIn('#if CONFIG_HUTUJI_KAWAII_FACE', drift)
+        self.assertIn('theme->accent_color()', drift)
+        self.assertIn('0xB4F0FF', drift)
+        self.assertIn('lv_canvas_fill_bg(canvas, lv_color_black()', self.kawaii_c)
+        self.assertIn('lv_obj_set_style_bg_color(face_state.face_container, lv_color_black()',
+                      self.kawaii_c)
+        # 铺满父盒（禁止回退 min 方块裁切）
+        self.assertIn('lv_obj_set_size(face_state.face_container, parent_w, parent_h)',
+                      self.kawaii_c)
+        self.assertIn('parent_w * 0.46f', self.kawaii_c)
+        # 禁止回退白底眼白框
+        self.assertNotIn('lv_canvas_fill_bg(canvas, lv_color_white()', self.kawaii_c)
+        self.assertNotIn('lv_color_make(50, 180, 255)', self.kawaii_c)
+
+    def test_lichuang_face_box_nearly_fullscreen(self):
+        # 立创 320x240：脸盒须近全屏（旧 280x190 目视留白被否）
+        self.assertIn('constexpr int kFaceWidth = 312;', self.lcd_cc)
+        self.assertIn('constexpr int kFaceHeight = 232;', self.lcd_cc)
+        self.assertNotIn('constexpr int kFaceWidth = 280;', self.lcd_cc)
+        self.assertNotIn('constexpr int kFaceHeight = 190;', self.lcd_cc)
 
     def test_emotion_mapping_covers_all_grobot_names(self):
         m = re.search(r'kNames\[\] = \{(.*?)\};', self.grobot_cc, re.S)

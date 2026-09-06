@@ -120,7 +120,15 @@ void LcdDisplay::InitializeLcdThemes() {
     auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_material_symbols_30_4);
     auto emoji_font = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
 
-#if CONFIG_HUTUJI_GROBOT_FACE
+#if CONFIG_HUTUJI_KAWAII_FACE
+    // Eilik 桌宠脸：活泼淡青眼/钮同源（2026-09-06 用户圈选目视认定更好看）。
+    // 覆盖下方 GROBOT 的 π 中段蓝紫——那套给按钮偏冷静，和淡青虹膜打架。
+    const auto light_accent = lv_color_hex(0x0F8F8A);
+    const auto dark_accent = lv_color_hex(0xB4F0FF);
+    const auto dark_success = lv_color_hex(0x5ECB9A);
+    const auto dark_warning = lv_color_hex(0xE4B15D);
+    const auto dark_danger = lv_color_hex(0xE06A70);
+#elif CONFIG_HUTUJI_GROBOT_FACE
     const auto light_accent = lv_color_hex(PiGradientHex(kPiBrandGradientT));
     const auto dark_accent = light_accent;
     const auto dark_success = lv_color_hex(PiGradientHex(kPiSuccessGradientT));
@@ -128,7 +136,7 @@ void LcdDisplay::InitializeLcdThemes() {
     const auto dark_danger = lv_color_hex(PiGradientHex(kPiDangerGradientT));
 #else
     const auto light_accent = lv_color_hex(0x0F8F8A);
-    const auto dark_accent = lv_color_hex(0x32D6CB);
+    const auto dark_accent = lv_color_hex(0xB4F0FF);
     const auto dark_success = lv_color_hex(0x5ECB9A);
     const auto dark_warning = lv_color_hex(0xE4B15D);
     const auto dark_danger = lv_color_hex(0xE06A70);
@@ -171,7 +179,8 @@ void LcdDisplay::InitializeLcdThemes() {
     dark_theme->set_surface_color(lv_color_hex(0x1A242B));
     dark_theme->set_muted_text_color(lv_color_hex(0xA7B1B8));
     dark_theme->set_accent_color(dark_accent);
-    dark_theme->set_accent_text_color(lv_color_hex(0x071316));
+    // 淡青底上用深墨字，避免白字发飘
+    dark_theme->set_accent_text_color(lv_color_hex(0x0A1A22));
     dark_theme->set_success_color(dark_success);
     dark_theme->set_warning_color(dark_warning);
     dark_theme->set_danger_color(dark_danger);
@@ -565,16 +574,15 @@ void LcdDisplay::EnsureDrawPreviewUi() {
     }
 
     auto* theme = static_cast<LvglTheme*>(current_theme_);
-    // 预览是一张纸：外圈暗场只负责压暗 Grobot，卡片内部留暖白纸面和两行操作区。
-    // 480x320 预算：卡片 464x304，内边距 10，标题约 28，按钮 64，剩余约 190 给图片。
-    // 所有可点目标高度 >= 56px（儿童手指命中面）。
+    // 预览铺满屏：立创 320×240 / Waveshare 480×320 共用——图吃掉底栏以上全部像素，
+    // 底栏固定 ≥56px 确认/取消。旧「大卡片+厚边距」在 240 高上只剩 ~100px 给图。
     draw_preview_root_ = lv_obj_create(lv_screen_active());
     lv_obj_set_size(draw_preview_root_, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_style_radius(draw_preview_root_, 0, 0);
     lv_obj_set_style_border_width(draw_preview_root_, 0, 0);
     lv_obj_set_style_bg_color(draw_preview_root_, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(draw_preview_root_, LV_OPA_60, 0);
-    lv_obj_set_style_pad_all(draw_preview_root_, theme->spacing(4), 0);
+    lv_obj_set_style_bg_opa(draw_preview_root_, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(draw_preview_root_, 0, 0);
     lv_obj_set_flex_flow(draw_preview_root_, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(draw_preview_root_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
@@ -583,20 +591,16 @@ void LcdDisplay::EnsureDrawPreviewUi() {
     lv_obj_add_flag(draw_preview_root_, LV_OBJ_FLAG_CLICKABLE);
 
     draw_preview_card_ = lv_obj_create(draw_preview_root_);
-    const lv_coord_t card_width = LV_HOR_RES - theme->spacing(8);
-    const lv_coord_t card_height = LV_VER_RES - theme->spacing(8);
-    const lv_coord_t content_width = card_width - theme->spacing(10);
+    const lv_coord_t card_width = LV_HOR_RES;
+    const lv_coord_t card_height = LV_VER_RES;
+    const lv_coord_t content_width = LV_HOR_RES - theme->spacing(4);
     lv_obj_set_size(draw_preview_card_, card_width, card_height);
-    lv_obj_set_style_radius(draw_preview_card_, 24, 0);
-    lv_obj_set_style_bg_color(draw_preview_card_, theme->surface_color(), 0);
+    lv_obj_set_style_radius(draw_preview_card_, 0, 0);
+    lv_obj_set_style_bg_color(draw_preview_card_, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(draw_preview_card_, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(draw_preview_card_, 1, 0);
-    lv_obj_set_style_border_color(draw_preview_card_, theme->border_color(), 0);
-    lv_obj_set_style_shadow_width(draw_preview_card_, 24, 0);
-    lv_obj_set_style_shadow_color(draw_preview_card_, lv_color_black(), 0);
-    lv_obj_set_style_shadow_opa(draw_preview_card_, LV_OPA_30, 0);
-    lv_obj_set_style_pad_all(draw_preview_card_, theme->spacing(5), 0);
-    lv_obj_set_style_pad_row(draw_preview_card_, theme->spacing(3), 0);
+    lv_obj_set_style_border_width(draw_preview_card_, 0, 0);
+    lv_obj_set_style_pad_all(draw_preview_card_, theme->spacing(2), 0);
+    lv_obj_set_style_pad_row(draw_preview_card_, theme->spacing(2), 0);
     lv_obj_set_flex_flow(draw_preview_card_, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(draw_preview_card_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
@@ -606,17 +610,16 @@ void LcdDisplay::EnsureDrawPreviewUi() {
     // 字体继承屏幕级主题字体（SetTheme 会随主题刷新屏幕字体），不持有裸指针。
     draw_preview_hint_ = lv_label_create(draw_preview_card_);
     lv_obj_set_width(draw_preview_hint_, content_width);
-    lv_obj_set_style_text_color(draw_preview_hint_, theme->text_color(), 0);
+    lv_obj_set_style_text_color(draw_preview_hint_, lv_color_white(), 0);
     lv_obj_set_style_text_align(draw_preview_hint_, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(draw_preview_hint_, LV_LABEL_LONG_DOT);
 
     draw_preview_image_ = lv_image_create(draw_preview_card_);
     lv_obj_set_style_bg_color(draw_preview_image_, lv_color_hex(0xF6F1E6), 0);
     lv_obj_set_style_bg_opa(draw_preview_image_, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(draw_preview_image_, 16, 0);
-    lv_obj_set_style_border_width(draw_preview_image_, 1, 0);
-    lv_obj_set_style_border_color(draw_preview_image_, lv_color_hex(0xD8D1C4), 0);
-    lv_obj_set_style_pad_all(draw_preview_image_, theme->spacing(2), 0);
+    lv_obj_set_style_radius(draw_preview_image_, 0, 0);
+    lv_obj_set_style_border_width(draw_preview_image_, 0, 0);
+    lv_obj_set_style_pad_all(draw_preview_image_, 0, 0);
 
     // 按钮行沉底：「开始画」是唯一主动作，占 2/3 宽；「取消」次动作占 1/3。
     // 行高取屏高 20%（480x320 下 64px）且不低于 56px。
@@ -686,10 +689,11 @@ void LcdDisplay::ShowDrawPreviewLoading() {
     if (draw_preview_root_ == nullptr) {
         return;
     }
-    // 图未落地先上卡片：空纸面 + 提示语 + 禁用确认，避免用户面对空屏等待。
+    // 图未落地先上全屏底：占位区尽量大，避免 320×240 上看成小方块。
     if (draw_preview_image_ != nullptr) {
         lv_image_set_src(draw_preview_image_, nullptr);
-        lv_obj_set_size(draw_preview_image_, 220, 160);
+        const lv_coord_t button_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
+        lv_obj_set_size(draw_preview_image_, LV_HOR_RES - 8, LV_VER_RES - button_height - 28);
     }
     draw_preview_cached_.reset();
     if (draw_preview_hint_ != nullptr) {
@@ -736,27 +740,26 @@ void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::st
     auto* img_dsc = draw_preview_cached_->image_dsc();
     lv_image_set_src(draw_preview_image_, img_dsc);
 
-    // 与 EnsureDrawPreviewUi 的卡片预算一致：内容宽 = 卡片宽 - 两侧内边距 20；
-    // 高 = 卡片高 - 上下内边距 20、标题约 28、按钮行与两处行距，其余全部留给图片。
-    // 等比放大不超过原始像素。
+    // 铺满底栏以上：宽≈整屏，高=屏高−底栏−顶提示行。允许放大超过 1:1
+    // （curated/小 PNG 旧口径 zoom≤256 会钉死原尺寸，立创屏上像邮票）。
     auto* theme = static_cast<LvglTheme*>(current_theme_);
     const lv_coord_t button_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
-    const lv_coord_t max_width = LV_HOR_RES - theme->spacing(18);
-    const lv_coord_t max_height =
-        LV_VER_RES - theme->spacing(18) - 28 - button_height - theme->spacing(6);
-    if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {
+    const lv_coord_t max_width = LV_HOR_RES - theme->spacing(4);
+    const lv_coord_t max_height = LV_VER_RES - button_height - theme->spacing(6) - 22;
+    if (img_dsc->header.w > 0 && img_dsc->header.h > 0 && max_width > 0 && max_height > 0) {
         const lv_coord_t zoom_w = (max_width * 256) / img_dsc->header.w;
         const lv_coord_t zoom_h = (max_height * 256) / img_dsc->header.h;
         lv_coord_t zoom = zoom_w < zoom_h ? zoom_w : zoom_h;
-        if (zoom > 256) {
-            zoom = 256;
+        if (zoom < 1) {
+            zoom = 1;
         }
         lv_image_set_scale(draw_preview_image_, zoom);
         lv_obj_set_size(draw_preview_image_, (img_dsc->header.w * zoom) / 256,
                         (img_dsc->header.h * zoom) / 256);
     }
 
-    lv_label_set_text(draw_preview_hint_, hint.c_str());
+    // 图落地后收起长提示，把像素让给图；空串仍占一行布局时改为短确认句。
+    lv_label_set_text(draw_preview_hint_, hint.empty() ? Lang::Strings::DRAW_PREVIEW_HINT : hint.c_str());
     // 占位卡阶段确认键禁用；图落地后才允许确认。
     if (draw_preview_confirm_btn_ != nullptr) {
         lv_obj_clear_state(draw_preview_confirm_btn_, LV_STATE_DISABLED);
@@ -2020,8 +2023,10 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     constexpr int kFaceWidth = 460;
     constexpr int kFaceHeight = 300;
 #else
-    constexpr int kFaceWidth = 280;
-    constexpr int kFaceHeight = 190;
+    // lichuang 320x240：Eilik 要铺满屏（旧 grobot 280x190 + min 方块 ≈190 留白过多，
+    // 2026-09-06 用户目视否决）。与 waveshare 同口径：四边约 4px。
+    constexpr int kFaceWidth = 312;
+    constexpr int kFaceHeight = 232;
 #endif
     lv_obj_set_size(emoji_box_, kFaceWidth, kFaceHeight);
     // 兑现上方「状态栏继续独立叠在最前层」：WeChat 分支的创建顺序是栏在前、脸在后，
@@ -2041,6 +2046,9 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     // kawaii 桌宠脸（2026-09-06 用户拍板，同日替掉 ElectronBot GIF 脸——用户见过
     // 实物后指明要 Eilik 那种有大眼+嘴的桌宠感）：vendored lvgl_kawaii_face 程序
     // 绘制（眼/眉/嘴/腮红，17 情绪+自动眨眼），零图片零解码开销；字幕条共用。
+    // Eilik 黑底：脸盒本身也刷黑，避免布局缝露出主题浅色。
+    lv_obj_set_style_bg_color(emoji_box_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_COVER, 0);
     InitKawaiiFace();
     lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
@@ -2117,10 +2125,20 @@ void LcdDisplay::AccentDriftTimerCb(lv_timer_t* timer) {
             return;
         }
     }
-    // 8s 正弦绕 π 品牌中段（0.50）±0.10：明显可辨的色相呼吸，不出品牌色带。
+    // 8s 正弦：Grobot 绕 π 品牌中段色相呼吸；Eilik/kawaii 锁主题淡青只做明暗呼吸，
+    // 禁止再写 π 蓝紫（2026-09-06 用户主诉「按钮颜色不对」——定时器每 100ms 盖掉 accent）。
     const uint32_t tick = lv_tick_get();
+#if CONFIG_HUTUJI_KAWAII_FACE
+    auto* theme = static_cast<LvglTheme*>(self->current_theme_);
+    const lv_color_t base =
+        theme != nullptr ? theme->accent_color() : lv_color_hex(0xB4F0FF);
+    const float pulse = 0.5f + 0.5f * sinf((float)(tick % 8000) / 8000.0f * 6.2832f);
+    const lv_color_t c =
+        lv_color_mix(lv_color_white(), base, (lv_opa_t)(18 + (int)(36.0f * pulse)));
+#else
     const float drift = 0.10f * sinf((float)(tick % 8000) / 8000.0f * 6.2832f);
     const lv_color_t c = lv_color_hex(PiGradientHex(kPiBrandGradientT + drift));
+#endif
     // 聆听态：说话大圆钮与呼吸光晕整体切绿（与状态胶囊同色=「我在听，说吧」，
     // 2026-08-28 用户决策）；其余 3 钮保持品牌 accent 漂移。触摸跳过帧后
     // 下一帧自愈，不需要补偿写。
@@ -3332,16 +3350,18 @@ face_emotion_t LcdDisplay::MapKawaiiEmotion_(const char* name) {
 void LcdDisplay::InitKawaiiFace() {
     kawaii_face_active_ = true;
     kawaii_emotion_ = "neutral";
-    // 父对象 = 460x300 脸盒：kawaii 取 min(宽,高)=300 作脸幅，画布缓冲
-    // ~155KB 已打 SPIRAM 优先补丁，不压内部 SRAM（TLS/音频命脉）
+    // 父对象 = 近全屏脸盒；画布 SPIRAM；虹膜色 = 主题 accent（与控制/画画/说话同色）
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
     face_config_t cfg = {
         .parent = emoji_box_,
         .animation_speed = 33,
         .blink_interval = 4000,
         .auto_blink = true,
+        .has_accent = true,
+        .accent = theme != nullptr ? theme->accent_color() : lv_color_hex(FACE_EILIK_ACCENT_HEX),
     };
     if (face_animation_init(&cfg) == ESP_OK) {
-        ESP_LOGI(TAG, "Kawaii face initialized (lvgl_kawaii_face @d58e1c8 + pause/spiram patches)");
+        ESP_LOGI(TAG, "Kawaii face initialized (Eilik + accent-matched iris)");
     } else {
         // 初始化失败不拖垮 UI：回落 emoji 图标路径（脸盒/字幕条照常）
         kawaii_face_active_ = false;

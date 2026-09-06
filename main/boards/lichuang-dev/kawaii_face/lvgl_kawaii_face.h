@@ -96,7 +96,13 @@ typedef struct {
     uint32_t animation_speed;  // Animation update interval in ms
     uint32_t blink_interval;   // Auto-blink interval in ms
     bool     auto_blink;       // Enable automatic blinking
+    /* 本地补丁：与 UI 按钮同源 accent（false 时回落 FACE_EILIK_* 默认） */
+    bool     has_accent;
+    lv_color_t accent;
 } face_config_t;
+
+/* Eilik 虹膜/按钮默认 = 活泼淡青（与 lcd_display dark_accent 同源） */
+#define FACE_EILIK_ACCENT_HEX 0xB4F0FF
 
 /**
  * @brief Initialize the face animation system
