@@ -33,8 +33,8 @@
 #include "boards/lichuang-dev/grobot_eyes.h"
 #include "boards/lichuang-dev/hutuji_pi_splash_core.h"
 #endif
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-#include "boards/lichuang-dev/electronbot_face.h"
+#if CONFIG_HUTUJI_KAWAII_FACE
+#include "boards/lichuang-dev/kawaii_face/lvgl_kawaii_face.h"
 #endif
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
 #include "boards/lichuang-dev/hutuji_pi_splash.h"
@@ -1868,16 +1868,6 @@ LcdDisplay::~LcdDisplay() {
         accent_drift_timer_ = nullptr;
     }
 #endif
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-    if (electronbot_blink_timer_ != nullptr) {
-        lv_timer_delete(electronbot_blink_timer_);
-        electronbot_blink_timer_ = nullptr;
-    }
-    if (electronbot_blink_restore_timer_ != nullptr) {
-        lv_timer_delete(electronbot_blink_restore_timer_);
-        electronbot_blink_restore_timer_ = nullptr;
-    }
-#endif
     if (machine_hud_timer_ != nullptr) {
         lv_timer_delete(machine_hud_timer_);
         machine_hud_timer_ = nullptr;
@@ -2047,11 +2037,13 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     if (status_bar_ != nullptr) {
         lv_obj_move_foreground(status_bar_);
     }
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-    // ElectronBot 桌宠脸（2026-09-06 用户拍板）：不建 grobot 程序绘眼画布，
-    // emoji_image_ 直接播内嵌 GIF 集合；底部字幕条与 grobot 版共用同一套。
-    InitElectronBotFace(theme);
+#if CONFIG_HUTUJI_KAWAII_FACE
+    // kawaii 桌宠脸（2026-09-06 用户拍板，同日替掉 ElectronBot GIF 脸——用户见过
+    // 实物后指明要 Eilik 那种有大眼+嘴的桌宠感）：vendored lvgl_kawaii_face 程序
+    // 绘制（眼/眉/嘴/腮红，17 情绪+自动眨眼），零图片零解码开销；字幕条共用。
+    InitKawaiiFace();
     lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
     CreateGrobotSubtitleBar(screen, theme);
 #else
     // Grobot 自己从 π splash 的共享渐变取色；主题 accent 仍只用于按钮/状态语义。
@@ -2331,23 +2323,17 @@ void LcdDisplay::SetupUI() {
 #endif
 
 void LcdDisplay::SetGrobotEyesPaused(bool on) {
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-    if (electronbot_face_active_) {
-        // 与 grobot 版同语义：job 高压窗口冻结动画。Pause/Resume 冻结在当前帧且零
-        // 重分配（Stop 倒带虽也不释放，但重播打断当前帧位）；恢复时 neutral 走常驻
-        // 槽零分配重播，情绪循环段有控制器则续播、缺失才重建。
+#if CONFIG_HUTUJI_KAWAII_FACE
+    if (kawaii_face_active_) {
         DisplayLockGuard lock(this);
-        electronbot_paused_ = on;
-        if (on) {
-            if (gif_controller_ != nullptr) gif_controller_->Pause();
-            if (electronbot_neutral_gif_ != nullptr) electronbot_neutral_gif_->Pause();
-            if (electronbot_blink_gif_ != nullptr) electronbot_blink_gif_->Pause();
-        } else if (electronbot_emotion_ == "neutral") {
-            ElectronBotShow("neutral");
-        } else if (gif_controller_ != nullptr) {
-            gif_controller_->Resume();
-        } else {
-            ElectronBotShow(electronbot_emotion_.c_str());
+        // 与 grobot 版同语义：job 高压窗口冻结动画。vendored 补丁
+        // face_animation_set_paused 停动画定时器——冻结在当前帧、零重分配；
+        // 恢复续播。暂停期 SetEmotion 只记录（kawaii_emotion_），此处恢复时
+        // 按最新情绪落一次。
+        kawaii_paused_ = on;
+        face_animation_set_paused(on);
+        if (!on) {
+            face_set_emotion(MapKawaiiEmotion_(kawaii_emotion_.c_str()), true);
         }
         return;
     }
@@ -2368,7 +2354,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
                  role, content);
     }
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    if (grobot_eyes_ != nullptr || electronbot_face_active_) {
+    if (grobot_eyes_ != nullptr || kawaii_face_active_) {
         DisplayLockGuard lock(this);
         SetGrobotSubtitle(content);
         return;
@@ -2676,7 +2662,7 @@ void LcdDisplay::ClearChatMessages() {
 
     // Grobot 全脸没有独立 AI logo；其它 LVGL 聊天界面清屏后才恢复 logo。
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    if (grobot_eyes_ == nullptr && !electronbot_face_active_ && emoji_label_ != nullptr) {
+    if (grobot_eyes_ == nullptr && !kawaii_face_active_ && emoji_label_ != nullptr) {
         lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
 #else
@@ -2890,10 +2876,6 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
         preview_image_cached_.reset();
         if (gif_controller_) {
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-            // electronbot 脸暂停期（job 高压窗口）不得借预览超时回放动画
-            if (!electronbot_paused_)
-#endif
             gif_controller_->Start();
         }
         return;
@@ -2923,7 +2905,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
                  role, content);
     }
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    if (grobot_eyes_ != nullptr || electronbot_face_active_) {
+    if (grobot_eyes_ != nullptr || kawaii_face_active_) {
         DisplayLockGuard lock(this);
         SetGrobotSubtitle(content);
         return;
@@ -3004,14 +2986,13 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
                  emotion);
     }
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-    if (electronbot_face_active_) {
+#if CONFIG_HUTUJI_KAWAII_FACE
+    if (kawaii_face_active_) {
         DisplayLockGuard lock(this);
-        // 记录归一化后的情绪供暂停恢复重放；集合内别名映射兜底 neutral
-        electronbot_emotion_ = ElectronBotEmojiCollection::MapEmotion(emotion);
-        if (!electronbot_paused_) {
-            // 暂停期（job 高压窗口）只记录不播放：恢复时由暂停钩子按最新情绪重放
-            ElectronBotShow(electronbot_emotion_.c_str());
+        // 记录归一化后的情绪供暂停恢复；暂停期（job 高压窗口）只记录不播放
+        kawaii_emotion_ = emotion != nullptr ? emotion : "neutral";
+        if (!kawaii_paused_) {
+            face_set_emotion(MapKawaiiEmotion_(kawaii_emotion_.c_str()), true);
         }
         return;
     }
@@ -3115,20 +3096,12 @@ void LcdDisplay::SetTheme(Theme* theme) {
 
     auto lvgl_theme = static_cast<LvglTheme*>(theme);
 
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-    // 主题切换会换 LvglTheme 实例：electronbot 表情集合挂回新主题，否则 SetEmotion 落空
-    if (electronbot_collection_ != nullptr) {
-        lvgl_theme->set_emoji_collection(electronbot_collection_);
-    }
-#endif
-
-    // Get the active screen
-    lv_obj_t* screen = lv_screen_active();
-
-    // Set font
     auto text_font = lvgl_theme->text_font()->font();
     auto icon_font = lvgl_theme->icon_font()->font();
     auto large_icon_font = lvgl_theme->large_icon_font()->font();
+
+    // Get the active screen
+    lv_obj_t* screen = lv_screen_active();
 
     if (text_font->line_height >= 40) {
         lv_obj_set_style_text_font(mute_label_, large_icon_font, 0);
@@ -3314,130 +3287,66 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
     }
 }
 
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-void LcdDisplay::InitElectronBotFace(LvglTheme* theme) {
-    electronbot_face_active_ = true;
-    electronbot_emotion_ = "neutral";
-    electronbot_collection_ = std::make_shared<ElectronBotEmojiCollection>();
-    if (theme != nullptr) {
-        theme->set_emoji_collection(electronbot_collection_);
+#if CONFIG_HUTUJI_KAWAII_FACE
+// xiaozhi 21 情绪名 → kawaii face_emotion_t（grobot kNames 同源全集 + 常见扩展名；
+// 未知名兜底 FACE_NEUTRAL）。kawaii 的 WINK/LOVE/WORKING_HARD 比 ElectronBot 时代
+// 的近似映射更贴（真单眼眨/爱心/汗珠努力）。
+face_emotion_t LcdDisplay::MapKawaiiEmotion_(const char* name) {
+    if (name == nullptr) {
+        return FACE_NEUTRAL;
     }
-    SetEmojiCollection(electronbot_collection_);
-    lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-    // 256² 源图 1.5x 放大到 384 贴脸盒高（460x300 横屏）：情绪/眨眼只在状态切换时
-    // 换源，非每帧动画——一次性变换成本可忽略（advisory 否决的是常驻动画每帧缩放）
-    lv_image_set_scale(emoji_image_, 384);
-    ElectronBotMakeCached_(electronbot_neutral_gif_, "neutral");
-    ElectronBotMakeCached_(electronbot_blink_gif_, "blink_once");
-    ElectronBotShow("neutral");
-    electronbot_blink_timer_ = lv_timer_create(ElectronBotBlinkTimerCb, 5000, this);
-    ESP_LOGI(TAG, "ElectronBot face initialized (GIF collection embedded)");
-}
-
-void LcdDisplay::ElectronBotMakeCached_(std::unique_ptr<LvglGif>& slot, const char* key) {
-    const LvglImage* image = electronbot_collection_->GetEmojiImage(key);
-    if (image == nullptr) {
-        return;
-    }
-    slot = std::make_unique<LvglGif>(image->image_dsc());
-    if (!slot->IsLoaded()) {
-        ESP_LOGE(TAG, "ElectronBot face: bad GIF for %s", key);
-        slot.reset();
-        return;
-    }
-    slot->SetFrameCallback(
-        [this, &slot]() { lv_image_set_src(emoji_image_, slot->image_dsc()); });
-}
-
-void LcdDisplay::ElectronBotShow(const char* key) {
-    if (emoji_image_ == nullptr) {
-        return;
-    }
-    // 互斥：先停两个常驻控制器（目标槽除外），否则对方的帧回调会覆盖当前画面
-    LvglGif* keep = nullptr;
-    if (strcmp(key, "neutral") == 0) {
-        keep = electronbot_neutral_gif_.get();
-    } else if (strcmp(key, "blink_once") == 0) {
-        keep = electronbot_blink_gif_.get();
-    }
-    if (electronbot_neutral_gif_ && electronbot_neutral_gif_.get() != keep) {
-        electronbot_neutral_gif_->Pause();
-    }
-    if (electronbot_blink_gif_ && electronbot_blink_gif_.get() != keep) {
-        electronbot_blink_gif_->Pause();
-    }
-    // 常驻槽位（neutral/blink）复用既有控制器——Stop 倒带不释放，全程零重分配；
-    // 情绪循环段随情绪在 gif_controller_ 上换（LLM 语句级频率，可接受）
-    LvglGif* target = nullptr;
-    if (strcmp(key, "neutral") == 0) {
-        target = electronbot_neutral_gif_.get();
-    } else if (strcmp(key, "blink_once") == 0) {
-        target = electronbot_blink_gif_.get();
-    }
-    if (target != nullptr) {
-        if (gif_controller_) {
-            gif_controller_->Stop();
-            gif_controller_.reset();
-        }
-        target->Stop();  // 倒带+渲首帧，从头播
-        lv_image_set_src(emoji_image_, target->image_dsc());
-        target->Start();
-    } else {
-        auto* theme = static_cast<LvglTheme*>(current_theme_);
-        auto* coll = theme != nullptr ? theme->emoji_collection().get() : nullptr;
-        const LvglImage* image = coll != nullptr ? coll->GetEmojiImage(key) : nullptr;
-        if (image == nullptr) {
-            return;
-        }
-        if (electronbot_neutral_gif_) electronbot_neutral_gif_->Pause();
-        if (electronbot_blink_gif_) electronbot_blink_gif_->Pause();
-        if (gif_controller_) {
-            gif_controller_->Stop();
-            gif_controller_.reset();
-        }
-        if (image->IsGif()) {
-            gif_controller_ = std::make_unique<LvglGif>(image->image_dsc());
-            if (gif_controller_->IsLoaded()) {
-                gif_controller_->SetFrameCallback(
-                    [this]() { lv_image_set_src(emoji_image_, gif_controller_->image_dsc()); });
-                lv_image_set_src(emoji_image_, gif_controller_->image_dsc());
-                gif_controller_->Start();
-            } else {
-                ESP_LOGE(TAG, "ElectronBot face: bad GIF for %s", key);
-                gif_controller_.reset();
-                return;
+    struct Entry { const char* const* names; size_t count; face_emotion_t face; };
+    static const char* const kHappy[] = {"happy", "laughing", "funny"};
+    static const char* const kLove[] = {"loving", "kissy"};
+    static const char* const kPlayful[] = {"delicious", "playful"};
+    static const char* const kSilly[] = {"silly"};
+    static const char* const kCool[] = {"confident", "cool"};
+    static const char* const kWorried[] = {"embarrassed"};
+    static const char* const kSad[] = {"sad"};
+    static const char* const kCry[] = {"crying"};
+    static const char* const kAngry[] = {"angry"};
+    static const char* const kSurprised[] = {"shocked", "surprised", "fearful"};
+    static const char* const kConfused[] = {"thinking", "confused"};
+    static const char* const kWink[] = {"winking"};
+    static const char* const kSleepy[] = {"sleepy"};
+    static const char* const kWorkingHard[] = {"working_hard"};
+    static const char* const kNeutral[] = {"neutral", "relaxed", "idle", "staticstate"};
+    static const Entry kMap[] = {
+        {kHappy, 3, FACE_HAPPY}, {kLove, 2, FACE_LOVE}, {kPlayful, 2, FACE_PLAYFUL},
+        {kSilly, 1, FACE_SILLY}, {kCool, 2, FACE_COOL}, {kWorried, 1, FACE_WORRIED},
+        {kSad, 1, FACE_SAD}, {kCry, 1, FACE_CRY}, {kAngry, 1, FACE_ANGRY},
+        {kSurprised, 3, FACE_SURPRISED}, {kConfused, 2, FACE_CONFUSED},
+        {kWink, 1, FACE_WINK}, {kSleepy, 1, FACE_SLEEPY}, {kWorkingHard, 1, FACE_WORKING_HARD},
+        {kNeutral, 4, FACE_NEUTRAL},
+    };
+    for (const Entry& entry : kMap) {
+        for (size_t i = 0; i < entry.count; i++) {
+            if (strcmp(name, entry.names[i]) == 0) {
+                return entry.face;
             }
-        } else {
-            lv_image_set_src(emoji_image_, image->image_dsc());
         }
     }
-    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    return FACE_NEUTRAL;
 }
 
-void LcdDisplay::ElectronBotBlinkTimerCb(lv_timer_t* timer) {
-    auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
-    DisplayLockGuard lock(self);
-    if (self->electronbot_paused_ || self->electronbot_emotion_ != "neutral") {
-        return;
-    }
-    if (self->electronbot_blink_restore_timer_ != nullptr) {
-        return;  // 上一眨还没回静态帧（不应发生，守卫）
-    }
-    self->ElectronBotShow("blink_once");
-    // 眨眼片段 0.5s@12fps，650ms 后回静态帧；restore 存成员供析构删除（裸 lv_timer
-    // 回调持有 this，析构夹在窗口内就是 UAF——2026-09-06 advisory 评审实锤）
-    self->electronbot_blink_restore_timer_ = lv_timer_create(ElectronBotBlinkRestoreCb, 650, self);
-    lv_timer_set_repeat_count(self->electronbot_blink_restore_timer_, 1);
-}
-
-void LcdDisplay::ElectronBotBlinkRestoreCb(lv_timer_t* timer) {
-    auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
-    DisplayLockGuard lock(self);
-    self->electronbot_blink_restore_timer_ = nullptr;  // 一次性定时器自动删除自身
-    // 眨眼途中来了真情绪：恢复帧不得盖回去（SetEmotion 已把 emotion_ 换走）
-    if (!self->electronbot_paused_ && self->electronbot_emotion_ == "neutral") {
-        self->ElectronBotShow("neutral");
+void LcdDisplay::InitKawaiiFace() {
+    kawaii_face_active_ = true;
+    kawaii_emotion_ = "neutral";
+    // 父对象 = 460x300 脸盒：kawaii 取 min(宽,高)=300 作脸幅，画布缓冲
+    // ~155KB 已打 SPIRAM 优先补丁，不压内部 SRAM（TLS/音频命脉）
+    face_config_t cfg = {
+        .parent = emoji_box_,
+        .animation_speed = 33,
+        .blink_interval = 4000,
+        .auto_blink = true,
+    };
+    if (face_animation_init(&cfg) == ESP_OK) {
+        ESP_LOGI(TAG, "Kawaii face initialized (lvgl_kawaii_face @d58e1c8 + pause/spiram patches)");
+    } else {
+        // 初始化失败不拖垮 UI：回落 emoji 图标路径（脸盒/字幕条照常）
+        kawaii_face_active_ = false;
+        lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGE(TAG, "Kawaii face init failed; emoji fallback");
     }
 }
 #endif

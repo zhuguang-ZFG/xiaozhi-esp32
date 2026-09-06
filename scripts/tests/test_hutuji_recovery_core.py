@@ -2140,9 +2140,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         bodies = lcd_cc.split("void LcdDisplay::SetChatMessage")[1:]
         self.assertGreaterEqual(len(bodies), 2)
         for body in bodies[:2]:
-            # 契约：任一整屏脸（grobot 程序绘眼或 ElectronBot GIF 脸）都把聊天/反馈
+            # 契约：任一整屏脸（grobot 程序绘眼或 kawaii 桌宠脸）都把聊天/反馈
             # 路由到独立字幕层，不回退到被脸盖住的 content_ 标签
-            self.assertIn("if (grobot_eyes_ != nullptr || electronbot_face_active_)", body)
+            self.assertIn("if (grobot_eyes_ != nullptr || kawaii_face_active_)", body)
             self.assertIn("SetGrobotSubtitle(content)", body)
             self.assertIn("return;", body)
 

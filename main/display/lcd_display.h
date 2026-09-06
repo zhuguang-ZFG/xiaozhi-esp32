@@ -14,8 +14,8 @@
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
 class GrobotEyes;
 #endif
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-class ElectronBotEmojiCollection;
+#if CONFIG_HUTUJI_KAWAII_FACE
+#include "boards/lichuang-dev/kawaii_face/lvgl_kawaii_face.h"  // face_emotion_t 进方法签名
 #endif
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
 class HutujiPiSplash;
@@ -144,30 +144,17 @@ protected:
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
     std::unique_ptr<GrobotEyes> grobot_eyes_;
 #endif
-#if CONFIG_HUTUJI_ELECTRONBOT_FACE
-    // ElectronBot 桌宠脸（2026-09-06 用户拍板替掉 grobot 程序绘眼）：情绪走
-    // SetEmotion 既有 GIF 路径播 emoji_image_；眨眼偶发由定时器驱动；暂停钩子
-    // 复用 SetGrobotEyesPaused（job 高压窗口冻结动画，TLS/渲染不互抢）。
-    std::shared_ptr<ElectronBotEmojiCollection> electronbot_collection_;
-    std::string electronbot_emotion_{"neutral"};
-    lv_timer_t* electronbot_blink_timer_ = nullptr;
-    bool electronbot_paused_ = false;
-    // neutral 静态帧与眨眼各持一个常驻控制器（Stop=倒带不释放，复用零分配）；
-    // 情绪循环段仍走 gif_controller_ 随情绪换——避免每 5s 一次的 288KB 级 PSRAM
-    // 申请/释放循环（长期碎片化风险，2026-09-06 advisory 评审实锤）
-    std::unique_ptr<LvglGif> electronbot_neutral_gif_;
-    std::unique_ptr<LvglGif> electronbot_blink_gif_;
-    lv_timer_t* electronbot_blink_restore_timer_ = nullptr;
-    bool electronbot_blink_twice_next_ = false;
-    void InitElectronBotFace(LvglTheme* theme);
-    void ElectronBotMakeCached_(std::unique_ptr<LvglGif>& slot, const char* key);
-    void ElectronBotShow(const char* key);
-    static void ElectronBotBlinkTimerCb(lv_timer_t* timer);
-    static void ElectronBotBlinkRestoreCb(lv_timer_t* timer);
+#if CONFIG_HUTUJI_KAWAII_FACE
+    // kawaii 桌宠脸（2026-09-06 用户拍板，同日替掉 ElectronBot GIF 脸）：vendored
+    // lvgl_kawaii_face 程序绘制（眼/眉/嘴/腮红，17 情绪+自动眨眼），零图片零解码；
+    // 暂停钩子复用 SetGrobotEyesPaused → face_animation_set_paused（本地补丁）。
+    std::string kawaii_emotion_{"neutral"};
+    bool kawaii_paused_ = false;
+    void InitKawaiiFace();
+    static face_emotion_t MapKawaiiEmotion_(const char* name);
 #endif
-    // 脸模式判定常量编译期化会散布 #if 碎块；留无条件 bool（默认 false），
-    // 非 electronbot 构建恒走假分支，调用点零 #if。
-    bool electronbot_face_active_ = false;
+    // 脸模式判定：无条件 bool（默认 false），非 kawaii 构建恒走假分支，调用点零 #if
+    bool kawaii_face_active_ = false;
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
     // 开机 π logo 启动画面；播完自行拆掉所有 LVGL 对象，仅析构时兜底。
     std::unique_ptr<HutujiPiSplash> pi_splash_;
