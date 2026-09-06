@@ -42,6 +42,15 @@
 #error "WiFi 静态 TX 缓冲会吃掉约 25KB 内部 RAM 导致 activation 栈分配失败；TX 缓冲必须动态（CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1, DYNAMIC_TX_BUFFER_NUM=32）"
 #endif
 
+// 同款防漂移（2026-09-06 评审发现）：ssl_receive 收包任务栈与 hutuji_preview 8192 栈
+// 都经 xTaskCreateWithCaps 落 SPIRAM（esp-ml307 补丁 + StartDraw），依赖
+// CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM；该旗标此前只存在于 gitignored 的生成
+// sdkconfig（未钉 defaults），fullclean/换机重建静默丢失会让所有 TLS 连接
+// fail-closed 报错。正确值已钉 sdkconfig.defaults.esp32s3。
+#ifndef CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+#error "SPIRAM 任务栈依赖 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y（ssl_receive/hutuji_preview 经 xTaskCreateWithCaps 落 SPIRAM）；请核对 sdkconfig 与 sdkconfig.defaults.esp32s3"
+#endif
+
 #define TAG "HutujiJob"
 
 namespace hutuji {
