@@ -9,6 +9,7 @@
 class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
+    esp_timer_handle_t config_mode_idle_timer_ = nullptr;
     bool in_config_mode_ = false;
     NetworkEventCallback network_event_callback_ = nullptr;
 
@@ -35,6 +36,12 @@ protected:
      * WiFi connection timeout callback
      */
     static void OnWifiConnectTimeout(void* arg);
+
+    /**
+     * 配网模式 5 分钟无操作自动退出（避免设备永远卡在「聋哑」热点态）。
+     * 仅在已有户网凭据时退出（无凭据退出会立刻弹回配网，空转）。
+     */
+    static void OnConfigModeIdleTimeout(void* arg);
 
 public:
     WifiBoard();

@@ -259,17 +259,29 @@ inline constexpr uint32_t PerformanceReassertPeriodMs(uint32_t fresh_budget_ms) 
     return fresh_budget_ms < 4000u ? fresh_budget_ms : 4000u;
 }
 
-/** 生成 ZXing/Android/iOS 识别的 open SoftAP 二维码内容；不包含家庭 Wi-Fi 凭据。 */
+/** 配网二维码 payload：统一 URL 形态，微信扫一扫直接进小程序配网页（2026-09-07 定案）。
+ * 旧 WIFI:T:nopass 形态只能被系统相机识别成「加入热点」，用户不知下一步；
+ * URL 形态经 mp 规则 /draw-upload/wifi → pages/wifi/wifi 进配网向导，SSID 随 s 参数带入。
+ * 注意：不再带系统级「自动连热点」能力，连接热点由小程序向导引导用户手动完成。
+ */
 inline std::string BuildOpenHotspotWifiQrPayload(const std::string& ssid) {
-    std::string escaped;
-    escaped.reserve(ssid.size() + 16);
-    for (char ch : ssid) {
-        if (ch == '\\' || ch == ';' || ch == ',' || ch == '"' || ch == ':') {
-            escaped.push_back('\\');
+    // SSID 走 URL query 编码（unreserved 集合原样，其余 %XX），任意字节不破坏解析。
+    static const char* kHex = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(ssid.size() * 3);
+    for (unsigned char ch : ssid) {
+        const bool unreserved = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                                (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+                                ch == '.' || ch == '~';
+        if (unreserved) {
+            encoded.push_back(static_cast<char>(ch));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(kHex[ch >> 4]);
+            encoded.push_back(kHex[ch & 0x0F]);
         }
-        escaped.push_back(ch);
     }
-    return "WIFI:T:nopass;S:" + escaped + ";;";
+    return "https://hutuji.donglicao.com/draw-upload/wifi?s=" + encoded;
 }
 
 /**

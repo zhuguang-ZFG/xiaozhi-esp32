@@ -1190,8 +1190,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 两者显式传参、不设默认值，避免哪一侧被悄悄改成另一侧的语义。
         self.assertIn("QueryAndWaitFreshMachineState(kOkFallbackIdleTimeoutMs)", fallback)
 
-    def test_open_hotspot_wifi_qr_payload_escapes_ssid(self):
-        """二维码 payload 按 ZXing 规则转义，LCD 共享覆盖层覆盖两块板。"""
+    def test_open_hotspot_wifi_qr_payload_url_encodes_ssid(self):
+        """二维码 payload 是小程序配网页 URL，SSID 按 URL query 编码（2026-09-07 定案）。"""
         compiler = find_compiler()
         if compiler is None:
             self.skipTest("no supported host C++ compiler found")
@@ -1203,9 +1203,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             #include <string>
             int main() {
                 assert(hutuji::BuildOpenHotspotWifiQrPayload("Xiaozhi-ABCD") ==
-                       "WIFI:T:nopass;S:Xiaozhi-ABCD;;");
+                       "https://hutuji.donglicao.com/draw-upload/wifi?s=Xiaozhi-ABCD");
                 assert(hutuji::BuildOpenHotspotWifiQrPayload("My;Wifi:Name\\x,\"y\"") ==
-                       "WIFI:T:nopass;S:My\\;Wifi\\:Name\\\\x\\,\\\"y\\\";;");
+                       "https://hutuji.donglicao.com/draw-upload/wifi?s=My%3BWifi%3AName%5Cx%2C%22y%22");
                 return 0;
             }
             """
@@ -3245,11 +3245,19 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("小派", standby)
         self.assertNotIn("你好小派", standby)
 
-        sdkconfig = (ROOT / "sdkconfig").read_text(encoding="utf-8")
-        self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=y", sdkconfig)
-        self.assertIn('CONFIG_CUSTOM_WAKE_WORD="xiao pai"', sdkconfig)
-        self.assertIn('CONFIG_CUSTOM_WAKE_WORD_DISPLAY="小派"', sdkconfig)
-        self.assertIn("CONFIG_SR_MN_CN_MULTINET7_QUANT=y", sdkconfig)
+        # 断言配置源头（waveshare config.json 是产线板），不读根 sdkconfig——
+        # 它是上次构建的残留，构建顺序不同结果不同（lichuang 无自定义唤醒词，
+        # 2026-09-07 lichuang release 构建后此测试假红实证）。
+        board_cfg = json.loads(
+            (ROOT / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/config.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        appends = [item for b in board_cfg["builds"] for item in b.get("sdkconfig_append", [])]
+        self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=y", appends)
+        self.assertIn('CONFIG_CUSTOM_WAKE_WORD="xiao pai"', appends)
+        self.assertIn('CONFIG_CUSTOM_WAKE_WORD_DISPLAY="小派"', appends)
+        self.assertIn("CONFIG_SR_MN_CN_MULTINET7_QUANT=y", appends)
 
         matrix = (
             ROOT / "main/boards/waveshare/esp32-s3-rgb-matrix/rgb_matrix_display.cc"

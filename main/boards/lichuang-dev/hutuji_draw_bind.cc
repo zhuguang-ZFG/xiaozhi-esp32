@@ -144,11 +144,19 @@ bool PollConsumedOnce(const std::string& code) {
 void BindWorkerTask(void* /*arg*/) {
     const TaskHandle_t self = xTaskGetCurrentTaskHandle();
     const std::string code = g_bind_code;
-    AnnounceOnce(code);
+    // announce 单发时代 TLS 一抖整码作废（用户输码必撞「无效或已过期」2026-09-07 JJAUAL 实锤），
+    // 故并入轮询环持续重试直到 200；与 consumed 轮询共享同一 10 分钟上限。
+    bool announced = false;
     for (int i = 0; i < kPollMaxAttempts && g_active; ++i) {
+        if (!announced) {
+            announced = AnnounceOnce(code);
+        }
         vTaskDelay(pdMS_TO_TICKS(kPollIntervalMs));
         if (!g_active) {
             break;
+        }
+        if (!announced) {
+            continue;  // 没 announce 成功前查会话无意义（服务端必然 missing）
         }
         if (!PollConsumedOnce(code)) {
             continue;
@@ -161,6 +169,10 @@ void BindWorkerTask(void* /*arg*/) {
             }
         });
         break;
+    }
+    if (!announced) {
+        ESP_LOGW(kTag, "bind window ended without successful announce mac=%s",
+                 SystemInfo::GetMacAddress().c_str());
     }
     if (g_worker == self) {
         g_worker = nullptr;

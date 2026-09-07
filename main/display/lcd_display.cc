@@ -2340,32 +2340,6 @@ void LcdDisplay::SetupUI() {
 #define MAX_MESSAGES 20
 #endif
 
-void LcdDisplay::SetGrobotEyesPaused(bool on) {
-#if CONFIG_HUTUJI_KAWAII_FACE
-    if (kawaii_face_active_) {
-        DisplayLockGuard lock(this);
-        // 与 grobot 版同语义：job 高压窗口冻结动画。vendored 补丁
-        // face_animation_set_paused 停动画定时器——冻结在当前帧、零重分配；
-        // 恢复续播。暂停期 SetEmotion 只记录（kawaii_emotion_），此处恢复时
-        // 按最新情绪落一次。
-        kawaii_paused_ = on;
-        face_animation_set_paused(on);
-        if (!on) {
-            face_set_emotion(MapKawaiiEmotion_(kawaii_emotion_.c_str()), true);
-        }
-        return;
-    }
-#endif
-#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
-    if (grobot_eyes_ == nullptr) {
-        return;
-    }
-    DisplayLockGuard lock(this);
-    grobot_eyes_->SetPaused(on);
-#else
-    (void)on;
-#endif
-}
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
@@ -2970,6 +2944,32 @@ void LcdDisplay::ClearChatMessages() {
     }
 }
 #endif
+void LcdDisplay::SetGrobotEyesPaused(bool on) {
+#if CONFIG_HUTUJI_KAWAII_FACE
+    if (kawaii_face_active_) {
+        DisplayLockGuard lock(this);
+        // 与 grobot 版同语义：job 高压窗口冻结动画。vendored 补丁
+        // face_animation_set_paused 停动画定时器——冻结在当前帧、零重分配；
+        // 恢复续播。暂停期 SetEmotion 只记录（kawaii_emotion_），此处恢复时
+        // 按最新情绪落一次。
+        kawaii_paused_ = on;
+        face_animation_set_paused(on);
+        if (!on) {
+            face_set_emotion(MapKawaiiEmotion_(kawaii_emotion_.c_str()), true);
+        }
+        return;
+    }
+#endif
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
+    if (grobot_eyes_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    grobot_eyes_->SetPaused(on);
+#else
+    (void)on;
+#endif
+}
 void LcdDisplay::SetStatus(const char* status) {
     LvglDisplay::SetStatus(status);
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_HUTUJI_GROBOT_FACE
