@@ -18,6 +18,9 @@
 #include <esp_log.h>
 #include <cJSON.h>
 #include <freertos/FreeRTOS.h>
+#include <lvgl.h>
+#include <draw/lv_image_decoder.h>
+#include <draw/lv_image_decoder_private.h>
 #include <freertos/task.h>
 #include <freertos/idf_additions.h>
 
@@ -1827,6 +1830,34 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
                 return nullptr;
             }
             SystemInfo::LogHeapNow("preview-decoded");
+            // 预览预解码（2026-09-07 Waveshare 白屏取证兼候选修复）：PNG 交给
+            // LVGL 渲染期解码时屏幕只有背景色不出图，而同一 decoder_open 在下载
+            // 任务里解码 RGB565 512² 完全正常——直接在预览任务里预解码成原始
+            // RGB565 位图再交给 UI，绕开渲染期编码图路径；附带收益：解码一次
+            // 完成，不再每帧重复。失败时保留 PNG 原图回落旧路径。
+            {
+                lv_image_decoder_dsc_t probe;
+                if (lv_image_decoder_open(&probe, img->image_dsc(), nullptr) == LV_RESULT_OK) {
+                    auto* decoded = static_cast<const lv_draw_buf_t*>(probe.decoded);
+                    if (decoded && decoded->data && decoded->header.cf == LV_COLOR_FORMAT_RGB565) {
+                        const size_t bytes = decoded->data_size;
+                        auto* raw = static_cast<uint8_t*>(
+                            heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                        if (raw) {
+                            memcpy(raw, decoded->data, bytes);
+                            img = std::make_unique<LvglAllocatedImage>(
+                                raw, bytes, decoded->header.w, decoded->header.h,
+                                decoded->header.stride, LV_COLOR_FORMAT_RGB565);
+                            ESP_LOGW(TAG, "预览预解码 RGB565 %lux%lu（绕开渲染期 PNG）",
+                                     (unsigned long)decoded->header.w,
+                                     (unsigned long)decoded->header.h);
+                        }
+                    }
+                    lv_image_decoder_close(&probe);
+                } else {
+                    ESP_LOGE(TAG, "预览预解码 decoder_open 失败，回落 PNG 渲染期解码");
+                }
+            }
             return img;
         }();
         if (!image && outcome == FetchOutcome::kFatal) {
