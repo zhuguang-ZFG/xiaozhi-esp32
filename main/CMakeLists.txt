@@ -891,7 +891,7 @@ else()
     )
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
-if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 OR CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
     list(APPEND SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pipe.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_job.cc
@@ -1151,8 +1151,8 @@ endif()
 
 option(HUTUJI_AUTO_TEST_ABORT_ON_PAPER "Enable hutuji bringup 8.5 scaffold: call abort as soon as paper-change window opens" OFF)
 if(HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
-    if(NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 AND NOT CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
-        message(FATAL_ERROR "HUTUJI_AUTO_TEST_ABORT_ON_PAPER is only supported for lichuang-dev / waveshare-3.5")
+    if(NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 AND NOT CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 AND NOT CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+        message(FATAL_ERROR "HUTUJI_AUTO_TEST_ABORT_ON_PAPER is only supported for lichuang-dev / waveshare-3.5 / freenove-2.8")
     endif()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
     if(NOT HUTUJI_AUTO_TEST_DRAW)
