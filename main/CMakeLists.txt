@@ -867,6 +867,11 @@ elseif(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    set(HUTUJI_GROBOT_FACE TRUE)
+    # kawaii 桌宠脸默认开，与 waveshare-3.5 同口径（2026-09-08 用户主诉「桌宠 UI 不对」：
+    # 首版端口漏开脸编译面，主屏跑成原厂 emoji 聊天 UI）。320x240 与 lichuang 同分辨率，
+    # 脸盒走 lcd_display.cc 的 312x232 else 分支，几何零新增。CACHE 不带 FORCE 可 -D=OFF 回退。
+    set(HUTUJI_KAWAII_FACE ON CACHE BOOL "Replace grobot eyes with kawaii animated face")
 elseif(CONFIG_BOARD_TYPE_AI_VOX3)
     set(BOARD_TYPE "nulllab-ai-vox-v3")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
