@@ -215,14 +215,16 @@ bool JobIsIdleForOta() {
 std::string TodayUtcYmd() {
     time_t now = time(nullptr);
     struct tm tm_utc = {};
-#if defined(_WIN32)
-    gmtime_s(&tm_utc, &now);
-#else
     gmtime_r(&now, &tm_utc);
-#endif
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm_utc.tm_year + 1900, tm_utc.tm_mon + 1,
-             tm_utc.tm_mday);
+    const int year = tm_utc.tm_year + 1900;
+    const int mon = tm_utc.tm_mon + 1;
+    const int day = tm_utc.tm_mday;
+    // 钳位避免 -Werror=format-truncation 把 tm 字段当成任意 int。
+    const unsigned y = year > 0 ? static_cast<unsigned>(year) : 0u;
+    const unsigned m = (mon >= 1 && mon <= 12) ? static_cast<unsigned>(mon) : 1u;
+    const unsigned d = (day >= 1 && day <= 31) ? static_cast<unsigned>(day) : 1u;
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%04u-%02u-%02u", y, m, d);
     return buf;
 }
 
