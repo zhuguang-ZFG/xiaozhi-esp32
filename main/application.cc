@@ -20,6 +20,10 @@
 #ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
 #include "boards/lichuang-dev/hutuji_conversation_report.h"
 #endif
+#if CONFIG_HUTUJI_KAWAII_FACE
+#include "lcd_display.h"
+#endif
+
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -364,6 +368,13 @@ void Application::HandleActivationDoneEvent() {
     // 无头 announce 一轮窗口；portal 已有该 MAC 的配网认领即自动完成绑定。
     // 尽力而为，失败只记日志，绝不影响正常启动；抽屉输码降级路径保留。
     hutuji::StartAutoBindHeadless(display);
+#endif
+#if CONFIG_HUTUJI_KAWAII_FACE
+    // 与 EnterWifiConfigMode 的暂停配对：激活完成（配网收口/重连成功）恢复全脸动画。
+    // 暂停 API 对未激活的脸是幂等空操作，正常开机路径调用无害。
+    if (auto* lcd = dynamic_cast<LcdDisplay*>(display)) {
+        lcd->SetGrobotEyesPaused(false);
+    }
 #endif
 }
 
