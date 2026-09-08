@@ -263,13 +263,16 @@ inline constexpr uint32_t PerformanceReassertPeriodMs(uint32_t fresh_budget_ms) 
  * 旧 WIFI:T:nopass 形态只能被系统相机识别成「加入热点」，用户不知下一步；
  * URL 形态经 mp 规则 /draw-upload/wifi → pages/wifi/wifi 进配网向导，SSID 随 s 参数带入。
  * 注意：不再带系统级「自动连热点」能力，连接热点由小程序向导引导用户手动完成。
+ * m 参数（2026-09-08 一次扫码合一定案）：整机 MAC 作为「用户扫到这张码」的近场证明，
+ * 小程序配网成功后凭它调 /api/user/bind/claim 认领，设备 announce 到达即自动绑定。
  */
-inline std::string BuildOpenHotspotWifiQrPayload(const std::string& ssid) {
-    // SSID 走 URL query 编码（unreserved 集合原样，其余 %XX），任意字节不破坏解析。
+inline std::string UrlEncodeQueryComponent(const std::string& raw) {
+    // query 值统一 URL 编码（unreserved 集合原样，其余 %XX），任意字节不破坏解析；
+    // MAC 的冒号被编成 %3A，服务端/小程序侧 decode 后就是规范小写形态。
     static const char* kHex = "0123456789ABCDEF";
     std::string encoded;
-    encoded.reserve(ssid.size() * 3);
-    for (unsigned char ch : ssid) {
+    encoded.reserve(raw.size() * 3);
+    for (unsigned char ch : raw) {
         const bool unreserved = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
                                 (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
                                 ch == '.' || ch == '~';
@@ -281,7 +284,12 @@ inline std::string BuildOpenHotspotWifiQrPayload(const std::string& ssid) {
             encoded.push_back(kHex[ch & 0x0F]);
         }
     }
-    return "https://hutuji.donglicao.com/draw-upload/wifi?s=" + encoded;
+    return encoded;
+}
+
+inline std::string BuildOpenHotspotWifiQrPayload(const std::string& ssid, const std::string& mac) {
+    return "https://hutuji.donglicao.com/draw-upload/wifi?s=" + UrlEncodeQueryComponent(ssid) +
+           "&m=" + UrlEncodeQueryComponent(mac);
 }
 
 /**

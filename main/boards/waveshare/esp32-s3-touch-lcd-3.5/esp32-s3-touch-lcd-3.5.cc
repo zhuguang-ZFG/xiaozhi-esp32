@@ -2,6 +2,7 @@
 #include "codecs/es8311_audio_codec.h"
 #include "display/lcd_display.h"
 #include "system_reset.h"
+#include "system_info.h"
 #include "application.h"
 #include "boards/lichuang-dev/hutuji_job.h"
 #include "boards/lichuang-dev/hutuji_pipe.h"
@@ -741,7 +742,7 @@ private:
                     StopWifiLostWatchdog();
                     const std::string ap_ssid = WifiManager::GetInstance().GetApSsid();
                     display_->ShowProvisioningQr(
-                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid),
+                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress()),
                         "Scan: " + ap_ssid + "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
                 } else if (event == NetworkEvent::WifiConfigModeExit ||
                            event == NetworkEvent::Connected) {

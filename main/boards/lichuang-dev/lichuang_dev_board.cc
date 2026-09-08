@@ -14,6 +14,7 @@
 #include "mcp_server.h"
 #include "plotter_provision.h"
 #include "press_to_talk_mcp_tool.h"
+#include "system_info.h"
 #include "wifi_board.h"
 
 // 调试用：需要本地工程回归时，在编译参数里同时定义：
@@ -529,7 +530,7 @@ public:
                 if (event == NetworkEvent::WifiConfigModeEnter) {
                     const std::string ap_ssid = WifiManager::GetInstance().GetApSsid();
                     display_->ShowProvisioningQr(
-                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid),
+                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress()),
                         "Scan: " + ap_ssid + "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
                 } else if (event == NetworkEvent::WifiConfigModeExit ||
                            event == NetworkEvent::Connected) {

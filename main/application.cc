@@ -11,8 +11,11 @@
     defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
 #define HUTUJI_CONVERSATION_REPORT_ENABLED 1
 #endif
-#ifdef CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+#define HUTUJI_AUTO_BIND_ENABLED 1
 #include "boards/lichuang-dev/hutuji_activation_relay.h"
+#include "boards/lichuang-dev/hutuji_draw_bind.h"
 #endif
 #ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
 #include "boards/lichuang-dev/hutuji_conversation_report.h"
@@ -356,6 +359,12 @@ void Application::HandleActivationDoneEvent() {
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     });
+#ifdef HUTUJI_AUTO_BIND_ENABLED
+    // 一次扫码合一流程（2026-09-08 定案）：激活完成事件每次开机都到这里，
+    // 无头 announce 一轮窗口；portal 已有该 MAC 的配网认领即自动完成绑定。
+    // 尽力而为，失败只记日志，绝不影响正常启动；抽屉输码降级路径保留。
+    hutuji::StartAutoBindHeadless(display);
+#endif
 }
 
 void Application::ActivationTask() {
@@ -493,11 +502,14 @@ void Application::CheckNewVersion() {
         // Activation code is shown to the user and waiting for the user to input
         if (ota_->HasActivationCode()) {
             ShowActivationCode(ota_->GetActivationCode(), ota_->GetActivationMessage());
-#ifdef CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
             // 京东云中转（2026-08-20 用户决策，唯一干净注入点：激活码只在
             // Application/Ota 内部可见）：把激活码上报给自建服务代绑控制台，
             // 用户联网后无感完成绑定；尽力而为，失败不影响屏显输码兜底。
-            // 仅限本板编译面生效，其余板型上游行为不变。
+            // 2026-09-08 扩到 freenove-2.8：用户实测新板激活码不会自动写入控制台，
+            // 根因是原编译闸只圈 waveshare-3.5。仅限这两板编译面生效，其余板型
+            // 上游行为不变。
             hutuji::ReportActivationCode(ota_->GetActivationCode());
 #endif
         }

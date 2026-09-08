@@ -67,7 +67,7 @@ std::string ReadDeviceToken() {
     return token;
 }
 
-bool AnnounceOnce(const std::string& code) {
+bool AnnounceOnce(const std::string& code, bool* bound_out) {
     const std::string token = ReadDeviceToken();
     if (token.size() < 8) {
         ESP_LOGW(kTag, "device token missing, skip announce mac=%s",
@@ -104,6 +104,19 @@ bool AnnounceOnce(const std::string& code) {
         const int status = http->GetStatusCode();
         ESP_LOGI(kTag, "announce mac=%s status=%d", SystemInfo::GetMacAddress().c_str(), status);
         ok = (status >= 200 && status < 300);
+        if (ok && bound_out != nullptr) {
+            // 2026-09-08 起 portal 在响应里回 bound：该 MAC 已被用户认领并完成撮合。
+            // 老 portal 无此字段 → 解析不到即 false，行为与旧版一致。
+            char buf[192] = {};
+            const int n = http->Read(buf, sizeof(buf) - 1);
+            if (n > 0) {
+                cJSON* resp = cJSON_Parse(buf);
+                if (resp != nullptr) {
+                    *bound_out = cJSON_IsTrue(cJSON_GetObjectItem(resp, "bound"));
+                    cJSON_Delete(resp);
+                }
+            }
+        }
         http->Close();
     }
     return ok;
@@ -149,7 +162,7 @@ void BindWorkerTask(void* /*arg*/) {
     bool announced = false;
     for (int i = 0; i < kPollMaxAttempts && g_active; ++i) {
         if (!announced) {
-            announced = AnnounceOnce(code);
+            announced = AnnounceOnce(code, nullptr);
         }
         vTaskDelay(pdMS_TO_TICKS(kPollIntervalMs));
         if (!g_active) {
@@ -192,12 +205,80 @@ void QueueWorker() {
     }
 }
 
+// ---- 一次扫码合一流程（2026-09-08 定案）：无头 announce ----
+// 抽屉流要用户开抽屉输码；合一流程里用户只扫配网码，设备侧 announce 后
+// 由 portal 按 MAC 与小程序认领撮合，响应 bound:true 即完成。
+constexpr int kAutoBindIntervalMs = 5000;    // 无人在等结果，比抽屉流 3s 温和
+constexpr int kAutoBindMaxAttempts = 120;    // ~10 分钟窗口，盖住激活重试环
+
+std::string g_auto_code;
+bool g_auto_active = false;
+TaskHandle_t g_auto_worker = nullptr;
+
+void AutoBindWorkerTask(void* /*arg*/) {
+    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    const std::string code = g_auto_code;
+    bool bound = false;
+    for (int i = 0; i < kAutoBindMaxAttempts && g_auto_active && !bound; ++i) {
+        // 每轮重发同一码（幂等 upsert、顺带刷新会话 TTL），直到 portal 回 bound
+        // 或窗口结束；token 未就位（激活未完成）时 AnnounceOnce 快速失败等下轮。
+        AnnounceOnce(code, &bound);
+        if (!bound) {
+            vTaskDelay(pdMS_TO_TICKS(kAutoBindIntervalMs));
+        }
+    }
+    if (bound) {
+        ESP_LOGI(kTag, "auto bind matched mac=%s", SystemInfo::GetMacAddress().c_str());
+        Application::GetInstance().Schedule([]() {
+            if (g_display != nullptr) {
+                g_display->ShowNotification("已绑定呼图账号", 5000);
+            }
+        });
+    } else if (g_auto_active) {
+        ESP_LOGW(kTag, "auto bind window ended unbound mac=%s",
+                 SystemInfo::GetMacAddress().c_str());
+    }
+    g_auto_active = false;
+    if (g_auto_worker == self) {
+        g_auto_worker = nullptr;
+    }
+    vTaskDelete(nullptr);
+}
+
 }  // namespace
+
+void StartAutoBindHeadless(Display* display) {
+    if (g_active) {
+        return;  // 抽屉绑定流在跑：announce 归它管（同样会被撮合），不抢 worker
+    }
+    if (g_auto_worker != nullptr) {
+        return;  // 本窗口已在跑：激活完成事件每次开机都到，重复调用安全
+    }
+    if (display != nullptr) {
+        g_display = display;
+    }
+    g_auto_code = GenerateBindCode();
+    g_auto_active = true;
+    if (xTaskCreate(AutoBindWorkerTask, "hutuji_autobind", kTaskStack, nullptr, 3,
+                    &g_auto_worker) != pdPASS) {
+        ESP_LOGW(kTag, "auto bind worker create failed");
+        g_auto_worker = nullptr;
+        g_auto_active = false;
+        return;
+    }
+    ESP_LOGI(kTag, "auto bind headless started mac=%s", SystemInfo::GetMacAddress().c_str());
+}
+
+void StopAutoBindHeadless() {
+    g_auto_active = false;  // worker 下个周期自查退出，不在外部杀任务
+}
+
 
 void StartDrawBind(Display* display) {
     if (display == nullptr) {
         return;
     }
+    StopAutoBindHeadless();  // 抽屉流接管 announce，无头 worker 下个周期退出
     g_display = display;
     g_bind_code = GenerateBindCode();
     g_active = true;

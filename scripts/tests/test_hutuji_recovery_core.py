@@ -1202,10 +1202,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             #include <cassert>
             #include <string>
             int main() {
-                assert(hutuji::BuildOpenHotspotWifiQrPayload("Xiaozhi-ABCD") ==
-                       "https://hutuji.donglicao.com/draw-upload/wifi?s=Xiaozhi-ABCD");
-                assert(hutuji::BuildOpenHotspotWifiQrPayload("My;Wifi:Name\\x,\"y\"") ==
-                       "https://hutuji.donglicao.com/draw-upload/wifi?s=My%3BWifi%3AName%5Cx%2C%22y%22");
+                // 2026-09-08 起 QR 带 &m=<MAC>（一次扫码合一流程的用户在场证明），
+                // MAC 冒号按 query 规则编成 %3A。
+                assert(hutuji::BuildOpenHotspotWifiQrPayload("Xiaozhi-ABCD", "aa:bb:cc:dd:ee:ff") ==
+                       "https://hutuji.donglicao.com/draw-upload/wifi?s=Xiaozhi-ABCD&m=aa%3Abb%3Acc%3Add%3Aee%3Aff");
+                assert(hutuji::BuildOpenHotspotWifiQrPayload("My;Wifi:Name\\x,\"y\"", "00:11:22:33:44:55") ==
+                       "https://hutuji.donglicao.com/draw-upload/wifi?s=My%3BWifi%3AName%5Cx%2C%22y%22&m=00%3A11%3A22%3A33%3A44%3A55");
                 return 0;
             }
             """
@@ -1228,8 +1230,11 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("esp_qrcode_generate", lcd_cc)
         self.assertIn("LV_OBJ_FLAG_CLICKABLE", lcd_cc)
         self.assertIn("LV_OBJ_FLAG_SCROLLABLE", lcd_cc)
-        for board, constructor in ((lichuang, "LichuangDevBoard"), (waveshare, "CustomBoard")):
-            self.assertIn("BuildOpenHotspotWifiQrPayload", board)
+        freenove = (ROOT / "main/boards/freenove-esp32s3-display-2.8-lcd/freenove-esp32s3-display-2.8-lcd.cc").read_text(
+            encoding="utf-8"
+        )
+        for board, constructor in ((lichuang, "LichuangDevBoard"), (waveshare, "CustomBoard"), (freenove, "FreenoveESP32S3Display")):
+            self.assertIn("BuildOpenHotspotWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress())", board)
             self.assertIn("void SetNetworkEventCallback(NetworkEventCallback callback) override", board)
             self.assertIn("WifiBoard::SetNetworkEventCallback(", board)
             self.assertIn("callback = std::move(callback)", board)
@@ -3278,7 +3283,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 钩子必须带板型守卫，其余板型上游行为不变。
         hook = app_cc[app_cc.index("hutuji::ReportActivationCode(ota_->GetActivationCode())"):]
         guard_region = app_cc[:app_cc.index("hutuji::ReportActivationCode(ota_->GetActivationCode())")]
-        self.assertIn("#ifdef CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5",
+        self.assertIn("defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)",
                       guard_region[-800:])
         self.assertIn("#endif", hook[:200])
 
@@ -3298,6 +3303,41 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             if "ESP_LOG" in line:
                 self.assertNotIn("payload->code", line)
                 self.assertNotIn("body", line)
+
+    def test_auto_bind_headless_wiring(self):
+        """一次扫码合一（2026-09-08 定案）：激活完成钩子带板型守卫、
+        draw_bind 提供无头 announce worker 并解析 portal 响应 bound 字段。"""
+        app_cc = (ROOT / "main/application.cc").read_text(encoding="utf-8")
+        self.assertIn("hutuji_draw_bind.h", app_cc)
+        self.assertIn("HUTUJI_AUTO_BIND_ENABLED", app_cc)
+        self.assertIn("hutuji::StartAutoBindHeadless(display)", app_cc)
+        # 钩子必须挂在 HandleActivationDoneEvent 内（每次开机都到），且带宏守卫。
+        handler_start = app_cc.index("void Application::HandleActivationDoneEvent()")
+        handler_end = app_cc.index("void Application::ActivationTask()", handler_start)
+        handler = app_cc[handler_start:handler_end]
+        self.assertIn("#ifdef HUTUJI_AUTO_BIND_ENABLED", handler)
+        self.assertIn("hutuji::StartAutoBindHeadless(display)", handler)
+
+        bind_h = (ROOT / "main/boards/lichuang-dev/hutuji_draw_bind.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("void StartAutoBindHeadless(Display* display)", bind_h)
+        self.assertIn("void StopAutoBindHeadless()", bind_h)
+
+        bind_cc = (ROOT / "main/boards/lichuang-dev/hutuji_draw_bind.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("void StartAutoBindHeadless(Display* display)", bind_cc)
+        self.assertIn("void StopAutoBindHeadless()", bind_cc)
+        # portal 2026-09-08 起在 announce 响应回 bound；解析不到（老 portal）即 false。
+        self.assertIn('cJSON_IsTrue(cJSON_GetObjectItem(resp, "bound"))', bind_cc)
+        # 抽屉流接管时必须停无头 worker，避免双 announce 通道抢会话。
+        drawer = bind_cc[bind_cc.index("void StartDrawBind(Display* display)"):]
+        self.assertIn("StopAutoBindHeadless();", drawer)
+        # 已绑定设备每次开机仍会 announce 一次（幂等、顺带刷新 token 与会话 TTL），
+        # portal 回 bound:true 即停；无认领窗口结束自行退出，不得常驻。
+        self.assertIn("kAutoBindMaxAttempts", bind_cc)
+        self.assertIn("g_auto_active = false;", bind_cc)
 
     def test_conversation_report_guard_covers_every_board_that_links_it(self):
         """会话上报的头/调用点守卫必须与 hutuji_conversation_report.cc 的编译面等价。
