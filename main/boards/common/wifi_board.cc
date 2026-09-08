@@ -249,8 +249,21 @@ void WifiBoard::StartWifiConfigMode() {
 #endif
 }
 
+#if CONFIG_HUTUJI_KAWAII_FACE
+#include "lcd_display.h"
+#endif
+
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
+#if CONFIG_HUTUJI_KAWAII_FACE
+    // 配网换屏与 kawaii 脸动画定时器竞态防线（2026-09-08 19:13 freenove 实机
+    // Guru Meditation：会话中二次进配网，lv_font_get_glyph_dsc 沿 fallback 链
+    // 调用空函数指针 PC=0x0——boot 进配网连续 4 次正常，差异就在脸动画在跑）。
+    // 进配网先冻结全脸动画；恢复由 HandleActivationDoneEvent 统一完成。
+    if (auto* lcd = dynamic_cast<LcdDisplay*>(GetDisplay())) {
+        lcd->SetGrobotEyesPaused(true);
+    }
+#endif
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 
     auto& app = Application::GetInstance();
