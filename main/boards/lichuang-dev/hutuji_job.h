@@ -60,8 +60,15 @@ public:
     /** 当前点动步进（1 或 10mm，默认 10）。 */
     float GetJogStepMm();
 
-    /** status JSON：connected/ready/authorized/state/last_line */
+    /** status JSON：connected/ready/authorized/state/last_line + firmware_version/board/ota */
     std::string StatusJson() const;
+
+    /**
+     * OTA 状态镜像（供 Task 6 `hutuji_ota` 写入；`StatusJson` 读出）。
+     * 缺省 state=idle、progress=0、reason 空、update_available=false。
+     */
+    void SetOtaStatus(const std::string& state, int progress, const std::string& reason = "");
+    void SetOtaUpdateAvailable(bool available);
 
     bool IsPaperActive() const { return paper_active_.load(); }
     /** WiFi 省电门：活跃窗口内板级 SetPowerSaveLevel 拒绝一切非 PERFORMANCE 档位回落。 */
@@ -319,6 +326,13 @@ private:
     uint32_t draw_start_tick_ = 0;
     uint32_t paused_accum_ms_ = 0;
     uint32_t pause_segment_start_ = 0;
+
+    // OTA 进度镜像：与出图 state_ 分离；StatusJson 在 ota_mutex_ 下快照。
+    mutable std::mutex ota_mutex_;
+    std::string ota_state_{"idle"};
+    int ota_progress_{0};
+    std::string ota_reason_;
+    bool ota_update_available_{false};
 };
 
 }  // namespace hutuji

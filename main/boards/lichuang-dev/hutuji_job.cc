@@ -14,6 +14,7 @@
 #include "system_info.h"
 #include "settings.h"
 
+#include <esp_app_desc.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <cJSON.h>
@@ -1352,6 +1353,31 @@ std::string Job::StatusJson() const {
     }
     cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());
     cJSON_AddStringToObject(root, "state", state.c_str());
+    // OTA / 板型（量产）：firmware_version 来自 app_desc；board = 编译期 BOARD_NAME
+    //（与 CMake BOARD_TYPE 默认同值，catalog key 如 freenove-esp32s3-display-2.8-lcd）。
+    // ota 对象由 SetOtaStatus / SetOtaUpdateAvailable 维护；缺省 idle。
+    const esp_app_desc_t* app_desc = esp_app_get_description();
+    cJSON_AddStringToObject(root, "firmware_version",
+                            app_desc && app_desc->version[0] ? app_desc->version : "");
+    cJSON_AddStringToObject(root, "board", BOARD_NAME);
+    std::string ota_state;
+    int ota_progress = 0;
+    std::string ota_reason;
+    bool ota_update_available = false;
+    {
+        std::lock_guard<std::mutex> ota_lock(ota_mutex_);
+        ota_state = ota_state_;
+        ota_progress = ota_progress_;
+        ota_reason = ota_reason_;
+        ota_update_available = ota_update_available_;
+    }
+    cJSON* ota = cJSON_AddObjectToObject(root, "ota");
+    if (ota != nullptr) {
+        cJSON_AddStringToObject(ota, "state", ota_state.c_str());
+        cJSON_AddNumberToObject(ota, "progress", ota_progress);
+        cJSON_AddStringToObject(ota, "reason", ota_reason.c_str());
+        cJSON_AddBoolToObject(ota, "update_available", ota_update_available);
+    }
     // 文章模式（§10.2 pages）：单页时两原子为 0，字段不出现。
     const size_t article_total = article_total_.load(std::memory_order_relaxed);
     if (article_total > 0) {
@@ -1394,6 +1420,18 @@ std::string Job::StatusJson() const {
     std::string json = str ? str : "{}";
     cJSON_free(str);
     return json;
+}
+
+void Job::SetOtaStatus(const std::string& state, int progress, const std::string& reason) {
+    std::lock_guard<std::mutex> lock(ota_mutex_);
+    ota_state_ = state.empty() ? "idle" : state;
+    ota_progress_ = progress < 0 ? 0 : (progress > 100 ? 100 : progress);
+    ota_reason_ = reason;
+}
+
+void Job::SetOtaUpdateAvailable(bool available) {
+    std::lock_guard<std::mutex> lock(ota_mutex_);
+    ota_update_available_ = available;
 }
 
 void Job::PreviewTaskEntry(void* arg) {

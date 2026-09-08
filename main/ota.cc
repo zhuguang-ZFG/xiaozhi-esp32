@@ -17,10 +17,11 @@
 #include <esp_hmac.h>
 #endif
 
-#include <cstring>
-#include <vector>
-#include <sstream>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <sstream>
+#include <vector>
 
 #define TAG "Ota"
 
@@ -409,14 +410,26 @@ bool Ota::StartUpgrade(std::function<void(int progress, size_t speed)> callback)
 
 
 std::vector<int> Ota::ParseVersion(const std::string& version) {
+    // hutuji.1.0.0：跳过非纯数字段（如 "hutuji"），只比较 1.0.0。
     std::vector<int> versionNumbers;
     std::stringstream ss(version);
     std::string segment;
-    
     while (std::getline(ss, segment, '.')) {
-        versionNumbers.push_back(std::stoi(segment));
+        if (segment.empty()) {
+            continue;
+        }
+        bool all_digit = std::all_of(segment.begin(), segment.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        });
+        if (!all_digit) {
+            continue;  // 跳过 "hutuji" 等前缀/标签
+        }
+        try {
+            versionNumbers.push_back(std::stoi(segment));
+        } catch (...) {
+            continue;
+        }
     }
-    
     return versionNumbers;
 }
 
