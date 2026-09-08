@@ -9,6 +9,7 @@
 
 #include <cJSON.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_random.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -208,8 +209,13 @@ void QueueWorker() {
 // ---- 一次扫码合一流程（2026-09-08 定案）：无头 announce ----
 // 抽屉流要用户开抽屉输码；合一流程里用户只扫配网码，设备侧 announce 后
 // 由 portal 按 MAC 与小程序认领撮合，响应 bound:true 即完成。
-constexpr int kAutoBindIntervalMs = 5000;    // 无人在等结果，比抽屉流 3s 温和
-constexpr int kAutoBindMaxAttempts = 120;    // ~10 分钟窗口，盖住激活重试环
+constexpr int kAutoBindWindowMs = 10 * 60 * 1000;  // ~10 分钟窗口，盖住激活重试环
+constexpr int kAutoBindFastMs = 5000;    // 认领大概率紧随配网：首分钟 5s 一拍
+constexpr int kAutoBindSlowMs = 30000;   // 之后 30s 一拍：每拍都是全新 TLS 握手
+                                         // （实测 4.5-5.5s），5s 恒拍 = 半数时间
+                                         // 在握手，音频任务被饿死（2026-09-08 实机
+                                         // 语音卡顿/听不清根因）
+constexpr int kAutoBindFastRounds = 12;  // 12×5s = 首 1 分钟
 
 std::string g_auto_code;
 bool g_auto_active = false;
@@ -218,14 +224,25 @@ TaskHandle_t g_auto_worker = nullptr;
 void AutoBindWorkerTask(void* /*arg*/) {
     const TaskHandle_t self = xTaskGetCurrentTaskHandle();
     const std::string code = g_auto_code;
+    const int64_t deadline = esp_timer_get_time() + (int64_t)kAutoBindWindowMs * 1000;
     bool bound = false;
-    for (int i = 0; i < kAutoBindMaxAttempts && g_auto_active && !bound; ++i) {
+    int round = 0;
+    while (g_auto_active && !bound && esp_timer_get_time() < deadline) {
+        // 语音会话期 announce 整体让路：mbedTLS 握手是秒级 CPU 密集段，
+        // 与 AFE 馈送/TTS 同核互抢（2026-09-08 实机「听不清用户说话」定性）。
+        const auto state = Application::GetInstance().GetDeviceState();
+        if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
         // 每轮重发同一码（幂等 upsert、顺带刷新会话 TTL），直到 portal 回 bound
         // 或窗口结束；token 未就位（激活未完成）时 AnnounceOnce 快速失败等下轮。
         AnnounceOnce(code, &bound);
         if (!bound) {
-            vTaskDelay(pdMS_TO_TICKS(kAutoBindIntervalMs));
+            vTaskDelay(pdMS_TO_TICKS(round < kAutoBindFastRounds ? kAutoBindFastMs
+                                                                 : kAutoBindSlowMs));
         }
+        ++round;
     }
     if (bound) {
         ESP_LOGI(kTag, "auto bind matched mac=%s", SystemInfo::GetMacAddress().c_str());
