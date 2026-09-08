@@ -1375,7 +1375,9 @@ std::string Job::StatusJson() const {
     if (ota != nullptr) {
         cJSON_AddStringToObject(ota, "state", ota_state.c_str());
         cJSON_AddNumberToObject(ota, "progress", ota_progress);
-        cJSON_AddStringToObject(ota, "reason", ota_reason.c_str());
+        if (!ota_reason.empty()) {
+            cJSON_AddStringToObject(ota, "reason", ota_reason.c_str());
+        }
         cJSON_AddBoolToObject(ota, "update_available", ota_update_available);
     }
     // 文章模式（§10.2 pages）：单页时两原子为 0，字段不出现。
