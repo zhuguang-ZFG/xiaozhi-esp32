@@ -8,6 +8,7 @@
 #include "boards/lichuang-dev/hutuji_pipe.h"
 #include "boards/lichuang-dev/hutuji_draw_bind.h"
 #include "boards/lichuang-dev/hutuji_ble_diag.h"
+#include "boards/lichuang-dev/hutuji_ota.h"
 #include "boards/lichuang-dev/hutuji_conversation_report.h"
 #include "boards/lichuang-dev/hutuji_recovery_core.h"
 #include "boards/lichuang-dev/hutuji_music.h"
@@ -549,6 +550,8 @@ private:
 
         // BLE-DIAG 阶段 A 只读诊断广播；默认关闭，未启用时是空实现。
         hutuji::ble_diag::Start();
+
+        hutuji::ota::RegisterTools(mcp_server);
 
         display_->ConfigureMachineControls(
             [this]() { ScheduleMachineControl("pause", &hutuji::Job::RequestPause); },

@@ -17,6 +17,11 @@
 #include "boards/lichuang-dev/hutuji_activation_relay.h"
 #include "boards/lichuang-dev/hutuji_draw_bind.h"
 #endif
+#if defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3) ||           \
+    defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+#include "boards/lichuang-dev/hutuji_ota.h"
+#endif
 #ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
 #include "boards/lichuang-dev/hutuji_conversation_report.h"
 #endif
@@ -289,6 +294,16 @@ void Application::Run() {
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
+
+#if defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3) ||           \
+    defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+            // 小派量产 OTA：每天 idle+WiFi 只查 latest.json，不自动升级。
+            // 每 60s 调一次即可；MaybeDailyCheck 内部按日历日与 inflight 再早退。
+            if (clock_ticks_ % 60 == 0) {
+                hutuji::ota::MaybeDailyCheck();
+            }
+#endif
         }
     }
 }

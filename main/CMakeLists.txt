@@ -900,6 +900,7 @@ if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 OR CONFIG_BOARD_TYPE_Freen
     list(APPEND SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pipe.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_job.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_ota.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_activation_relay.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_conversation_report.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_draw_bind.cc

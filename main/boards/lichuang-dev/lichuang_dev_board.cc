@@ -6,6 +6,7 @@
 #include "display/lcd_display.h"
 #include "esp32_camera.h"
 #include "hutuji_ble_diag.h"
+#include "hutuji_ota.h"
 #include "hutuji_conversation_report.h"
 #include "hutuji_job.h"
 #include "hutuji_music.h"
@@ -316,6 +317,8 @@ private:
 
         // BLE-DIAG 阶段 A 只读诊断广播；默认关闭，未启用时是空实现。
         hutuji::ble_diag::Start();
+
+        hutuji::ota::RegisterTools(mcp_server);
 
         mcp_server.AddTool(
             "hutuji.status",
