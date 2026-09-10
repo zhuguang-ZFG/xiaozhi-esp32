@@ -1077,15 +1077,17 @@ struct GrblSettingCheckResult {
     double actual = 0.0;
 };
 
-inline GrblSettingCheckResult CheckGrblSettingAgainstGolden(size_t index, const std::string& key,
-                                                            double actual) {
+inline GrblSettingCheckResult CheckGrblSettingAgainstGoldenTable(const GrblSettingGolden* table,
+                                                                 size_t table_count, size_t index,
+                                                                 const std::string& key,
+                                                                 double actual) {
     GrblSettingCheckResult result;
     result.actual = actual;
-    if (index >= kGrblSettingGoldenCount) {
+    if (index >= table_count) {
         result.key = key;
         return result;
     }
-    const GrblSettingGolden& golden = kGrblSettingGoldens[index];
+    const GrblSettingGolden& golden = table[index];
     result.key = golden.response_key;
     result.expected = golden.expected;
     if (key != golden.response_key) {
@@ -1093,6 +1095,14 @@ inline GrblSettingCheckResult CheckGrblSettingAgainstGolden(size_t index, const 
     }
     result.ok = GrblSettingValueMatches(actual, golden.expected, golden.integer);
     return result;
+}
+
+// 换纸机金标表的兼容包装（§10.4.15 起按机型分表：无换纸机走 nopaper 表，调用方
+// 统一用 Table 版传生效表；本包装保旧调用点零改动）。
+inline GrblSettingCheckResult CheckGrblSettingAgainstGolden(size_t index, const std::string& key,
+                                                            double actual) {
+    return CheckGrblSettingAgainstGoldenTable(kGrblSettingGoldens, kGrblSettingGoldenCount,
+                                              index, key, actual);
 }
 
 /**

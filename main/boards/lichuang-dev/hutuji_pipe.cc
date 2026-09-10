@@ -134,6 +134,7 @@ void Pipe::PipeTask() {
         paper_changing_.store(PaperChangingState::Unknown);
         ready_.store(false);
         authorized_.store(false);
+        nopaper_machine_.store(false);
         ResetSettingsFingerprintState();
         DrainResponses();
         if (task_session_active_.load()) {
@@ -732,7 +733,10 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
     if (line.rfind("[VER:", 0) == 0) {
         // `$I` 只证明对端版本；商业固件的授权日志走 CLIENT_SERIAL，Telnet 看不到。
         // ready_ 要等后续零位移授权探测完成，避免 draw 在授权态未知时抢跑。
-        ESP_LOGI(TAG, "Grbl 版本探活成功（%s），等待授权探测", line.c_str());
+        // §10.4.15：build 段 20260910 = 无换纸量产 SKU，驱动页尾/指纹分表分支。
+        nopaper_machine_.store(hutuji::GrblVerLineIsNopaperSku(line));
+        ESP_LOGI(TAG, "Grbl 版本探活成功（%s，%s），等待授权探测", line.c_str(),
+                 nopaper_machine_.load() ? "无换纸 SKU" : "换纸机型");
         return;
     }
 
@@ -788,8 +792,11 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
             settings_line_ok_ = false;
             RecordSettingsMismatch("parse");
         } else {
-            const GrblSettingCheckResult check =
-                CheckGrblSettingAgainstGolden(static_cast<size_t>(settings_query_index_), key, value);
+            const hutuji::GrblSettingGolden* goldens = nullptr;
+            size_t goldens_count = 0;
+            hutuji::ActiveGrblSettingGoldens(nopaper_machine_.load(), goldens, goldens_count);
+            const GrblSettingCheckResult check = CheckGrblSettingAgainstGoldenTable(
+                goldens, goldens_count, static_cast<size_t>(settings_query_index_), key, value);
             settings_line_ok_ = check.ok;
             if (!check.ok) {
                 RecordSettingsMismatch(check.key);
@@ -1037,20 +1044,25 @@ bool Pipe::HandleAuthProbeResponse(WaitResult result, int error_code) {
                 return true;
             }
             ++settings_query_index_;
-            if (static_cast<size_t>(settings_query_index_) >= kGrblSettingGoldenCount) {
+            const hutuji::GrblSettingGolden* goldens = nullptr;
+            size_t goldens_count = 0;
+            hutuji::ActiveGrblSettingGoldens(nopaper_machine_.load(), goldens, goldens_count);
+            if (static_cast<size_t>(settings_query_index_) >= goldens_count) {
                 settings_verified_.store(true);
                 ready_.store(true);
                 auth_probe_stage_ = AuthProbeStage::Complete;
-                ESP_LOGI(TAG, "Grbl 设置指纹通过（%u 项）",
-                         static_cast<unsigned>(kGrblSettingGoldenCount));
+                ESP_LOGI(TAG, "Grbl 设置指纹通过（%u 项，%s）",
+                         static_cast<unsigned>(goldens_count),
+                         nopaper_machine_.load() ? "无换纸 SKU" : "换纸机型");
                 return true;
             }
             settings_line_ok_ = false;
-            if (!SendLine(kGrblSettingGoldens[settings_query_index_].query_line)) {
+            if (!SendLine(goldens[settings_query_index_].query_line)) {
                 auth_probe_stage_ = AuthProbeStage::Failed;
                 ESP_LOGE(TAG, "设置指纹查询发送失败");
             }
             return true;
+        }
 
         default:
             return false;
@@ -1102,7 +1114,10 @@ bool Pipe::BeginSettingsFingerprintProbe() {
     ResetSettingsFingerprintState();
     auth_probe_stage_ = AuthProbeStage::WaitingSettingQuery;
     settings_line_ok_ = false;
-    if (!SendLine(kGrblSettingGoldens[0].query_line)) {
+    const hutuji::GrblSettingGolden* goldens = nullptr;
+    size_t goldens_count = 0;
+    hutuji::ActiveGrblSettingGoldens(nopaper_machine_.load(), goldens, goldens_count);
+    if (!SendLine(goldens[0].query_line)) {
         ESP_LOGE(TAG, "设置指纹首项发送失败");
         return false;
     }

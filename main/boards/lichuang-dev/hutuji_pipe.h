@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include "hutuji_recovery_core.h"
+#include "hutuji_nopaper_core.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -98,6 +99,8 @@ public:
     bool IsAuthorized() const { return authorized_.load(); }
     /** 连接后逐项 `$` 指纹比对通过才为 true；被上位机改设置时为 false。 */
     bool IsSettingsVerified() const { return settings_verified_.load(); }
+    /** 无换纸量产 SKU（Grbl build 20260910，§10.4.15）；VER 未达/换纸机 = false。 */
+    bool IsNopaperMachine() const { return nopaper_machine_.load(); }
     /** mismatch 时返回 golden key（如 `130`）；通过或未探测时为空。 */
     std::string GetSettingsMismatchKey() const;
     /**
@@ -246,6 +249,7 @@ private:
     std::atomic<bool> ready_{false};
     std::atomic<bool> authorized_{false};
     std::atomic<bool> settings_verified_{false};
+    std::atomic<bool> nopaper_machine_{false};
     AbortResetToken abort_reset_token_;
     std::atomic<bool> task_session_active_{false};
     std::atomic<bool> expect_blocking_peer_{false};

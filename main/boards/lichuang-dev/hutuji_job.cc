@@ -384,6 +384,11 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
             return "{\"error\":\"pages 第 1 页必须与 url/preview_url 一致\"}";
         }
     }
+    // §10.4.15：无换纸量产 SKU 不做多页（2026-09-10 用户拍板）——换纸机零改动。
+    // Pipe 未连时 IsNopaperMachine=false（保守按换纸机放行，由页尾推进兜底）。
+    if (hutuji::NopaperRejectsMultiPage(Pipe::GetInstance().IsNopaperMachine(), pages.size())) {
+        return std::string("{\"error\":\"") + hutuji::kNopaperMultiPageRejectMsg + "\"}";
+    }
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (busy_.exchange(true)) {
         // P1-3 同参数幂等重入：服务端链式调用在生成完成点即发，云端第二步以同
@@ -2071,7 +2076,11 @@ void Job::Run() {
         if (ok) {
             ok = ReturnHomeAfterDraw();
         }
-        if (ok) {
+        // §10.4.15：无换纸机 M30 是 no-op 且无换纸机构，换纸编排（M30 + 等换纸
+        // 完成 + 播报武装）整段跳过——画完归位即终态，用户手动取纸。
+        if (ok && hutuji::NopaperSkipsPaperChange(pipe.IsNopaperMachine())) {
+            ESP_LOGI(TAG, "无换纸 SKU：页尾换纸编排跳过（归位已完成）");
+        } else if (ok) {
             ok = ChangePaperAfterDraw();
         }
         if (abort_requested_.load()) {
@@ -2079,7 +2088,14 @@ void Job::Run() {
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("已取消");
         } else if (ok) {
-            if (!article_pages_.empty() && article_index_ + 1 < article_pages_.size()) {
+            if (!article_pages_.empty() && article_index_ + 1 < article_pages_.size() &&
+                hutuji::NopaperRejectsMultiPage(pipe.IsNopaperMachine(),
+                                                article_pages_.size())) {
+                // 提交闸时 Pipe 未连（机型未知）放行的多页任务，在此收口：
+                // 不换纸直接续页 = 第 2 页画在同一张纸上，必须拦。
+                last_error_ = hutuji::kNopaperMultiPageRejectMsg;
+                ok = false;
+            } else if (!article_pages_.empty() && article_index_ + 1 < article_pages_.size()) {
                 // 文章翻页：换纸已成功，释放本页缓冲并推进到下一页重新下载。
                 // paper_change_notified_ 逐页重武装（每页各有一次 M30 播报）；
                 // 预取只对第 1 页有效，后续页 url 不同自然 miss 回落直下载。
