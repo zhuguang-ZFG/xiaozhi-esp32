@@ -137,6 +137,10 @@ inline bool ParseFiniteMPos(const std::string& status, float& x, float& y, float
 // 配置值不进安全链）。同日先按 $$ 把 277 放 Y，实机判定后反转到 X。
 inline constexpr float kJogEnvelopeMaxXMm = 277.0f;
 inline constexpr float kJogEnvelopeMaxYMm = 190.0f;
+// 无换纸机（nopaper SKU）点动包线：镜像云端 PROFILE_NOPAPER 限幅 205/290
+// （物理 210×297 减 5mm 边，2026-09-11 §10.4.15；R17-XREPO-01 双侧同步）。
+inline constexpr float kJogEnvelopeNopaperMaxXMm = 205.0f;
+inline constexpr float kJogEnvelopeNopaperMaxYMm = 290.0f;
 /** 1mm 细步进，逐字对齐奎享实测 `$J=G21G91X1.0Y0.0Z0.0F8000.0`（R17 交叉钉）。 */
 inline constexpr float kJogStepMm = 1.0f;
 inline constexpr float kJogStepMmFine = 1.0f;
@@ -209,15 +213,32 @@ inline constexpr char kMotorDisableLine[] = "$MD";
 
 enum class JogVerdict { kOk, kStalePosition, kOutOfBounds };
 
-inline JogVerdict DecideJog(float mx, float my, float dx, float dy) {
-    if (!std::isfinite(mx) || !std::isfinite(my) || !std::isfinite(dx) || !std::isfinite(dy)) {
+/** 按机型取点动包线：nopaper → 205/290，换纸机（含 VER 未达保守档）→ 277/190。 */
+inline void MachineJogEnvelope(bool nopaper_machine, float& max_x_mm, float& max_y_mm) {
+    if (nopaper_machine) {
+        max_x_mm = kJogEnvelopeNopaperMaxXMm;
+        max_y_mm = kJogEnvelopeNopaperMaxYMm;
+    } else {
+        max_x_mm = kJogEnvelopeMaxXMm;
+        max_y_mm = kJogEnvelopeMaxYMm;
+    }
+}
+
+inline JogVerdict DecideJog(float mx, float my, float dx, float dy, float max_x_mm,
+                            float max_y_mm) {
+    if (!std::isfinite(mx) || !std::isfinite(my) || !std::isfinite(dx) || !std::isfinite(dy) ||
+        !std::isfinite(max_x_mm) || !std::isfinite(max_y_mm)) {
         return JogVerdict::kStalePosition;
     }
-    if (mx + dx < 0.0f || mx + dx > kJogEnvelopeMaxXMm || my + dy < 0.0f ||
-        my + dy > kJogEnvelopeMaxYMm) {
+    if (mx + dx < 0.0f || mx + dx > max_x_mm || my + dy < 0.0f || my + dy > max_y_mm) {
         return JogVerdict::kOutOfBounds;
     }
     return JogVerdict::kOk;
+}
+
+/** 换纸机默认档（277/190）；显式限幅重载是主机型路径，调用方须传 Pipe 探测真值。 */
+inline JogVerdict DecideJog(float mx, float my, float dx, float dy) {
+    return DecideJog(mx, my, dx, dy, kJogEnvelopeMaxXMm, kJogEnvelopeMaxYMm);
 }
 
 /**

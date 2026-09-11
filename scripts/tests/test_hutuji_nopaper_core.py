@@ -124,7 +124,7 @@ int main() {
         if (std::strcmp(table[i].response_key, "Errors/Verbose") == 0) has_verbose = true;
     }
     assert(has_verbose);
-    // 无换纸机：12 项、无长名项、数值 = c896ce5c 机头默认
+    // 无换纸机：12 项、无长名项；$110/$111 于 2026-09-11 拍板提速 12000（余项=机头默认）
     ActiveGrblSettingGoldens(true, table, count);
     assert(count == kGrblSettingGoldenNopaperCount);
     assert(count == 12);
@@ -133,7 +133,8 @@ int main() {
     }
     assert(table[0].expected == 255.0 && table[0].integer);   // $1 弹簧笔常使能
     assert(table[1].expected == 4.0 && table[1].integer);     // $3 只反 Z（bit Z=4）
-    assert(table[7].expected == 5000.0);                      // $110 机头限速
+    assert(table[7].expected == 12000.0);                     // $110 提速后限速（2026-09-11）
+    assert(table[8].expected == 12000.0);                     // $111
     assert(table[11].expected == 20.0);                       // $132 笔程
     return 0;
 }

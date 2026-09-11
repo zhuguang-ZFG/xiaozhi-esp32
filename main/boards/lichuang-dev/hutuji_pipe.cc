@@ -1031,7 +1031,7 @@ bool Pipe::HandleAuthProbeResponse(WaitResult result, int error_code) {
             }
             return true;
 
-        case AuthProbeStage::WaitingSettingQuery:
+        case AuthProbeStage::WaitingSettingQuery: {
             if (result != WaitResult::Ok) {
                 ScheduleAuthProbeRetryOrFail("设置指纹", error_code);
                 return true;
@@ -1247,7 +1247,10 @@ bool Pipe::SendAbortReset(uint32_t expected_connection_sequence, uint32_t previo
         IsResetSessionReady(expected_connection_sequence, allow_unready_reconnect);
     const bool fresh_stopped =
         HasFreshStoppedStatus(previous_status_sequence, expected_connection_sequence);
-    const bool fresh_paper = paper_status_seq_.load() != previous_paper_status_sequence;
+    // 无换纸机型永不换纸（§10.4.15），paper 新鲜度前提对它无意义且该机 Hold 态下
+    // [ESP901] 不可答——豁免 fresh_paper，否则无换纸机的错误恢复永远进不了 reset。
+    const bool fresh_paper = nopaper_machine_.load() ||
+                             paper_status_seq_.load() != previous_paper_status_sequence;
     const bool banner_unchanged = reset_banner_seq_.load() == previous_banner_sequence;
     if (!same_session || !banner_unchanged) {
         abort_reset_token_.Cancel();

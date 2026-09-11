@@ -9,6 +9,7 @@
 #include "boards/lichuang-dev/hutuji_draw_bind.h"
 #include "boards/lichuang-dev/hutuji_ble_diag.h"
 #include "boards/lichuang-dev/hutuji_ota.h"
+#include "boards/lichuang-dev/hutuji_memory.h"
 #include "boards/lichuang-dev/hutuji_conversation_report.h"
 #include "boards/lichuang-dev/hutuji_recovery_core.h"
 #include "boards/lichuang-dev/hutuji_music.h"
@@ -552,6 +553,7 @@ private:
         hutuji::ble_diag::Start();
 
         hutuji::ota::RegisterTools(mcp_server);
+        hutuji::memory::RegisterTools(mcp_server);
 
         display_->ConfigureMachineControls(
             [this]() { ScheduleMachineControl("pause", &hutuji::Job::RequestPause); },

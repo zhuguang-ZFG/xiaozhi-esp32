@@ -7,6 +7,7 @@
 #include "esp32_camera.h"
 #include "hutuji_ble_diag.h"
 #include "hutuji_ota.h"
+#include "hutuji_memory.h"
 #include "hutuji_conversation_report.h"
 #include "hutuji_job.h"
 #include "hutuji_music.h"
@@ -319,6 +320,7 @@ private:
         hutuji::ble_diag::Start();
 
         hutuji::ota::RegisterTools(mcp_server);
+        hutuji::memory::RegisterTools(mcp_server);
 
         mcp_server.AddTool(
             "hutuji.status",

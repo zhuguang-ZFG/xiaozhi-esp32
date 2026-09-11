@@ -3,6 +3,7 @@
 #include "application.h"
 #include "board.h"
 #include "display.h"
+#include "hutuji_pipe.h"
 #include "http.h"
 #include "settings.h"
 #include "system_info.h"
@@ -84,6 +85,10 @@ bool AnnounceOnce(const std::string& code, bool* bound_out) {
     cJSON_AddStringToObject(root, "mac", SystemInfo::GetMacAddress().c_str());
     cJSON_AddStringToObject(root, "bind_code", code.c_str());
     cJSON_AddStringToObject(root, "device_token", token.c_str());
+    // 机型词汇（protocol §10.4.15，2026-09-11）：绑定期把 $I VER 识别的机型
+    // 上报 portal 落库；1.0.9 之前字段不存在，portal 默认 paper。
+    cJSON_AddStringToObject(root, "plotter_sku",
+                            Pipe::GetInstance().IsNopaperMachine() ? "nopaper" : "paper");
     char* body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (body == nullptr) {
@@ -121,6 +126,19 @@ bool AnnounceOnce(const std::string& code, bool* bound_out) {
         http->Close();
     }
     return ok;
+}
+
+constexpr const char* kAutoBoundNvsNs = "hutuji";
+constexpr const char* kAutoBoundNvsKey = "auto_bound";
+
+bool IsAutoBoundRemembered() {
+    Settings s(kAutoBoundNvsNs, false);
+    return s.GetInt(kAutoBoundNvsKey, 0) != 0;
+}
+
+void RememberAutoBound() {
+    Settings s(kAutoBoundNvsNs, true);  // 须读写打开，否则 SetInt 静默跳过
+    s.SetInt(kAutoBoundNvsKey, 1);
 }
 
 bool PollConsumedOnce(const std::string& code) {
@@ -176,6 +194,7 @@ void BindWorkerTask(void* /*arg*/) {
             continue;
         }
         ESP_LOGI(kTag, "bind session consumed mac=%s", SystemInfo::GetMacAddress().c_str());
+        RememberAutoBound();
         Application::GetInstance().Schedule([]() {
             if (g_display != nullptr) {
                 g_display->ShowNotification("绑定成功", 5000);
@@ -245,6 +264,7 @@ void AutoBindWorkerTask(void* /*arg*/) {
         ++round;
     }
     if (bound) {
+        RememberAutoBound();  // 下次开机跳过无头 announce，免 TLS 抢音频
         ESP_LOGI(kTag, "auto bind matched mac=%s", SystemInfo::GetMacAddress().c_str());
         Application::GetInstance().Schedule([]() {
             if (g_display != nullptr) {
@@ -270,6 +290,13 @@ void StartAutoBindHeadless(Display* display) {
     }
     if (g_auto_worker != nullptr) {
         return;  // 本窗口已在跑：激活完成事件每次开机都到，重复调用安全
+    }
+    // 已绑定设备：开机再跑 10 分钟 announce（即便首拍 bound=true 也要付一次 TLS）
+    // 会与 AFE/TTS 抢核；NVS 记住后直接跳过（2026-09-08 用户「说话卡顿」复诉）。
+    if (IsAutoBoundRemembered()) {
+        ESP_LOGI(kTag, "auto bind skipped（NVS already bound）mac=%s",
+                 SystemInfo::GetMacAddress().c_str());
+        return;
     }
     if (display != nullptr) {
         g_display = display;

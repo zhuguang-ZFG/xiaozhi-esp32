@@ -664,6 +664,10 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
             }
         }
 
+        // 无换纸机型（§10.4.15）永不换纸：[ESP901] 在该机只有 Idle 下可答，
+        // Hold 下不消费行命令——查了必 5s 超时断连丢任务（2026-09-11 实机事故）。
+        // 无换纸机跳过纸态查询；SendAbortReset 内对无换纸机豁免 fresh_paper。
+        const bool nopaper = pipe.IsNopaperMachine();
         uint32_t paper_before = 0;
         {
             std::lock_guard<std::mutex> stream_lock(stream_mutex_);
@@ -672,15 +676,17 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
                 break;
             }
             paper_before = pipe.GetPaperStatusSequence();
-            if (!pipe.SendLine("[ESP901]")) {
+            if (!nopaper && !pipe.SendLine("[ESP901]")) {
                 break;
             }
         }
-        int paper_error = -1;
-        if (pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &paper_error) != WaitResult::Ok ||
-            pipe.GetPaperStatusSequence() == paper_before ||
-            pipe.GetPaperChangingState() != PaperChangingState::Off) {
-            break;
+        if (!nopaper) {
+            int paper_error = -1;
+            if (pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &paper_error) != WaitResult::Ok ||
+                pipe.GetPaperStatusSequence() == paper_before ||
+                pipe.GetPaperChangingState() != PaperChangingState::Off) {
+                break;
+            }
         }
         const uint32_t banner_before = pipe.GetResetBannerSequence();
         const uint32_t post_reset_status = pipe.GetStatusReportSequence();
@@ -1162,8 +1168,14 @@ std::string Job::RequestManualControl(const std::string& action) {
             if (fresh) {
                 pipe.GetMachinePos(mx, my, mz);
             }
-            const hutuji::JogVerdict verdict = fresh ? hutuji::DecideJog(mx, my, pre_dx, pre_dy)
-                                                     : hutuji::JogVerdict::kStalePosition;
+            // 机型包线（2026-09-11 §10.4.15）：nopaper 205/290，换纸机 277/190；
+            // VER 未达 → IsNopaperMachine=false 保守档（与金标表同口径）。
+            const bool nopaper_jog = pipe.IsNopaperMachine();
+            float jog_env_x = 0, jog_env_y = 0;
+            hutuji::MachineJogEnvelope(nopaper_jog, jog_env_x, jog_env_y);
+            const hutuji::JogVerdict verdict =
+                fresh ? hutuji::DecideJog(mx, my, pre_dx, pre_dy, jog_env_x, jog_env_y)
+                      : hutuji::JogVerdict::kStalePosition;
             StopPerformanceHold();
             if (verdict != hutuji::JogVerdict::kOk) {
                 busy_.store(false);
@@ -1173,7 +1185,7 @@ std::string Job::RequestManualControl(const std::string& action) {
                                       : action == "jog_y+" ? "前"
                                                            : "后";
                     const float limit =
-                        pre_dx != 0 ? hutuji::kJogEnvelopeMaxXMm : hutuji::kJogEnvelopeMaxYMm;
+                        pre_dx != 0 ? jog_env_x : jog_env_y;
                     char reason[128];
                     snprintf(reason, sizeof(reason),
                              "{\"error\":\"点动越界：当前位置 X%.1f Y%.1f，向%s走 %.0f "
@@ -1274,7 +1286,12 @@ void Job::ManualTask() {
             failed_step = "点动前未取到新鲜坐标";
         } else {
             pipe.GetMachinePos(mx, my, mz);
-            if (hutuji::DecideJog(mx, my, dx, dy) != hutuji::JogVerdict::kOk) {
+            // 纵深防御同机型包线：任务内判定与工具侧预检同源 core（2026-09-11）。
+            float task_env_x = 0, task_env_y = 0;
+            hutuji::MachineJogEnvelope(Pipe::GetInstance().IsNopaperMachine(), task_env_x,
+                                       task_env_y);
+            if (hutuji::DecideJog(mx, my, dx, dy, task_env_x, task_env_y) !=
+                hutuji::JogVerdict::kOk) {
                 ok = false;
                 failed_step = "点动越界";
             } else {
@@ -1358,8 +1375,11 @@ std::string Job::StatusJson() const {
     }
     cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());
     cJSON_AddStringToObject(root, "state", state.c_str());
-    // OTA / 板型（量产）：firmware_version 来自 app_desc；board = 编译期 BOARD_NAME
-    //（与 CMake BOARD_TYPE 默认同值，catalog key 如 freenove-esp32s3-display-2.8-lcd）。
+    cJSON_AddStringToObject(root, "board", BOARD_NAME);
+    // 机型词汇（protocol §10.4.15，2026-09-11）：$I VER build 段识别的现值；
+    // VER 未达（pipe 未连/未认证）= "paper" 保守档，与金标表口径一致。
+    cJSON_AddStringToObject(root, "plotter_sku",
+                            pipe.IsNopaperMachine() ? "nopaper" : "paper");
     // ota 对象由 SetOtaStatus / SetOtaUpdateAvailable 维护；缺省 idle。
     const esp_app_desc_t* app_desc = esp_app_get_description();
     cJSON_AddStringToObject(root, "firmware_version",
@@ -2782,20 +2802,25 @@ bool Job::RecoverDisconnectedDraw() {
             Notify("还在重连写字机，请稍候");
         }
     }
+    // 无换纸机型（§10.4.15）永不换纸：跳过 [ESP901] 查询（该机 Hold 下不消费行命令，
+    // 查了必超时丢任务），直接按 Changing=Off 走断连恢复。
+    const bool nopaper_recovery = pipe.IsNopaperMachine();
     const uint32_t paper_seq = pipe.GetPaperStatusSequence();
-    if (!pipe.SendLine("[ESP901]")) {
+    if (!nopaper_recovery && !pipe.SendLine("[ESP901]")) {
         last_error_ = "重连后查询换纸状态失败";
         return false;
     }
-    int paper_err = -1;
-    WaitResult paper_wr = pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &paper_err);
-    if (paper_wr != WaitResult::Ok || pipe.GetPaperStatusSequence() == paper_seq) {
-        last_error_ = paper_wr == WaitResult::Failed
-                          ? "重连后查询换纸状态失败 (error:" + std::to_string(paper_err) + ")"
-                          : "重连后未收到有效 Changing 状态";
-        return false;
+    if (!nopaper_recovery) {
+        int paper_err = -1;
+        WaitResult paper_wr = pipe.WaitResponse(kPaperStatusTimeoutMs, nullptr, &paper_err);
+        if (paper_wr != WaitResult::Ok || pipe.GetPaperStatusSequence() == paper_seq) {
+            last_error_ = paper_wr == WaitResult::Failed
+                              ? "重连后查询换纸状态失败 (error:" + std::to_string(paper_err) + ")"
+                              : "重连后未收到有效 Changing 状态";
+            return false;
+        }
     }
-    if (pipe.GetPaperChangingState() != PaperChangingState::Off) {
+    if (!nopaper_recovery && pipe.GetPaperChangingState() != PaperChangingState::Off) {
         last_error_ = "断连发生在换纸窗口，已停止自动恢复，请检查纸张后重画";
         Notify(last_error_);
         // R21-F08：本分支已播报，Run() 收尾的失败出口不得二次播报；状态同步前置

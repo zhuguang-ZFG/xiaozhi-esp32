@@ -200,16 +200,22 @@ bool HostAllowed(const std::string& url) {
 }
 
 bool JobIsIdleForOta() {
-    // 与 portal assert_upgrade_allowed 对齐：仅 state==idle。
+    // 与手动控制 settled 集合对齐：idle/done/error/aborted 均可升。
+    // 设计拒升面是出图/预览/换纸/upgrading；done 是终态（abort 不清），
+    // 仅认 idle 会在画完后误 busy（2026-09-09 HIL① 实证）。
     cJSON* root = cJSON_Parse(Job::GetInstance().StatusJson().c_str());
     if (root == nullptr) {
         return false;
     }
     cJSON* state = cJSON_GetObjectItem(root, "state");
-    const bool idle = cJSON_IsString(state) && state->valuestring != nullptr &&
-                      std::strcmp(state->valuestring, "idle") == 0;
+    const bool settled =
+        cJSON_IsString(state) && state->valuestring != nullptr &&
+        (std::strcmp(state->valuestring, "idle") == 0 ||
+         std::strcmp(state->valuestring, "done") == 0 ||
+         std::strcmp(state->valuestring, "error") == 0 ||
+         std::strcmp(state->valuestring, "aborted") == 0);
     cJSON_Delete(root);
-    return idle;
+    return settled;
 }
 
 std::string TodayUtcYmd() {
@@ -353,7 +359,24 @@ void RegisterTools(McpServer& mcp_server) {
             (void)sha256;  // 本批 Ota::Upgrade 无 sha 校验；门户已核包，参数仅契约对齐
 
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateUpgrading || !JobIsIdleForOta()) {
+            // 下载失败路径曾漏清 DeviceState=Upgrading；若 ota 已 failed 则先拉回 Idle 再判。
+            if (app.GetDeviceState() == kDeviceStateUpgrading) {
+                cJSON* root = cJSON_Parse(Job::GetInstance().StatusJson().c_str());
+                cJSON* ota = root ? cJSON_GetObjectItem(root, "ota") : nullptr;
+                cJSON* ota_state = ota ? cJSON_GetObjectItem(ota, "state") : nullptr;
+                const bool ota_failed =
+                    cJSON_IsString(ota_state) && ota_state->valuestring != nullptr &&
+                    std::strcmp(ota_state->valuestring, "failed") == 0;
+                if (root) {
+                    cJSON_Delete(root);
+                }
+                if (ota_failed) {
+                    app.SetDeviceState(kDeviceStateIdle);
+                } else {
+                    return MakeReasonJson("busy");
+                }
+            }
+            if (!JobIsIdleForOta()) {
                 return MakeReasonJson("busy");
             }
             if (board != BOARD_NAME) {

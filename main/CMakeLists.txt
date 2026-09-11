@@ -906,6 +906,7 @@ if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 OR CONFIG_BOARD_TYPE_Freen
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_draw_bind.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_ble_diag.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_music.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_memory.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pi_splash.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/plotter_provision.cc
     )
@@ -1164,6 +1165,13 @@ if(HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
     if(NOT HUTUJI_AUTO_TEST_DRAW)
         message(WARNING "HUTUJI_AUTO_TEST_ABORT_ON_PAPER without HUTUJI_AUTO_TEST_DRAW: paper window only opens if a draw is triggered from the cloud")
     endif()
+endif()
+
+# 故意坏包 HIL（F6）：新槽启动即 mark invalid 回滚；仅 staging 发版，禁止进量产 latest。
+option(HUTUJI_OTA_POISON_ROLLBACK "Poison OTA image: rollback immediately on boot (HIL only)" OFF)
+if(HUTUJI_OTA_POISON_ROLLBACK)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_OTA_POISON_ROLLBACK)
+    message(WARNING "HUTUJI_OTA_POISON_ROLLBACK=ON — do not ship this image")
 endif()
 
 # 2026-09-05 A/B 归因开关（fable 会诊）：ON = 日志全开对照组（HUTUJI_QUIET_STREAM_LOG=0），

@@ -3124,11 +3124,28 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
                 // 包线与步进常量逐值钉死，与云端 §5 / 奎享 `$J=` 序列同源。
                 static_assert(kJogEnvelopeMaxXMm == 277.0f, "X envelope drifted from cloud S5");
                 static_assert(kJogEnvelopeMaxYMm == 190.0f, "Y envelope drifted from cloud S5");
+                static_assert(kJogEnvelopeNopaperMaxXMm == 205.0f, "nopaper X envelope drifted from PROFILE_NOPAPER");
+                static_assert(kJogEnvelopeNopaperMaxYMm == 290.0f, "nopaper Y envelope drifted from PROFILE_NOPAPER");
                 static_assert(kJogStepMm == 1.0f, "fine jog step drifted from kx sequence");
                 static_assert(kJogStepMmFine == 1.0f, "fine step must stay 1mm");
                 static_assert(kJogStepMmCoarse == 10.0f, "coarse step must stay 10mm");
                 static_assert(kJogStepMmDefault == kJogStepMmCoarse, "default step must be 10mm");
                 assert(std::string(kMotorDisableLine) == "$MD");
+
+                // 机型显式限幅重载（2026-09-11 §10.4.15）：nopaper 包线四边 + 非有限。
+                assert(DecideJog(204.0f, 289.0f, kJogStepMm, kJogStepMm,
+                                 kJogEnvelopeNopaperMaxXMm, kJogEnvelopeNopaperMaxYMm) == JogVerdict::kOk);
+                assert(DecideJog(205.0f, 100.0f, kJogStepMm, 0.0f,
+                                 kJogEnvelopeNopaperMaxXMm, kJogEnvelopeNopaperMaxYMm) == JogVerdict::kOutOfBounds);
+                assert(DecideJog(100.0f, 290.0f, 0.0f, kJogStepMm,
+                                 kJogEnvelopeNopaperMaxXMm, kJogEnvelopeNopaperMaxYMm) == JogVerdict::kOutOfBounds);
+                assert(DecideJog(100.0f, 100.0f, nan, 0.0f,
+                                 kJogEnvelopeNopaperMaxXMm, kJogEnvelopeNopaperMaxYMm) == JogVerdict::kStalePosition);
+                float env_x = 0.0f, env_y = 0.0f;
+                MachineJogEnvelope(true, env_x, env_y);
+                assert(env_x == kJogEnvelopeNopaperMaxXMm && env_y == kJogEnvelopeNopaperMaxYMm);
+                MachineJogEnvelope(false, env_x, env_y);
+                assert(env_x == kJogEnvelopeMaxXMm && env_y == kJogEnvelopeMaxYMm);
 
                 // 10mm 默认步进：恰贴包线放行，越出拒绝。
                 assert(DecideJog(0.0f, 180.0f, 0.0f, kJogStepMmCoarse) == JogVerdict::kOk);
@@ -3208,7 +3225,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # "started"，LLM 会把拒绝播报成「已经往左挪啦」）。预检必须在任务派发前以
         # 同一 DecideJog 裁决，越界/坐标不可信以工具返回值直述失败。
         self.assertIn("点动同步预检", job_cc)
-        self.assertIn("hutuji::DecideJog(mx, my, pre_dx, pre_dy)", job_cc)
+        self.assertIn("hutuji::DecideJog(mx, my, pre_dx, pre_dy, jog_env_x, jog_env_y)", job_cc)
         self.assertIn("点动越界：当前位置", job_cc)
         self.assertIn("未能取到可信坐标，已拒绝点动", job_cc)
 
@@ -3336,7 +3353,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("StopAutoBindHeadless();", drawer)
         # 已绑定设备每次开机仍会 announce 一次（幂等、顺带刷新 token 与会话 TTL），
         # portal 回 bound:true 即停；无认领窗口结束自行退出，不得常驻。
-        self.assertIn("kAutoBindMaxAttempts", bind_cc)
+        self.assertIn("kAutoBindWindowMs", bind_cc)
         self.assertIn("g_auto_active = false;", bind_cc)
 
     def test_conversation_report_guard_covers_every_board_that_links_it(self):

@@ -1183,6 +1183,8 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
                  "Firmware upgrade failed, restarting audio service and continuing operation...");
         audio_service_.Start();                              // Restart audio service
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);  // Restore power save level
+        // 失败必须离开 Upgrading，否则 hutuji.ota_start 会永久 busy（2026-09-09 HIL② 后实证）
+        SetDeviceState(kDeviceStateIdle);
         Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "cancel",
               Lang::Sounds::OGG_EXCLAMATION);
         vTaskDelay(pdMS_TO_TICKS(3000));
