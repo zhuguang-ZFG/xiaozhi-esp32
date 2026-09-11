@@ -12,6 +12,7 @@
 #include "hutuji_job.h"
 #include "hutuji_music.h"
 #include "hutuji_pipe.h"
+#include "hutuji_kdraw_watcher.h"
 #include "i2c_device.h"
 #include "mcp_server.h"
 #include "plotter_provision.h"
@@ -318,6 +319,9 @@ private:
 
         // BLE-DIAG 阶段 A 只读诊断广播；默认关闭，未启用时是空实现。
         hutuji::ble_diag::Start();
+
+        // 奎享完成守护观察端（§9-H′ 对端）：UDP :2325 静默监听。
+        hutuji::kdraw::Start();
 
         hutuji::ota::RegisterTools(mcp_server);
         hutuji::memory::RegisterTools(mcp_server);
