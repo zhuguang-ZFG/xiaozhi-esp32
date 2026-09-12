@@ -2007,9 +2007,14 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
         ).read_text(encoding="utf-8")
         self.assertNotIn('JsonString("busy")', source)
-        # 5 处：StartDraw / RequestRepeat / RequestPenTest / RequestManualControl /
-        # RequestSpeed（2026-09-12 速度下放批新增）。
-        self.assertEqual(source.count('JsonString("写字机正忙，请稍候再试")'), 5)
+        # 旧四入口保持中文正文；速度入口须为结构化 error，不能被 portal 当成功。
+        self.assertEqual(source.count('JsonString("写字机正忙，请稍候再试")'), 4)
+        speed = source.split("std::string Job::RequestSpeed(int rate) {", 1)[1].split(
+            "void Job::SpeedTaskEntry", 1
+        )[0]
+        self.assertIn('写字机正忙，请稍候再试', speed)
+        self.assertNotIn('WaitResponse', speed)
+        self.assertIn('SpeedTaskEntry', speed)
         self.assertIn('Notify("出图完成，可以说「再来一次」直接重画")', source)
         self.assertIn('Notify("开始重画")', source)
 

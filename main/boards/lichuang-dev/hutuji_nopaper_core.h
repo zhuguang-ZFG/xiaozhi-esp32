@@ -27,7 +27,7 @@ inline constexpr const char* kNopaperGrblBuild = "20260910";
 // `$I` 应答行形如 `[VER:1.3a.20260910:]`：取第二个 '.' 后到下一个 ':' 的 build 段。
 // 非 VER 行/缺段/其他 build → false（保守：认不出 = 换纸机）。
 inline bool GrblVerLineIsNopaperSku(const std::string& line) {
-    if (line.rfind("[VER:", 0) != 0) {
+    if (line.rfind("[VER:", 0) != 0 || line.back() != ']') {
         return false;
     }
     const size_t first_dot = line.find('.');
@@ -39,6 +39,8 @@ inline bool GrblVerLineIsNopaperSku(const std::string& line) {
         return false;
     }
     const size_t end = line.find(':', second_dot + 1);
+    if (end == std::string::npos)
+        return false;
     const std::string build = line.substr(second_dot + 1, end - second_dot - 1);
     return build == kNopaperGrblBuild;
 }
@@ -64,8 +66,8 @@ inline constexpr const char* kNopaperMultiPageRejectMsg =
 // 快慢，不会撞机错位），从金表删除——探活不再校验 $110/$111，速度可经
 // Telnet/串口/hutuji.speed 工具自由调整（当前实机 16000=266mm/s），永不再
 // 触发「参数被改动」拒画。安全项（步进/行程/笔程/无限位/使能/方向）仍按金表
-// 锁死；Grbl 机头默认仍是 24000（custom_3axis_hr4988.h），`$RST=$` 恢复出厂
-// 会回 24000：不拒画，但速度回归出厂值，需按需重调。
+// 锁死。Grbl 会把参数写入 NVS，普通重启保留；`$RST=$` 回该机型编译默认。
+// 量产 massprod@6221502 与换纸分支默认不同，不能拿另一分支的 24000 代替它。
 // 刷机后须实机 $$ 校准本表（NVS 残留会盖过机头默认）。
 inline constexpr GrblSettingGolden kGrblSettingGoldensNopaper[] = {
     {"$1", "1", 255.0, true},

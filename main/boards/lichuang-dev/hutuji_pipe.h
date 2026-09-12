@@ -94,6 +94,8 @@ public:
     /** 丢弃队列内全部积压应答（连接重建 / 新任务开始时调用）。 */
     void DrainResponses();
 
+    // UDP 只读观察面使用已验证的地址；Telnet 被奎享占用时仍可用缓存。
+    uint32_t GetKnownPeerIp() const { return known_peer_ip_.load(); }
     bool IsConnected() const { return connected_.load(); }
     bool IsReady() const { return ready_.load(); }
     bool IsAuthorized() const { return authorized_.load(); }
@@ -244,6 +246,7 @@ private:
     bool BeginSettingsFingerprintProbe();
     void RecordSettingsMismatch(const std::string& key);
 
+    std::atomic<uint32_t> known_peer_ip_{0};
     std::atomic<bool> started_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> ready_{false};

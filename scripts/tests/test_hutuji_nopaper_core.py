@@ -69,6 +69,8 @@ int main() {
     assert(GrblVerLineIsNopaperSku("[VER:1.3a.20260910:custom]"));
     // 非 VER 行 / 残缺行 / 空行：保守不认
     assert(!GrblVerLineIsNopaperSku("[VER:1.3a"));
+    assert(!GrblVerLineIsNopaperSku("[VER:1.3a.20260910"));
+    assert(!GrblVerLineIsNopaperSku("[VER:1.3a.20260910]"));
     assert(!GrblVerLineIsNopaperSku("[VER:1.3a.]"));
     assert(!GrblVerLineIsNopaperSku("Grbl 1.3a ['$' for help]"));
     assert(!GrblVerLineIsNopaperSku(""));

@@ -58,11 +58,9 @@ public:
     std::string RequestManualControl(const std::string& action);
 
     /**
-     * 调整写字机空走速度（$110/$111，毫米/分钟）：2026-09-12 速度退出金表后的
-     * 云端入口（用户拍板「速度设置放小程序里，每次刷机太不方便」）。范围钳制
-     * 3000~16000：下限防 0 停转，上限为当日实机失步实证拍板值。仅 settled 态
-     * 可调；写入成功返回 {"rate":N}，不持久化（`$RST=$` 恢复出厂即回机头
-     * 默认，探活也不再校验该值）。
+     * 量产机移动速度上限（3000~16000 毫米/分钟）。立即返回 accepted/request_id，
+     * 后台核对新鲜 Idle 与同连接两轴应答，结果由 StatusJson.speed 发布。
+     * Grbl 将参数写入 NVS，重启保留，恢复出厂回该机型默认。
      */
     std::string RequestSpeed(int rate);
 
@@ -275,6 +273,16 @@ private:
     std::string state_{"idle"};
     std::string last_error_;
 
+    // 调速由 worker 持有 busy，结果在 state_mutex_ 内发布；不占主循环等网络。
+    static void SpeedTaskEntry(void* arg);
+    void RunSpeedUpdate();
+    std::atomic<bool> speed_active_{false};
+    uint32_t speed_connection_seq_ = 0;
+    uint32_t speed_request_id_ = 0;
+    int speed_requested_rate_ = 0;
+    int speed_applied_rate_ = 0;
+    std::string speed_state_{"idle"};
+    std::string speed_reason_;
     std::atomic<bool> busy_{false};
     std::atomic<bool> awaiting_confirmation_{false};
     std::atomic<bool> abort_requested_{false};

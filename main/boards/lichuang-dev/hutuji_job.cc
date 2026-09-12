@@ -1,6 +1,7 @@
 #include "hutuji_job.h"
 
 #include "hutuji_pipe.h"
+#include "hutuji_speed_core.h"
 
 #include "application.h"
 #include "assets/lang_config.h"
@@ -15,6 +16,7 @@
 #include "settings.h"
 
 #include <esp_app_desc.h>
+#include <esp_random.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <cJSON.h>
@@ -505,6 +507,9 @@ std::string Job::RequestAbort() {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (!busy_.load()) {
             return JsonString("ok");
+        }
+        if (speed_active_.load()) {
+            return "{\"error\":\"正在调整速度，请稍候查询结果\"}";
         }
         if (awaiting_confirmation_.exchange(false)) {
             ClearPreview();
@@ -1214,48 +1219,135 @@ std::string Job::RequestManualControl(const std::string& action) {
 }
 
 std::string Job::RequestSpeed(int rate) {
-    // 速度下放（2026-09-12 用户拍板）：$110/$111 已退出金表，调整不再触发
-    // 「参数被改动」拒画。范围钳制：下限防 0 停转，上限 16000 为当日实机
-    // 失步实证（400 连续丢步）上界，防把机器调坏。
-    if (rate < 3000 || rate > 16000) {
+    if (!IsMachineSpeedValid(rate)) {
         return "{\"error\":\"速度超出允许范围（3000-16000 毫米/分钟）\"}";
     }
-    auto& pipe = Pipe::GetInstance();
-    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-    if (busy_.exchange(true)) {
-        return JsonString("写字机正忙，请稍候再试");
+    // MCP 在主事件循环执行；锁忙时立刻拒绝，网络等待全部交给独立任务。
+    std::unique_lock<std::mutex> stream_lock(stream_mutex_, std::try_to_lock);
+    if (!stream_lock.owns_lock() || busy_.load()) {
+        return "{\"error\":\"写字机正忙，请稍候再试\"}";
     }
-    std::string state;
+    auto& pipe = Pipe::GetInstance();
+    if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized() ||
+        !pipe.IsSettingsVerified()) {
+        return "{\"error\":\"写字机未连接、未就绪或设置未通过检查\"}";
+    }
+    // 换纸机的 §9-G′ 仍锁住速度项，本工具仅对已移除速度金表的量产机开放。
+    if (!pipe.IsNopaperMachine()) {
+        return "{\"error\":\"当前机型不支持调整速度\"}";
+    }
+    uint32_t request_id = esp_random();
+    if (request_id == 0)
+        request_id = 1;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        state = state_;
+        if (!IsSpeedSettledState(state_)) {
+            return "{\"error\":\"当前任务状态不允许调整速度\"}";
+        }
+        speed_request_id_ = request_id;
+        speed_requested_rate_ = rate;
+        speed_state_ = "pending";
+        speed_reason_.clear();
     }
-    if (state != "idle" && state != "done" && state != "error" && state != "aborted") {
+    busy_.store(true);
+    speed_active_.store(true);
+    speed_connection_seq_ = pipe.GetConnectionSequence();
+    // 重连只验 banner，禁止探活命令的 ok 混进调速事务。
+    pipe.SetTaskSessionActive(true);
+    const BaseType_t created = xTaskCreate(SpeedTaskEntry, "hutuji_speed", 4096, this, 1, nullptr);
+    if (created != pdTRUE) {
+        pipe.SetTaskSessionActive(false);
+        speed_active_.store(false);
         busy_.store(false);
-        return "{\"error\":\"当前任务状态不允许调整速度\"}";
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        speed_state_ = "error";
+        speed_reason_ = "无法创建速度调整任务";
+        return "{\"error\":\"无法创建速度调整任务\"}";
     }
-    if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
-        busy_.store(false);
-        return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
+    char result[112];
+    snprintf(result, sizeof(result), "{\"status\":\"accepted\",\"request_id\":%lu,\"rate\":%d}",
+             static_cast<unsigned long>(request_id), rate);
+    return result;
+}
+
+void Job::SpeedTaskEntry(void* arg) {
+    static_cast<Job*>(arg)->RunSpeedUpdate();
+    vTaskDelete(nullptr);
+}
+
+void Job::RunSpeedUpdate() {
+    auto& pipe = Pipe::GetInstance();
+    int rate;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        rate = speed_requested_rate_;
     }
-    char line[32];
-    int err = -1;
-    snprintf(line, sizeof(line), "$110=%d", rate);
-    if (!pipe.SendLine(line) ||
-        pipe.WaitResponse(kSpeedWriteTimeoutMs, nullptr, &err) != WaitResult::Ok) {
-        busy_.store(false);
-        return "{\"error\":\"写入 X 轴速度失败\"}";
+    const uint32_t connection = speed_connection_seq_;
+    const auto same_session = [&]() {
+        return pipe.IsConnected() && pipe.IsReady() && pipe.IsAuthorized() &&
+               pipe.IsSettingsVerified() && pipe.IsNopaperMachine() &&
+               pipe.GetConnectionSequence() == connection;
+    };
+    std::string reason;
+    StartPerformanceHold();
+    const uint32_t before = pipe.GetStatusReportSequence();
+    bool fresh = same_session() && pipe.SendRealtime('?');
+    const TickType_t began = xTaskGetTickCount();
+    while (fresh && pipe.GetStatusReportSequence() == before) {
+        if (!same_session() ||
+            xTaskGetTickCount() - began >= pdMS_TO_TICKS(kJogFreshStateTimeoutMs)) {
+            fresh = false;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
-    snprintf(line, sizeof(line), "$111=%d", rate);
-    if (!pipe.SendLine(line) ||
-        pipe.WaitResponse(kSpeedWriteTimeoutMs, nullptr, &err) != WaitResult::Ok) {
-        busy_.store(false);
-        return "{\"error\":\"写入 Y 轴速度失败\"}";
+    if (!fresh || !same_session() || pipe.GetGrblState() != GrblState::Idle) {
+        reason = "写字机未确认空闲，未调整速度";
+    } else {
+        const SpeedWriteResult result = WriteMachineSpeed(same_session, [&](int axis) {
+            char line[32];
+            snprintf(line, sizeof(line), "$%d=%d", axis, rate);
+            if (!pipe.SendLine(line))
+                return false;
+            const TickType_t sent = xTaskGetTickCount();
+            while (same_session() &&
+                   xTaskGetTickCount() - sent < pdMS_TO_TICKS(kSpeedWriteTimeoutMs)) {
+                const WaitResult reply = pipe.WaitResponse(100);
+                if (reply == WaitResult::Ok)
+                    return true;
+                if (reply != WaitResult::Timeout)
+                    return false;
+            }
+            return false;
+        });
+        switch (result) {
+            case SpeedWriteResult::Ok:
+                break;
+            case SpeedWriteResult::SessionLost:
+                reason = "调速期间连接变化，请重新查询机器参数";
+                break;
+            case SpeedWriteResult::XFailed:
+                reason = "X 轴速度写入未确认，请重新查询机器参数";
+                break;
+            case SpeedWriteResult::YFailed:
+                reason = "X 轴已调整，Y 轴写入未确认，请重试";
+                break;
+        }
+        // 错误/超时后的迟到 ok 不能被下一次普通命令认领；仅关闭本次连接。
+        if (result != SpeedWriteResult::Ok)
+            pipe.ShutdownSocket(connection);
     }
-    busy_.store(false);
-    char msg[64];
-    snprintf(msg, sizeof(msg), "{\"rate\":%d}", rate);
-    return std::string(msg);
+    StopPerformanceHold();
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        speed_state_ = reason.empty() ? "done" : "error";
+        speed_reason_ = reason;
+        speed_applied_rate_ = reason.empty() ? rate : 0;
+    }
+    pipe.SetTaskSessionActive(false);
+    speed_active_.store(false);
+    busy_.store(false, std::memory_order_release);
 }
 
 void Job::EnsureJogStepLoaded() {
@@ -1420,6 +1512,17 @@ std::string Job::StatusJson() const {
     const std::string mismatch_key = pipe.GetSettingsMismatchKey();
     if (!pipe.IsSettingsVerified() && !mismatch_key.empty()) {
         cJSON_AddStringToObject(root, "grbl_settings_mismatch", mismatch_key.c_str());
+    }
+    cJSON* speed = cJSON_AddObjectToObject(root, "speed");
+    if (speed != nullptr) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        cJSON_AddStringToObject(speed, "state", speed_state_.c_str());
+        cJSON_AddNumberToObject(speed, "request_id", speed_request_id_);
+        cJSON_AddNumberToObject(speed, "requested_rate", speed_requested_rate_);
+        if (speed_applied_rate_ > 0)
+            cJSON_AddNumberToObject(speed, "rate", speed_applied_rate_);
+        if (!speed_reason_.empty())
+            cJSON_AddStringToObject(speed, "reason", speed_reason_.c_str());
     }
     cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());
     cJSON_AddStringToObject(root, "state", state.c_str());

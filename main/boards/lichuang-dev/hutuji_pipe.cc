@@ -98,6 +98,7 @@ void Pipe::Start() {
         return;
     }
 
+    known_peer_ip_.store(LoadCachedIp());
     // 应答队列取代原 EventGroup 单 bit：窗口化流控必须知道「收到了几个 ok」，
     // EventGroup 会把连续到达的多个 ok 合并成一个 bit，在途计数会永久漂移。
     resp_queue_ = xQueueCreate(kRespQueueDepth, sizeof(RespItem));
@@ -427,6 +428,7 @@ bool Pipe::ConnectOnce() {
             } else {
                 ESP_LOGW(TAG, "缓存 IP %s 验证失败（非写字机），清除缓存并回落扫描", resolved_ip_);
                 last_discover_miss_ = DiscoverMiss::CacheNotGrbl;
+                known_peer_ip_.store(0);
                 cached_suspect = true;
                 cached_slot_busy_count_ = 0;
                 close(sock_);
@@ -500,10 +502,12 @@ bool Pipe::ConnectOnce() {
     // 或写字机被 DHCP 改号）才写。
     struct sockaddr_in peer = {};
     socklen_t plen = sizeof(peer);
-    if (getpeername(sock_, reinterpret_cast<struct sockaddr*>(&peer), &plen) == 0 &&
-        peer.sin_addr.s_addr != cached_ip) {
-        SaveCachedIp(peer.sin_addr.s_addr);
-        ESP_LOGI(TAG, "写字机 IP 已缓存到 NVS");
+    if (getpeername(sock_, reinterpret_cast<struct sockaddr*>(&peer), &plen) == 0) {
+        known_peer_ip_.store(peer.sin_addr.s_addr);
+        if (peer.sin_addr.s_addr != cached_ip) {
+            SaveCachedIp(peer.sin_addr.s_addr);
+            ESP_LOGI(TAG, "写字机 IP 已缓存到 NVS");
+        }
     }
 
     // 每条 G-code 都是小包；关闭 Nagle，避免 Z5 已执行并在 `$1=25ms` 后失能，
