@@ -17,6 +17,9 @@ public:
     static esp_err_t PrintTaskCpuUsage(TickType_t xTicksToWait);
     static void PrintTaskList();
     static void PrintHeapStats();
+    // 取证（2026-09-06）：八路堆指标随取随打，phase 标记调用点（tick/preview/download 出入口）。
+    static void LogHeapNow(const char* phase);
+
     static void PrintPmLocks();
 };
 

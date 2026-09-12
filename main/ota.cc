@@ -17,10 +17,11 @@
 #include <esp_hmac.h>
 #endif
 
-#include <cstring>
-#include <vector>
-#include <sstream>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <sstream>
+#include <vector>
 
 #define TAG "Ota"
 
@@ -183,6 +184,23 @@ esp_err_t Ota::CheckVersion() {
         has_websocket_config_ = true;
     } else {
         ESP_LOGI(TAG, "No websocket section found!");
+    }
+
+    cJSON* messaging = cJSON_GetObjectItem(root, "messaging");
+    if (cJSON_IsObject(messaging)) {
+        Settings msg_settings("messaging", true);
+        cJSON* item = NULL;
+        cJSON_ArrayForEach(item, messaging) {
+            if (cJSON_IsString(item)) {
+                if (msg_settings.GetString(item->string) != item->valuestring) {
+                    msg_settings.SetString(item->string, item->valuestring);
+                }
+            } else if (cJSON_IsNumber(item)) {
+                if (msg_settings.GetInt(item->string) != item->valueint) {
+                    msg_settings.SetInt(item->string, item->valueint);
+                }
+            }
+        }
     }
 
     has_server_time_ = false;
@@ -392,14 +410,26 @@ bool Ota::StartUpgrade(std::function<void(int progress, size_t speed)> callback)
 
 
 std::vector<int> Ota::ParseVersion(const std::string& version) {
+    // hutuji.1.0.0：跳过非纯数字段（如 "hutuji"），只比较 1.0.0。
     std::vector<int> versionNumbers;
     std::stringstream ss(version);
     std::string segment;
-    
     while (std::getline(ss, segment, '.')) {
-        versionNumbers.push_back(std::stoi(segment));
+        if (segment.empty()) {
+            continue;
+        }
+        bool all_digit = std::all_of(segment.begin(), segment.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        });
+        if (!all_digit) {
+            continue;  // 跳过 "hutuji" 等前缀/标签
+        }
+        try {
+            versionNumbers.push_back(std::stoi(segment));
+        } catch (...) {
+            continue;
+        }
     }
-    
     return versionNumbers;
 }
 

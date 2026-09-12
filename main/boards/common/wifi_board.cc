@@ -37,12 +37,26 @@ WifiBoard::WifiBoard() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&timer_args, &connect_timer_);
+
+    // 配网模式 5 分钟无操作自动退出计时器（一次性；进入配网时武装）
+    esp_timer_create_args_t idle_args = {
+        .callback = OnConfigModeIdleTimeout,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "wifi_cfg_idle_timer",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&idle_args, &config_mode_idle_timer_);
 }
 
 WifiBoard::~WifiBoard() {
     if (connect_timer_) {
         esp_timer_stop(connect_timer_);
         esp_timer_delete(connect_timer_);
+    }
+    if (config_mode_idle_timer_) {
+        esp_timer_stop(config_mode_idle_timer_);
+        esp_timer_delete(config_mode_idle_timer_);
     }
 }
 
@@ -117,6 +131,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::Connected:
             // Stop timeout timer
             esp_timer_stop(connect_timer_);
+            if (config_mode_idle_timer_) {
+                esp_timer_stop(config_mode_idle_timer_);
+            }
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
             // make sure blufi resources has been released
             Blufi::GetInstance().deinit();
@@ -140,6 +157,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::WifiConfigModeExit:
             ESP_LOGI(TAG, "WiFi config mode exited");
             in_config_mode_ = false;
+            if (config_mode_idle_timer_) {
+                esp_timer_stop(config_mode_idle_timer_);
+            }
             // Try to connect with the new credentials
             TryWifiConnect();
             break;
@@ -165,8 +185,32 @@ void WifiBoard::OnWifiConnectTimeout(void* arg) {
     board->StartWifiConfigMode();
 }
 
+void WifiBoard::OnConfigModeIdleTimeout(void* arg) {
+    auto* board = static_cast<WifiBoard*>(arg);
+    if (!board->in_config_mode_) {
+        return;
+    }
+    const bool have_ssid = !SsidManager::GetInstance().GetSsidList().empty();
+    if (!have_ssid) {
+        // 无凭据：退出会立刻弹回配网（QR 闪一下又回来），改为重新武装即可
+        if (board->config_mode_idle_timer_) {
+            esp_timer_start_once(board->config_mode_idle_timer_, 300ULL * 1000000ULL);
+        }
+        return;
+    }
+    ESP_LOGW(TAG, "WiFi config mode idle 5min, auto-exiting to reconnect home network");
+    // StopConfigAp 回调是同步的、无凭据路径内部有 vTaskDelay，必须离开 timer task 上下文
+    Application::GetInstance().Schedule(
+        []() { WifiManager::GetInstance().StopConfigAp(); });
+}
+
 void WifiBoard::StartWifiConfigMode() {
     in_config_mode_ = true;
+    // 配网 5 分钟无操作自动退出（聋哑保护）：进入时武装，退出/连上时解除
+    if (config_mode_idle_timer_) {
+        esp_timer_stop(config_mode_idle_timer_);
+        esp_timer_start_once(config_mode_idle_timer_, 300ULL * 1000000ULL);
+    }
     // Transition to wifi configuring state
     Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);
 #ifdef CONFIG_USE_HOTSPOT_WIFI_PROVISIONING
@@ -205,8 +249,21 @@ void WifiBoard::StartWifiConfigMode() {
 #endif
 }
 
+#if CONFIG_HUTUJI_KAWAII_FACE
+#include "lcd_display.h"
+#endif
+
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
+#if CONFIG_HUTUJI_KAWAII_FACE
+    // 配网换屏与 kawaii 脸动画定时器竞态防线（2026-09-08 19:13 freenove 实机
+    // Guru Meditation：会话中二次进配网，lv_font_get_glyph_dsc 沿 fallback 链
+    // 调用空函数指针 PC=0x0——boot 进配网连续 4 次正常，差异就在脸动画在跑）。
+    // 进配网先冻结全脸动画；恢复由 HandleActivationDoneEvent 统一完成。
+    if (auto* lcd = dynamic_cast<LcdDisplay*>(GetDisplay())) {
+        lcd->SetGrobotEyesPaused(true);
+    }
+#endif
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 
     auto& app = Application::GetInstance();

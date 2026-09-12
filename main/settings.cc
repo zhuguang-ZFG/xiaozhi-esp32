@@ -59,6 +59,14 @@ int32_t Settings::GetInt(const std::string& key, int32_t default_value) {
 }
 
 void Settings::SetInt(const std::string& key, int32_t value) {
+    if (nvs_handle_ == 0) {
+        // nvs_open 失败（flash 满/坏块）时句柄为 0：nvs_set_i32(0, ...) 返回
+        // ESP_ERR_NVS_INVALID_HANDLE，ESP_ERROR_CHECK 直接 abort。getter 早有
+        // 同样守卫；布局记忆这类路径不得因 flash 故障白屏重启（2026-08-20
+        // 复审 P2-1），写入降级为告警跳过。
+        ESP_LOGW(TAG, "Namespace %s open failed, skip SetInt %s", ns_.c_str(), key.c_str());
+        return;
+    }
     if (read_write_) {
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle_, key.c_str(), value));
         dirty_ = true;

@@ -4,6 +4,32 @@
 #include "audio_codec.h"
 #include "board.h"
 #include "display.h"
+// hutuji 编译面：waveshare 3.5 与 lichuang-dev 两块板都链入
+// boards/lichuang-dev/hutuji_*.cc（前者显式列入 CMake，后者经板级 glob），
+// 故会话上报的头与调用点必须同条件守卫；其余板型两者都不编。
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+#define HUTUJI_CONVERSATION_REPORT_ENABLED 1
+#endif
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3) ||                  \
+    defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+#define HUTUJI_AUTO_BIND_ENABLED 1
+#include "boards/lichuang-dev/hutuji_activation_relay.h"
+#include "boards/lichuang-dev/hutuji_draw_bind.h"
+#endif
+#if defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3) ||           \
+    defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+#include "boards/lichuang-dev/hutuji_ota.h"
+#endif
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
+#include "boards/lichuang-dev/hutuji_conversation_report.h"
+#endif
+#if CONFIG_HUTUJI_KAWAII_FACE
+#include "lcd_display.h"
+#endif
+
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -265,9 +291,20 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
+
+#if defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3) ||           \
+    defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+            // 小派量产 OTA：每天 idle+WiFi 只查 latest.json，不自动升级。
+            // 每 60s 调一次即可；MaybeDailyCheck 内部按日历日与 inflight 再早退。
+            if (clock_ticks_ % 60 == 0) {
+                hutuji::ota::MaybeDailyCheck();
+            }
+#endif
         }
     }
 }
@@ -284,7 +321,10 @@ void Application::HandleNetworkConnectedEvent() {
             return;
         }
 
-        xTaskCreate(
+        // 2026-09-06 实机事故：内部堆碎片（largest <8KB）时 xTaskCreate 静默失败，
+        // 设备永久停在 activating（无 OTA/模型/协议任何日志），用户视角「机启中」定格。
+        // 必须检查返回值并大声报错（附带堆八字段定位碎片化程度）。
+        BaseType_t created = xTaskCreate(
             [](void* arg) {
                 Application* app = static_cast<Application*>(arg);
                 app->ActivationTask();
@@ -292,6 +332,10 @@ void Application::HandleNetworkConnectedEvent() {
                 vTaskDelete(NULL);
             },
             "activation", 4096 * 2, this, 2, &activation_task_handle_);
+        if (created != pdPASS) {
+            ESP_LOGE(TAG, "activation 任务创建失败（内部堆不足/碎片化）");
+            SystemInfo::LogHeapNow("activation-task-fail");
+        }
     }
 
     // Update the status bar immediately to show the network state
@@ -335,6 +379,19 @@ void Application::HandleActivationDoneEvent() {
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     });
+#ifdef HUTUJI_AUTO_BIND_ENABLED
+    // 一次扫码合一流程（2026-09-08 定案）：激活完成事件每次开机都到这里，
+    // 无头 announce 一轮窗口；portal 已有该 MAC 的配网认领即自动完成绑定。
+    // 尽力而为，失败只记日志，绝不影响正常启动；抽屉输码降级路径保留。
+    hutuji::StartAutoBindHeadless(display);
+#endif
+#if CONFIG_HUTUJI_KAWAII_FACE
+    // 与 EnterWifiConfigMode 的暂停配对：激活完成（配网收口/重连成功）恢复全脸动画。
+    // 暂停 API 对未激活的脸是幂等空操作，正常开机路径调用无害。
+    if (auto* lcd = dynamic_cast<LcdDisplay*>(display)) {
+        lcd->SetGrobotEyesPaused(false);
+    }
+#endif
 }
 
 void Application::ActivationTask() {
@@ -472,6 +529,16 @@ void Application::CheckNewVersion() {
         // Activation code is shown to the user and waiting for the user to input
         if (ota_->HasActivationCode()) {
             ShowActivationCode(ota_->GetActivationCode(), ota_->GetActivationMessage());
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+            // 京东云中转（2026-08-20 用户决策，唯一干净注入点：激活码只在
+            // Application/Ota 内部可见）：把激活码上报给自建服务代绑控制台，
+            // 用户联网后无感完成绑定；尽力而为，失败不影响屏显输码兜底。
+            // 2026-09-08 扩到 freenove-2.8：用户实测新板激活码不会自动写入控制台，
+            // 根因是原编译闸只圈 waveshare-3.5。仅限这两板编译面生效，其余板型
+            // 上游行为不变。
+            hutuji::ReportActivationCode(ota_->GetActivationCode());
+#endif
         }
 
         // This will block the loop until the activation is done or timeout
@@ -576,10 +643,16 @@ void Application::InitializeProtocol() {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
+                    Schedule([this, display, message = std::string(text->valuestring),
                               glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
+                        if (protocol_) {
+                            hutuji::ReportConversationTurn(
+                                "assistant", message.c_str(), protocol_->session_id());
+                        }
+#endif
                     });
                 }
             }
@@ -592,10 +665,16 @@ void Application::InitializeProtocol() {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
+                Schedule([this, display, message = std::string(text->valuestring),
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
+#ifdef HUTUJI_CONVERSATION_REPORT_ENABLED
+                    if (protocol_) {
+                        hutuji::ReportConversationTurn("user", message.c_str(),
+                                                       protocol_->session_id());
+                    }
+#endif
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
@@ -734,10 +813,32 @@ void Application::HandleToggleChatEvent() {
         }
         SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
+        // Toggle is the on-screen talk button. Abort and clear buffered TTS before
+        // entering listening, otherwise auto mode waits for playback to drain.
         AbortSpeaking(kAbortReasonNone);
+        audio_service_.ResetDecoder();
+        ListeningMode mode = GetDefaultListeningMode();
+        if (!protocol_->IsAudioChannelOpened()) {
+            // 2026-08-22 HIL：通道已被上一轮关闭时直接进监听会无 UDP 上行，
+            // 编码队列永远满丢帧、服务器收不到音频（用户感知「卡死」）。重开。
+            // 状态机无 speaking→connecting 合法边，经 idle 中转（两步皆合法边）。
+            SetDeviceState(kDeviceStateIdle);
+            SetDeviceState(kDeviceStateConnecting);
+            Schedule([this, mode]() { ContinueOpenAudioChannel(mode); });
+            return;
+        }
+        SetListeningMode(mode);
     } else if (state == kDeviceStateListening) {
         protocol_->CloseAudioChannel();
     }
+}
+
+bool Application::IsAudioChannelOpened() const {
+    return protocol_ && protocol_->IsAudioChannelOpened();
+}
+
+bool Application::IsPlaybackIdle() {
+    return audio_service_.IsPlaybackIdle();
 }
 
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
@@ -953,8 +1054,14 @@ void Application::HandleStateChangedEvent() {
 
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
+#if CONFIG_USE_CUSTOM_WAKE_WORD
+                // MultiNet 唤醒词会从扬声器回灌误触发（如 TTS 说「小派」），
+                // 直接 AbortSpeaking 造成「说着说着没声」。speaking 期关检测。
+                audio_service_.EnableWakeWordDetection(false);
+#else
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#endif
             }
             audio_service_.ResetDecoder();
             break;
@@ -1077,6 +1184,8 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
                  "Firmware upgrade failed, restarting audio service and continuing operation...");
         audio_service_.Start();                              // Restart audio service
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);  // Restore power save level
+        // 失败必须离开 Upgrading，否则 hutuji.ota_start 会永久 busy（2026-09-09 HIL② 后实证）
+        SetDeviceState(kDeviceStateIdle);
         Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "cancel",
               Lang::Sounds::OGG_EXCLAMATION);
         vTaskDelay(pdMS_TO_TICKS(3000));

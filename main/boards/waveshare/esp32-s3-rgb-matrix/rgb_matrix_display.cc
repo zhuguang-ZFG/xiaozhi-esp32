@@ -309,7 +309,7 @@ void CustomMatrixDisplay::SetupUI() {
     lv_obj_set_style_text_color(message_label_, lv_color_white(), 0);
     lv_obj_set_style_text_font(message_label_, &font_noto_sans_basic_14_1, 0);
     lv_obj_align(message_label_, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_label_set_text(message_label_, "hi 小智");
+    lv_label_set_text(message_label_, "hi 小派");
 
     // Emoji 图片：SetEmotion 使用
     emoji_image_ = lv_image_create(main_container_);

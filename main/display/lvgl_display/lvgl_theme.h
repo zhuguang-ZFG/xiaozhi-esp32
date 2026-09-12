@@ -26,6 +26,13 @@ public:
     inline lv_color_t system_text_color() const { return system_text_color_; }
     inline lv_color_t border_color() const { return border_color_; }
     inline lv_color_t low_battery_color() const { return low_battery_color_; }
+    inline lv_color_t surface_color() const { return surface_color_; }
+    inline lv_color_t muted_text_color() const { return muted_text_color_; }
+    inline lv_color_t accent_color() const { return accent_color_; }
+    inline lv_color_t accent_text_color() const { return accent_text_color_; }
+    inline lv_color_t success_color() const { return success_color_; }
+    inline lv_color_t warning_color() const { return warning_color_; }
+    inline lv_color_t danger_color() const { return danger_color_; }
     inline std::shared_ptr<LvglImage> background_image() const { return background_image_; }
     inline std::shared_ptr<EmojiCollection> emoji_collection() const { return emoji_collection_; }
     inline std::shared_ptr<LvglFont> text_font() const { return text_font_; }
@@ -49,6 +56,13 @@ public:
     inline void set_system_text_color(lv_color_t system_text) { system_text_color_ = system_text; }
     inline void set_border_color(lv_color_t border) { border_color_ = border; }
     inline void set_low_battery_color(lv_color_t low_battery) { low_battery_color_ = low_battery; }
+    inline void set_surface_color(lv_color_t surface) { surface_color_ = surface; }
+    inline void set_muted_text_color(lv_color_t muted_text) { muted_text_color_ = muted_text; }
+    inline void set_accent_color(lv_color_t accent) { accent_color_ = accent; }
+    inline void set_accent_text_color(lv_color_t accent_text) { accent_text_color_ = accent_text; }
+    inline void set_success_color(lv_color_t success) { success_color_ = success; }
+    inline void set_warning_color(lv_color_t warning) { warning_color_ = warning; }
+    inline void set_danger_color(lv_color_t danger) { danger_color_ = danger; }
     inline void set_background_image(std::shared_ptr<LvglImage> background_image) {
         background_image_ = background_image;
     }
@@ -75,6 +89,13 @@ private:
     lv_color_t system_text_color_;
     lv_color_t border_color_;
     lv_color_t low_battery_color_;
+    lv_color_t surface_color_;
+    lv_color_t muted_text_color_;
+    lv_color_t accent_color_;
+    lv_color_t accent_text_color_;
+    lv_color_t success_color_;
+    lv_color_t warning_color_;
+    lv_color_t danger_color_;
 
     // Background image
     std::shared_ptr<LvglImage> background_image_ = nullptr;
