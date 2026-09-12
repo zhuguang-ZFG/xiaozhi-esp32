@@ -1020,6 +1020,8 @@ inline bool ParsePaperStatusFields(const std::string& line, PaperPresentState& p
 /**
  * Grbl `$` 设置指纹（2026-08-29 实机 COM13 `$$` 只读取证 + protocol §6）。
  * 奎享/WebUI 可改写 NVS 持久化设置，小派须 fail-closed 拒画并上报 mismatch。
+ * 2026-09-12 提速批：$110/$111 金标 12000→24000（F24000=400mm/s），须与
+ * Grbl_Esp32 机头默认同窗刷机（G′ 锁拒写，须固件重建 + $RST=$ 装载）。
  */
 struct GrblSettingGolden {
     const char* query_line;    // 发往 Grbl 的行（SendLine 自动补 \\n）
@@ -1036,8 +1038,8 @@ inline constexpr GrblSettingGolden kGrblSettingGoldens[] = {
     {"$22", "22", 0.0, true},
     {"$100", "100", 100.0, false},
     {"$101", "101", 100.0, false},
-    {"$110", "110", 12000.0, false},
-    {"$111", "111", 12000.0, false},
+    {"$110", "110", 24000.0, false},
+    {"$111", "111", 24000.0, false},
     {"$130", "130", 210.0, false},
     {"$131", "131", 297.0, false},
     {"$132", "132", 200.0, false},
