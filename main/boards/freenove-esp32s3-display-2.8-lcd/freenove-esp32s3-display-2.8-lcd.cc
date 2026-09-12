@@ -376,6 +376,18 @@ private:
                 return hutuji::Job::GetInstance().RequestManualControl(action);
             });
 
+        mcp_server.AddTool(
+            "hutuji.speed",
+            "调整写字机移动速度上限（毫米/分钟，3000-16000）：画图和空走都受这个"
+            "上限限制，数值越大笔移动越快。调整立即写进机器，写字机重启后失效。"
+            "用户说「写字机速度调到 8000」「速度快一点/慢一点」时用；"
+            "写字机在画图时无法调整。",
+            PropertyList({Property("rate", kPropertyTypeInteger)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestSpeed(
+                    properties["rate"].value<int>());
+            });
+
         // 唱歌与绘图完全解耦：只走 AudioService 播放泵，不碰写字机管道。
         // 工具描述与 lichuang_dev_board 保持逐字一致，避免双板行为漂移。
         mcp_server.AddTool(

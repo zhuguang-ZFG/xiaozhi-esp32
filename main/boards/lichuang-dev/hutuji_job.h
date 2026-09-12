@@ -57,6 +57,15 @@ public:
      */
     std::string RequestManualControl(const std::string& action);
 
+    /**
+     * 调整写字机空走速度（$110/$111，毫米/分钟）：2026-09-12 速度退出金表后的
+     * 云端入口（用户拍板「速度设置放小程序里，每次刷机太不方便」）。范围钳制
+     * 3000~16000：下限防 0 停转，上限为当日实机失步实证拍板值。仅 settled 态
+     * 可调；写入成功返回 {"rate":N}，不持久化（`$RST=$` 恢复出厂即回机头
+     * 默认，探活也不再校验该值）。
+     */
+    std::string RequestSpeed(int rate);
+
     /** 当前点动步进（1 或 10mm，默认 10）。 */
     float GetJogStepMm();
 

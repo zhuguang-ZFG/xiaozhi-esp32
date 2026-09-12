@@ -2007,8 +2007,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
         ).read_text(encoding="utf-8")
         self.assertNotIn('JsonString("busy")', source)
-        # 4 处：StartDraw / RequestRepeat / RequestPenTest / RequestManualControl。
-        self.assertEqual(source.count('JsonString("写字机正忙，请稍候再试")'), 4)
+        # 5 处：StartDraw / RequestRepeat / RequestPenTest / RequestManualControl /
+        # RequestSpeed（2026-09-12 速度下放批新增）。
+        self.assertEqual(source.count('JsonString("写字机正忙，请稍候再试")'), 5)
         self.assertIn('Notify("出图完成，可以说「再来一次」直接重画")', source)
         self.assertIn('Notify("开始重画")', source)
 

@@ -109,6 +109,9 @@ constexpr uint32_t kOkFallbackIdleTimeoutMs = 2000;
 // 假失败「点动前未取到新鲜坐标」。6s 覆盖实测最坏 3.2s 仍有裕量；越界判定与
 // 限幅不变，超时依旧 fail closed（宁可拒动，不拿旧坐标放行运动）。
 constexpr uint32_t kJogFreshStateTimeoutMs = 6000;
+// hutuji.speed 写 $110/$111 的 ok 预算：Idle 下 `$` 命令是毫秒级应答，5s 足够；
+// 上限卡住换纸窗口误伤场景（settled 闸已拒换纸期，这里只是兜底）。
+constexpr uint32_t kSpeedWriteTimeoutMs = 5000;
 // 兜底次数上限。Telnet 偶发吃 ok 每页最多出现个别次；真丢行/真卡死必须暴露成
 // 失败，不能被兜底无限掩盖。
 constexpr int kMaxOkFallback = 3;
@@ -1208,6 +1211,51 @@ std::string Job::RequestManualControl(const std::string& action) {
         return "{\"error\":\"无法创建手动控制任务\"}";
     }
     return JsonString("started");
+}
+
+std::string Job::RequestSpeed(int rate) {
+    // 速度下放（2026-09-12 用户拍板）：$110/$111 已退出金表，调整不再触发
+    // 「参数被改动」拒画。范围钳制：下限防 0 停转，上限 16000 为当日实机
+    // 失步实证（400 连续丢步）上界，防把机器调坏。
+    if (rate < 3000 || rate > 16000) {
+        return "{\"error\":\"速度超出允许范围（3000-16000 毫米/分钟）\"}";
+    }
+    auto& pipe = Pipe::GetInstance();
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    if (busy_.exchange(true)) {
+        return JsonString("写字机正忙，请稍候再试");
+    }
+    std::string state;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state = state_;
+    }
+    if (state != "idle" && state != "done" && state != "error" && state != "aborted") {
+        busy_.store(false);
+        return "{\"error\":\"当前任务状态不允许调整速度\"}";
+    }
+    if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
+        busy_.store(false);
+        return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
+    }
+    char line[32];
+    int err = -1;
+    snprintf(line, sizeof(line), "$110=%d", rate);
+    if (!pipe.SendLine(line) ||
+        pipe.WaitResponse(kSpeedWriteTimeoutMs, nullptr, &err) != WaitResult::Ok) {
+        busy_.store(false);
+        return "{\"error\":\"写入 X 轴速度失败\"}";
+    }
+    snprintf(line, sizeof(line), "$111=%d", rate);
+    if (!pipe.SendLine(line) ||
+        pipe.WaitResponse(kSpeedWriteTimeoutMs, nullptr, &err) != WaitResult::Ok) {
+        busy_.store(false);
+        return "{\"error\":\"写入 Y 轴速度失败\"}";
+    }
+    busy_.store(false);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "{\"rate\":%d}", rate);
+    return std::string(msg);
 }
 
 void Job::EnsureJogStepLoaded() {

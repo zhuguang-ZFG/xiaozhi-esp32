@@ -124,18 +124,24 @@ int main() {
         if (std::strcmp(table[i].response_key, "Errors/Verbose") == 0) has_verbose = true;
     }
     assert(has_verbose);
-    // 无换纸机：12 项、无长名项；$110/$111 09-11 拍板 12000，2026-09-12 提速批再上 24000（余项=机头默认）
+    // 无换纸机：10 项、无长名项；$110/$111 速度项已从金表删除（2026-09-12
+    // 金表瘦身：速度下放为 hutuji.speed 工具自由调整，探活只锁安全项，
+    // 速度任意值不再触发 grbl_settings_mismatch 拒画）。
     ActiveGrblSettingGoldens(true, table, count);
     assert(count == kGrblSettingGoldenNopaperCount);
-    assert(count == 12);
+    assert(count == 10);
     for (size_t i = 0; i < count; ++i) {
         assert(std::strcmp(table[i].response_key, "Errors/Verbose") != 0);
     }
     assert(table[0].expected == 255.0 && table[0].integer);   // $1 弹簧笔常使能
     assert(table[1].expected == 4.0 && table[1].integer);     // $3 只反 Z（bit Z=4）
-    assert(table[7].expected == 24000.0);                     // $110 提速后限速（2026-09-12）
-    assert(table[8].expected == 24000.0);                     // $111
-    assert(table[11].expected == 20.0);                       // $132 笔程
+    assert(table[7].expected == 200.0);                       // $130 行程
+    assert(table[8].expected == 200.0);                       // $131 行程
+    assert(table[9].expected == 20.0);                        // $132 笔程
+    for (size_t i = 0; i < count; ++i) {
+        assert(std::strcmp(table[i].response_key, "110") != 0 &&
+               std::strcmp(table[i].response_key, "111") != 0);  // 速度项不得回流
+    }
     return 0;
 }
 ''', "nopaper_goldens")
