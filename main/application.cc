@@ -12,6 +12,7 @@
 #define HUTUJI_CONVERSATION_REPORT_ENABLED 1
 #endif
 #if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5) || \
+    defined(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3) ||                  \
     defined(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
 #define HUTUJI_AUTO_BIND_ENABLED 1
 #include "boards/lichuang-dev/hutuji_activation_relay.h"

@@ -3346,15 +3346,16 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         )
         self.assertIn("void StartAutoBindHeadless(Display* display)", bind_cc)
         self.assertIn("void StopAutoBindHeadless()", bind_cc)
-        # portal 2026-09-08 起在 announce 响应回 bound；解析不到（老 portal）即 false。
-        self.assertIn('cJSON_IsTrue(cJSON_GetObjectItem(resp, "bound"))', bind_cc)
-        # 抽屉流接管时必须停无头 worker，避免双 announce 通道抢会话。
-        drawer = bind_cc[bind_cc.index("void StartDrawBind(Display* display)"):]
-        self.assertIn("StopAutoBindHeadless();", drawer)
-        # 已绑定设备每次开机仍会 announce 一次（幂等、顺带刷新 token 与会话 TTL），
-        # portal 回 bound:true 即停；无认领窗口结束自行退出，不得常驻。
-        self.assertIn("kAutoBindWindowMs", bind_cc)
-        self.assertIn("g_auto_active = false;", bind_cc)
+        # v2 先取得随机挑战再签名；完成确认来自签名 announce 同一个会话。
+        self.assertIn('cJSON_GetObjectItem(json, "bound")', bind_cc)
+        self.assertIn("SignBindIdentity(session, challenge", bind_cc)
+        self.assertIn("LoadBindIdentitySession(session)", bind_cc)
+        # 手动与无头共用唯一 worker；取消/切网通过通知唤醒，旧代次不能清除新会话。
+        self.assertEqual(bind_cc.count("xTaskCreate("), 1)
+        self.assertIn("xTaskNotifyGive(g_worker)", bind_cc)
+        self.assertIn("FinishBindIdentitySession(g_run.session.nonce)", bind_cc)
+        self.assertIn("g_run.Current(generation)", bind_cc)
+        self.assertIn("esp_timer_get_time() >= deadline", bind_cc)
 
     def test_conversation_report_guard_covers_every_board_that_links_it(self):
         """会话上报的头/调用点守卫必须与 hutuji_conversation_report.cc 的编译面等价。

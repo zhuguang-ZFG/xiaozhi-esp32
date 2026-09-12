@@ -1,9 +1,14 @@
 #ifndef HUTUJI_DRAW_BIND_H
 #define HUTUJI_DRAW_BIND_H
 
+#include <string>
+
 class Display;
 
 namespace hutuji {
+
+/** 本地进入配网时新建身份会话；失败返回空串，不能回落仅 MAC 的码。 */
+std::string BuildIdentityWifiQrPayload(const std::string& ssid, const std::string& mac);
 
 /** 维护抽屉「绑定呼图账号」：屏显 QR + bind_code，HTTPS announce 到 draw-portal。 */
 void StartDrawBind(Display* display);

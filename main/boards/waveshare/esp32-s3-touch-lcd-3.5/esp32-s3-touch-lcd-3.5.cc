@@ -744,13 +744,23 @@ private:
         WifiBoard::SetNetworkEventCallback(
             [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
                 if (event == NetworkEvent::WifiConfigModeEnter) {
+                    // BuildOpenHotspotWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress())
+                    // 配网二维码在 NetworkEvent::Connected 之前显示；此顺序是回连体验契约。
                     StopWifiLostWatchdog();
                     const std::string ap_ssid = WifiManager::GetInstance().GetApSsid();
-                    display_->ShowProvisioningQr(
-                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress()),
-                        "Scan: " + ap_ssid + "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
+                    const std::string qr =
+                        hutuji::BuildIdentityWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress());
+                    if (qr.empty()) {
+                        display_->HideProvisioningQr();
+                        display_->ShowNotification("配网身份暂不可用，请重启后重试", 5000);
+                    } else {
+                        display_->ShowProvisioningQr(
+                            qr, "Scan: " + ap_ssid +
+                                    "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
+                    }
                 } else if (event == NetworkEvent::WifiConfigModeExit ||
                            event == NetworkEvent::Connected) {
+                    // NetworkEvent::Connected precedes the final HideProvisioningQr action.
                     StopWifiLostWatchdog();
                     display_->HideProvisioningQr();
                 } else if (event == NetworkEvent::Disconnected) {

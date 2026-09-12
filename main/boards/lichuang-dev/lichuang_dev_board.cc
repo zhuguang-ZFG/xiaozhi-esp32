@@ -6,13 +6,14 @@
 #include "display/lcd_display.h"
 #include "esp32_camera.h"
 #include "hutuji_ble_diag.h"
-#include "hutuji_ota.h"
-#include "hutuji_memory.h"
 #include "hutuji_conversation_report.h"
+#include "hutuji_draw_bind.h"
 #include "hutuji_job.h"
-#include "hutuji_music.h"
-#include "hutuji_pipe.h"
 #include "hutuji_kdraw_watcher.h"
+#include "hutuji_memory.h"
+#include "hutuji_music.h"
+#include "hutuji_ota.h"
+#include "hutuji_pipe.h"
 #include "i2c_device.h"
 #include "mcp_server.h"
 #include "plotter_provision.h"
@@ -537,10 +538,19 @@ public:
         WifiBoard::SetNetworkEventCallback(
             [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
                 if (event == NetworkEvent::WifiConfigModeEnter) {
+                    // BuildOpenHotspotWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress())
+                    // BuildOpenHotspotWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress())
                     const std::string ap_ssid = WifiManager::GetInstance().GetApSsid();
-                    display_->ShowProvisioningQr(
-                        hutuji::BuildOpenHotspotWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress()),
-                        "Scan: " + ap_ssid + "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
+                    const std::string qr =
+                        hutuji::BuildIdentityWifiQrPayload(ap_ssid, SystemInfo::GetMacAddress());
+                    if (qr.empty()) {
+                        display_->HideProvisioningQr();
+                        display_->ShowNotification("配网身份暂不可用，请重启后重试", 5000);
+                    } else {
+                        display_->ShowProvisioningQr(
+                            qr, "Scan: " + ap_ssid +
+                                    "\nOpen: " + WifiManager::GetInstance().GetApWebUrl());
+                    }
                 } else if (event == NetworkEvent::WifiConfigModeExit ||
                            event == NetworkEvent::Connected) {
                     display_->HideProvisioningQr();

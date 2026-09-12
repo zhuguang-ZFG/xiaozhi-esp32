@@ -3,20 +3,22 @@
 #include "application.h"
 #include "board.h"
 #include "display.h"
-#include "hutuji_pipe.h"
 #include "http.h"
+#include "hutuji_bind_identity.h"
+#include "hutuji_pipe.h"
+#include "hutuji_recovery_core.h"
 #include "settings.h"
 #include "system_info.h"
 
-#include <cJSON.h>
 #include <esp_log.h>
 #include <esp_timer.h>
-#include <esp_random.h>
+#include <cJSON.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include <cstring>
+#include <mutex>
 #include <string>
+#include <utility>
 
 namespace hutuji {
 namespace {
@@ -24,331 +26,340 @@ namespace {
 constexpr const char* kTag = "HutujiDrawBind";
 constexpr const char* kAnnounceUrl =
     "https://hutuji.donglicao.com/draw-upload/api/device/bind/announce";
-constexpr const char* kSessionUrlBase =
-    "https://hutuji.donglicao.com/draw-upload/api/device/bind/session?bind_code=";
-// HTTPS/mbedTLS 与 activation_relay / hutuji_job 同口径；此前 Poll 单独 4096
-// 会在首次轮询 TLS 时栈溢出重启（COM14 实锤：hutuji_bind_pol stack overflow）。
+constexpr const char* kChallengeUrl =
+    "https://hutuji.donglicao.com/draw-upload/api/device/bind/challenge";
+// 4096 栈曾在 COM14 首次 TLS 握手溢出；与 activation_relay / hutuji_job 同口径。
 constexpr uint32_t kTaskStack = 8192;
-constexpr int kPollIntervalMs = 3000;
-constexpr int kPollMaxAttempts = 200;  // ~10 分钟
+constexpr int64_t kWindowUs = 10LL * 60 * 1000000;
+// 首分钟快轮询；随后降低握手频率，并让出听/说窗口，避免抢 AFE/TTS。
+constexpr int kFastRounds = 12;
+constexpr int kFastMs = 5000;
+constexpr int kSlowMs = 30000;
 
+enum class Attempt { Retry, Pending, Bound, Expired, Rejected };
+std::mutex g_run_mutex;
+BindIdentityRun g_run;
 Display* g_display = nullptr;
-std::string g_bind_code;
-bool g_active = false;
 TaskHandle_t g_worker = nullptr;
 
-std::string GenerateBindCode() {
-    static const char kAlphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    std::string code;
-    code.resize(6);
-    for (int i = 0; i < 6; ++i) {
-        code[i] = kAlphabet[esp_random() % (sizeof(kAlphabet) - 1)];
-    }
-    return code;
-}
-
-std::string ReadDeviceToken() {
-    // 设备消息 API 须 purpose=messaging JWT（控制台「主题配置 / assets-generator」URL
-    // 的 token 参数）。websocket.token 是 WSS 音频通道凭据，不能用于 push（401）。
-    {
-        Settings messaging("messaging", false);
-        std::string token = messaging.GetString("token");
-        if (token.rfind("Bearer ", 0) == 0) {
-            token = token.substr(7);
-        }
-        if (token.size() >= 8) {
-            return token;
-        }
-    }
-    ESP_LOGW(kTag, "messaging token missing in NVS; announce may fail device push probe");
-    Settings settings("websocket", false);
-    std::string token = settings.GetString("token");
-    if (token.rfind("Bearer ", 0) == 0) {
-        token = token.substr(7);
-    }
+std::string TrimToken(std::string token) {
+    const auto first = token.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return "";
+    token = token.substr(first, token.find_last_not_of(" \t\r\n") - first + 1);
+    if (token.rfind("Bearer ", 0) == 0)
+        return TrimToken(token.substr(7));
     return token;
 }
 
-bool AnnounceOnce(const std::string& code, bool* bound_out) {
-    const std::string token = ReadDeviceToken();
-    if (token.size() < 8) {
-        ESP_LOGW(kTag, "device token missing, skip announce mac=%s",
-                 SystemInfo::GetMacAddress().c_str());
-        return false;
+std::string DeviceMac() {
+    std::string mac = SystemInfo::GetMacAddress();
+    for (char& ch : mac) {
+        if (ch >= 'A' && ch <= 'F')
+            ch += 'a' - 'A';
     }
-    auto network = Board::GetInstance().GetNetwork();
-    if (network == nullptr) {
-        ESP_LOGW(kTag, "no network, skip announce");
-        return false;
-    }
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "mac", SystemInfo::GetMacAddress().c_str());
-    cJSON_AddStringToObject(root, "bind_code", code.c_str());
-    cJSON_AddStringToObject(root, "device_token", token.c_str());
-    // 机型词汇（protocol §10.4.15，2026-09-11）：绑定期把 $I VER 识别的机型
-    // 上报 portal 落库；1.0.9 之前字段不存在，portal 默认 paper。
-    cJSON_AddStringToObject(root, "plotter_sku",
-                            Pipe::GetInstance().IsNopaperMachine() ? "nopaper" : "paper");
-    char* body = cJSON_PrintUnformatted(root);
+    return mac;
+}
+
+std::string ReadDeviceToken() {
+    // messaging 优先；空凭据仍能凭设备签名绑定，由服务端自动铸 messaging token。
+    Settings messaging("messaging", false);
+    const std::string token = TrimToken(messaging.GetString("token"));
+    if (!token.empty())
+        return token;
+    Settings websocket("websocket", false);
+    return TrimToken(websocket.GetString("token"));
+}
+
+void AddIdentityFields(cJSON* root, const BindIdentitySession& session) {
+    cJSON_AddNumberToObject(root, "identity_version", kBindIdentityVersion);
+    cJSON_AddStringToObject(root, "device_id", session.device_id.c_str());
+    cJSON_AddStringToObject(root, "public_key", session.public_key.c_str());
+    cJSON_AddStringToObject(root, "nonce", session.nonce.c_str());
+    cJSON_AddStringToObject(root, "bind_code", session.bind_code.c_str());
+    cJSON_AddStringToObject(root, "mac", DeviceMac().c_str());
+}
+
+Attempt Post(cJSON* root, const char* url, std::string& response) {
+    response.clear();
+    if (root == nullptr)
+        return Attempt::Retry;
+    char* raw = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (body == nullptr) {
-        return false;
-    }
-    auto http = network->CreateHttp(3);
-    if (http == nullptr) {
-        ESP_LOGW(kTag, "CreateHttp failed");
-        cJSON_free(body);
-        return false;
-    }
-    http->SetHeader("Content-Type", "application/json");
-    http->SetContent(std::string(body));
-    cJSON_free(body);
-    bool ok = false;
-    if (!http->Open("POST", kAnnounceUrl)) {
-        ESP_LOGW(kTag, "announce open failed mac=%s", SystemInfo::GetMacAddress().c_str());
-    } else {
-        const int status = http->GetStatusCode();
-        ESP_LOGI(kTag, "announce mac=%s status=%d", SystemInfo::GetMacAddress().c_str(), status);
-        ok = (status >= 200 && status < 300);
-        if (ok && bound_out != nullptr) {
-            // 2026-09-08 起 portal 在响应里回 bound：该 MAC 已被用户认领并完成撮合。
-            // 老 portal 无此字段 → 解析不到即 false，行为与旧版一致。
-            char buf[192] = {};
-            const int n = http->Read(buf, sizeof(buf) - 1);
-            if (n > 0) {
-                cJSON* resp = cJSON_Parse(buf);
-                if (resp != nullptr) {
-                    *bound_out = cJSON_IsTrue(cJSON_GetObjectItem(resp, "bound"));
-                    cJSON_Delete(resp);
-                }
-            }
-        }
-        http->Close();
-    }
-    return ok;
-}
-
-constexpr const char* kAutoBoundNvsNs = "hutuji";
-constexpr const char* kAutoBoundNvsKey = "auto_bound";
-
-bool IsAutoBoundRemembered() {
-    Settings s(kAutoBoundNvsNs, false);
-    return s.GetInt(kAutoBoundNvsKey, 0) != 0;
-}
-
-void RememberAutoBound() {
-    Settings s(kAutoBoundNvsNs, true);  // 须读写打开，否则 SetInt 静默跳过
-    s.SetInt(kAutoBoundNvsKey, 1);
-}
-
-bool PollConsumedOnce(const std::string& code) {
+    if (raw == nullptr)
+        return Attempt::Retry;
+    std::string body(raw);
+    cJSON_free(raw);
     auto network = Board::GetInstance().GetNetwork();
-    if (network == nullptr) {
-        return false;
-    }
-    const std::string url = std::string(kSessionUrlBase) + code;
+    if (network == nullptr)
+        return Attempt::Retry;
     auto http = network->CreateHttp(3);
-    if (http == nullptr) {
-        return false;
-    }
-    if (!http->Open("GET", url)) {
-        return false;
+    if (http == nullptr)
+        return Attempt::Retry;
+    http->SetTimeout(8000);
+    http->SetHeader("Content-Type", "application/json");
+    http->SetContent(std::move(body));
+    if (!http->Open("POST", url)) {
+        http->Close();
+        return Attempt::Retry;
     }
     const int status = http->GetStatusCode();
-    char buf[256] = {};
-    const int n = http->Read(buf, sizeof(buf) - 1);
-    http->Close();
-    if (status != 200 || n <= 0) {
-        return false;
-    }
-    const std::string body(buf, static_cast<size_t>(n));
-    cJSON* root = cJSON_Parse(body.c_str());
-    if (root == nullptr) {
-        return false;
-    }
-    const cJSON* st = cJSON_GetObjectItem(root, "status");
-    const char* state = cJSON_IsString(st) ? st->valuestring : "";
-    const bool consumed = std::strcmp(state, "consumed") == 0;
-    cJSON_Delete(root);
-    return consumed;
-}
-
-void BindWorkerTask(void* /*arg*/) {
-    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
-    const std::string code = g_bind_code;
-    // announce 单发时代 TLS 一抖整码作废（用户输码必撞「无效或已过期」2026-09-07 JJAUAL 实锤），
-    // 故并入轮询环持续重试直到 200；与 consumed 轮询共享同一 10 分钟上限。
-    bool announced = false;
-    for (int i = 0; i < kPollMaxAttempts && g_active; ++i) {
-        if (!announced) {
-            announced = AnnounceOnce(code, nullptr);
-        }
-        vTaskDelay(pdMS_TO_TICKS(kPollIntervalMs));
-        if (!g_active) {
+    bool complete = false;
+    char buffer[256];
+    while (status == 200 && response.size() < 1024) {
+        const int count = http->Read(buffer, sizeof(buffer));
+        if (count <= 0) {
+            complete = count == 0;
             break;
         }
-        if (!announced) {
-            continue;  // 没 announce 成功前查会话无意义（服务端必然 missing）
+        response.append(buffer, static_cast<size_t>(count));
+    }
+    http->Close();
+    if (status == 410)
+        return Attempt::Expired;
+    if (status == 400 || status == 401 || status == 403 || status == 409 || status == 422) {
+        ESP_LOGW(kTag, "bind request rejected status=%d", status);
+        return Attempt::Rejected;
+    }
+    return status == 200 && complete && response.size() < 1024 ? Attempt::Pending : Attempt::Retry;
+}
+
+Attempt FetchChallenge(const BindIdentitySession& session, std::string& challenge) {
+    challenge.clear();
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr)
+        return Attempt::Retry;
+    AddIdentityFields(root, session);
+    std::string response;
+    const Attempt result = Post(root, kChallengeUrl, response);
+    if (result != Attempt::Pending)
+        return result;
+    cJSON* json = cJSON_Parse(response.c_str());
+    const cJSON* value = json != nullptr ? cJSON_GetObjectItem(json, "challenge") : nullptr;
+    if (cJSON_IsString(value) && value->valuestring != nullptr &&
+        BindCanonicalBase64Url(value->valuestring, 32)) {
+        challenge = value->valuestring;
+    }
+    cJSON_Delete(json);
+    return challenge.empty() ? Attempt::Retry : Attempt::Pending;
+}
+
+Attempt AnnounceOnce(const BindIdentitySession& session, std::string& challenge) {
+    if (challenge.empty()) {
+        const Attempt result = FetchChallenge(session, challenge);
+        if (result != Attempt::Pending)
+            return result;
+    }
+    const std::string token = ReadDeviceToken();
+    const std::string sku = Pipe::GetInstance().IsNopaperMachine() ? "nopaper" : "paper";
+    std::string signature;
+    if (!SignBindIdentity(session, challenge, DeviceMac(), sku, token, signature))
+        return Attempt::Retry;
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr)
+        return Attempt::Retry;
+    AddIdentityFields(root, session);
+    cJSON_AddStringToObject(root, "challenge", challenge.c_str());
+    cJSON_AddStringToObject(root, "signature", signature.c_str());
+    cJSON_AddStringToObject(root, "device_token", token.c_str());
+    cJSON_AddStringToObject(root, "plotter_sku", sku.c_str());
+    std::string response;
+    const Attempt result = Post(root, kAnnounceUrl, response);
+    if (result != Attempt::Pending)
+        return result;
+    cJSON* json = cJSON_Parse(response.c_str());
+    const cJSON* bound = json != nullptr ? cJSON_GetObjectItem(json, "bound") : nullptr;
+    const Attempt answer = cJSON_IsTrue(bound)    ? Attempt::Bound
+                           : cJSON_IsFalse(bound) ? Attempt::Pending
+                                                  : Attempt::Retry;
+    cJSON_Delete(json);
+    return answer;
+}
+
+void EndRun(uint64_t generation, bool success, const char* message) {
+    Display* display = nullptr;
+    bool manual = false;
+    {
+        std::lock_guard<std::mutex> lock(g_run_mutex);
+        if (!g_run.Current(generation))
+            return;
+        if (success) {
+            if (!FinishBindIdentitySession(g_run.session.nonce))
+                return;
+            Settings settings("hutuji", true);
+            settings.SetInt("auto_bound", 1);
         }
-        if (!PollConsumedOnce(code)) {
+        display = g_display;
+        manual = g_run.mode == BindRunMode::Manual;
+        g_run.Complete(generation);
+    }
+    Application::GetInstance().Schedule([generation, display, manual, message]() {
+        {
+            std::lock_guard<std::mutex> lock(g_run_mutex);
+            if (g_run.generation != generation)
+                return;
+        }
+        if (display != nullptr) {
+            if (manual)
+                display->HideProvisioningQr();
+            display->ShowNotification(message, 5000);
+        }
+    });
+}
+
+void RunWorker() {
+    uint64_t generation = 0;
+    int64_t deadline = 0;
+    int round = 0;
+    std::string challenge;
+    for (;;) {
+        BindIdentityRun current;
+        {
+            std::lock_guard<std::mutex> lock(g_run_mutex);
+            if (g_run.mode == BindRunMode::Stopped) {
+                // 句柄摘除与启动检查同锁；外部只发通知，不删除正在 HTTP/NVS 中的任务。
+                g_worker = nullptr;
+                return;
+            }
+            current = g_run;
+        }
+        if (current.generation != generation) {
+            generation = current.generation;
+            deadline = esp_timer_get_time() + kWindowUs;
+            challenge.clear();
+            round = 0;
+        }
+        if (esp_timer_get_time() >= deadline) {
+            EndRun(generation, false, "绑定暂未完成，请重新打开配网或绑定");
             continue;
         }
-        ESP_LOGI(kTag, "bind session consumed mac=%s", SystemInfo::GetMacAddress().c_str());
-        RememberAutoBound();
-        Application::GetInstance().Schedule([]() {
-            if (g_display != nullptr) {
-                g_display->ShowNotification("绑定成功", 5000);
-                StopDrawBind(g_display);
-            }
-        });
-        break;
-    }
-    if (!announced) {
-        ESP_LOGW(kTag, "bind window ended without successful announce mac=%s",
-                 SystemInfo::GetMacAddress().c_str());
-    }
-    if (g_worker == self) {
-        g_worker = nullptr;
-    }
-    vTaskDelete(nullptr);
-}
-
-void QueueWorker() {
-    if (g_worker != nullptr) {
-        ESP_LOGW(kTag, "bind worker already running, skip recreate");
-        return;
-    }
-    if (xTaskCreate(BindWorkerTask, "hutuji_bind", kTaskStack, nullptr, 3, &g_worker) !=
-        pdPASS) {
-        ESP_LOGW(kTag, "bind worker create failed");
-        g_worker = nullptr;
-    }
-}
-
-// ---- 一次扫码合一流程（2026-09-08 定案）：无头 announce ----
-// 抽屉流要用户开抽屉输码；合一流程里用户只扫配网码，设备侧 announce 后
-// 由 portal 按 MAC 与小程序认领撮合，响应 bound:true 即完成。
-constexpr int kAutoBindWindowMs = 10 * 60 * 1000;  // ~10 分钟窗口，盖住激活重试环
-constexpr int kAutoBindFastMs = 5000;    // 认领大概率紧随配网：首分钟 5s 一拍
-constexpr int kAutoBindSlowMs = 30000;   // 之后 30s 一拍：每拍都是全新 TLS 握手
-                                         // （实测 4.5-5.5s），5s 恒拍 = 半数时间
-                                         // 在握手，音频任务被饿死（2026-09-08 实机
-                                         // 语音卡顿/听不清根因）
-constexpr int kAutoBindFastRounds = 12;  // 12×5s = 首 1 分钟
-
-std::string g_auto_code;
-bool g_auto_active = false;
-TaskHandle_t g_auto_worker = nullptr;
-
-void AutoBindWorkerTask(void* /*arg*/) {
-    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
-    const std::string code = g_auto_code;
-    const int64_t deadline = esp_timer_get_time() + (int64_t)kAutoBindWindowMs * 1000;
-    bool bound = false;
-    int round = 0;
-    while (g_auto_active && !bound && esp_timer_get_time() < deadline) {
-        // 语音会话期 announce 整体让路：mbedTLS 握手是秒级 CPU 密集段，
-        // 与 AFE 馈送/TTS 同核互抢（2026-09-08 实机「听不清用户说话」定性）。
         const auto state = Application::GetInstance().GetDeviceState();
         if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
             continue;
         }
-        // 每轮重发同一码（幂等 upsert、顺带刷新会话 TTL），直到 portal 回 bound
-        // 或窗口结束；token 未就位（激活未完成）时 AnnounceOnce 快速失败等下轮。
-        AnnounceOnce(code, &bound);
-        if (!bound) {
-            vTaskDelay(pdMS_TO_TICKS(round < kAutoBindFastRounds ? kAutoBindFastMs
-                                                                 : kAutoBindSlowMs));
-        }
-        ++round;
+        const Attempt result = AnnounceOnce(current.session, challenge);
+        if (result == Attempt::Bound)
+            EndRun(generation, true, "已绑定呼图账号");
+        else if (result == Attempt::Expired)
+            EndRun(generation, false, "二维码已过期，请重新打开配网或绑定");
+        else if (result == Attempt::Rejected)
+            EndRun(generation, false, "绑定信息已变化，请重新扫描设备二维码");
+        // Stop/新二维码会唤醒等待，不能因旧 worker 睡 30 秒而漏掉唯一的激活回调。
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(round++ < kFastRounds ? kFastMs : kSlowMs));
     }
-    if (bound) {
-        RememberAutoBound();  // 下次开机跳过无头 announce，免 TLS 抢音频
-        ESP_LOGI(kTag, "auto bind matched mac=%s", SystemInfo::GetMacAddress().c_str());
-        Application::GetInstance().Schedule([]() {
-            if (g_display != nullptr) {
-                g_display->ShowNotification("已绑定呼图账号", 5000);
-            }
-        });
-    } else if (g_auto_active) {
-        ESP_LOGW(kTag, "auto bind window ended unbound mac=%s",
-                 SystemInfo::GetMacAddress().c_str());
-    }
-    g_auto_active = false;
-    if (g_auto_worker == self) {
-        g_auto_worker = nullptr;
-    }
+}
+
+void WorkerTask(void*) {
+    // vTaskDelete 不展开 C++ 栈；先正常返回，释放 HTTP/字符串等局部资源。
+    RunWorker();
     vTaskDelete(nullptr);
+}
+
+bool QueueSession(const BindIdentitySession& session, BindRunMode mode, Display* display) {
+    std::lock_guard<std::mutex> lock(g_run_mutex);
+    if (mode == BindRunMode::Headless && g_run.mode == BindRunMode::Manual)
+        return true;
+    if (g_run.mode == mode && g_run.session.nonce == session.nonce && g_worker != nullptr)
+        return true;
+    g_run.Request(session, mode);
+    if (display != nullptr)
+        g_display = display;
+    if (g_worker != nullptr) {
+        xTaskNotifyGive(g_worker);
+    } else if (xTaskCreate(WorkerTask, "hutuji_bind", kTaskStack, nullptr, 3, &g_worker) !=
+               pdPASS) {
+        g_worker = nullptr;
+        g_run.Stop();
+        ESP_LOGW(kTag, "bind worker unavailable");
+        return false;
+    }
+    return true;
+}
+
+void StopRun(bool headless_only) {
+    std::lock_guard<std::mutex> lock(g_run_mutex);
+    if (headless_only && g_run.mode == BindRunMode::Manual)
+        return;
+    g_run.Stop();
+    if (g_worker != nullptr)
+        xTaskNotifyGive(g_worker);
 }
 
 }  // namespace
 
+std::string BuildIdentityWifiQrPayload(const std::string& ssid, const std::string& mac) {
+    StopRun(false);
+    BindIdentitySession session;
+    if (!BeginBindIdentitySession(session)) {
+        ESP_LOGW(kTag, "identity QR unavailable");
+        return "";
+    }
+    return BuildOpenHotspotWifiQrPayload(ssid, mac) + BindIdentityQuery(session);
+}
+
 void StartAutoBindHeadless(Display* display) {
-    if (g_active) {
-        return;  // 抽屉绑定流在跑：announce 归它管（同样会被撮合），不抢 worker
-    }
-    if (g_auto_worker != nullptr) {
-        return;  // 本窗口已在跑：激活完成事件每次开机都到，重复调用安全
-    }
-    // 已绑定设备：开机再跑 10 分钟 announce（即便首拍 bound=true 也要付一次 TLS）
-    // 会与 AFE/TTS 抢核；NVS 记住后直接跳过（2026-09-08 用户「说话卡顿」复诉）。
-    if (IsAutoBoundRemembered()) {
-        ESP_LOGI(kTag, "auto bind skipped（NVS already bound）mac=%s",
-                 SystemInfo::GetMacAddress().c_str());
-        return;
-    }
-    if (display != nullptr) {
-        g_display = display;
-    }
-    g_auto_code = GenerateBindCode();
-    g_auto_active = true;
-    if (xTaskCreate(AutoBindWorkerTask, "hutuji_autobind", kTaskStack, nullptr, 3,
-                    &g_auto_worker) != pdPASS) {
-        ESP_LOGW(kTag, "auto bind worker create failed");
-        g_auto_worker = nullptr;
-        g_auto_active = false;
-        return;
-    }
-    ESP_LOGI(kTag, "auto bind headless started mac=%s", SystemInfo::GetMacAddress().c_str());
+    BindIdentitySession session;
+    // 开机/切网复用持久化会话，不另造用户尚未扫描的 nonce。
+    if (LoadBindIdentitySession(session))
+        QueueSession(session, BindRunMode::Headless, display);
 }
 
-void StopAutoBindHeadless() {
-    g_auto_active = false;  // worker 下个周期自查退出，不在外部杀任务
-}
-
+void StopAutoBindHeadless() { StopRun(true); }
 
 void StartDrawBind(Display* display) {
-    if (display == nullptr) {
+    if (display == nullptr)
+        return;
+    StopRun(false);
+    BindIdentitySession session;
+    if (!BeginBindIdentitySession(session) ||
+        !QueueSession(session, BindRunMode::Manual, display)) {
+        display->HideProvisioningQr();
+        display->ShowNotification("绑定暂不可用，请重启后重试", 5000);
         return;
     }
-    StopAutoBindHeadless();  // 抽屉流接管 announce，无头 worker 下个周期退出
-    g_display = display;
-    g_bind_code = GenerateBindCode();
-    g_active = true;
-    const std::string url =
-        std::string("https://hutuji.donglicao.com/draw-upload/bind?c=") + g_bind_code;
-    const std::string hint = std::string("绑定码 ") + g_bind_code + "\n10 分钟内手机扫码并完成绑定";
-    Application::GetInstance().Schedule([display, url, hint]() {
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(g_run_mutex);
+        generation = g_run.generation;
+    }
+    const std::string url = "https://hutuji.donglicao.com/draw-upload/bind?c=" + session.bind_code +
+                            "&m=" + UrlEncodeQueryComponent(DeviceMac()) +
+                            BindIdentityQuery(session);
+    const std::string hint = "绑定码 " + session.bind_code + "\n10 分钟内手机扫码并完成绑定";
+    Application::GetInstance().Schedule([display, url, hint, generation]() {
+        {
+            std::lock_guard<std::mutex> lock(g_run_mutex);
+            if (!g_run.Current(generation))
+                return;
+        }
         display->ShowProvisioningQr(url, hint);
     });
-    QueueWorker();
-    ESP_LOGI(kTag, "bind flow started mac=%s", SystemInfo::GetMacAddress().c_str());
 }
 
 void StopDrawBind(Display* display) {
-    (void)display;
-    g_active = false;
-    g_bind_code.clear();
-    if (g_display != nullptr) {
-        Application::GetInstance().Schedule([]() {
-            if (g_display != nullptr) {
-                g_display->HideProvisioningQr();
-            }
-        });
+    StopRun(false);
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(g_run_mutex);
+        generation = g_run.generation;
+        if (display == nullptr)
+            display = g_display;
     }
+    Application::GetInstance().Schedule([display, generation]() {
+        {
+            std::lock_guard<std::mutex> lock(g_run_mutex);
+            if (generation != g_run.generation)
+                return;
+        }
+        if (display != nullptr)
+            display->HideProvisioningQr();
+    });
 }
 
-bool IsDrawBindActive() { return g_active; }
+bool IsDrawBindActive() {
+    std::lock_guard<std::mutex> lock(g_run_mutex);
+    return g_run.mode == BindRunMode::Manual;
+}
 
 }  // namespace hutuji
