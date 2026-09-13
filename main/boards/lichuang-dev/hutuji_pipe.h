@@ -4,8 +4,9 @@
 #include <atomic>
 #include <mutex>
 #include <string>
-#include "hutuji_recovery_core.h"
 #include "hutuji_nopaper_core.h"
+#include "hutuji_recovery_core.h"
+#include "hutuji_speed_core.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -107,6 +108,7 @@ public:
     bool IsNopaperMachine() const { return nopaper_machine_.load(); }
     /** mismatch 时返回 golden key（如 `130`）；通过或未探测时为空。 */
     std::string GetSettingsMismatchKey() const;
+    MachineSpeedSnapshot GetMachineSpeedSnapshot() const;
     /**
      * 绘图会话存续期间，重连只验 Telnet banner，不自动发送授权运动探针。
      * 任务层须先按 protocol §2.1 查询 Changing，再决定是否发受限 reset。
@@ -297,6 +299,8 @@ private:
     bool settings_line_ok_ = false;
     mutable std::mutex settings_mismatch_mutex_;
     std::string settings_mismatch_key_;
+    mutable std::mutex machine_speed_mutex_;
+    MachineSpeedSnapshot machine_speed_snapshot_;
     // 挂起态（Hold/Door/Sleep）下 Grbl 不消费行命令，`$I` 既不回 ok 也不回
     // error，纯错误驱动的 R10-PIPE-01 重试永不触发；靠本计数把「无应答」也
     // 变成可判定事件。仅 PipeTask 读写。

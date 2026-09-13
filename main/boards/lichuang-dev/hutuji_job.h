@@ -1,8 +1,9 @@
 #ifndef HUTUJI_JOB_H
 #define HUTUJI_JOB_H
 
-#include "hutuji_recovery_core.h"
 #include "http.h"
+#include "hutuji_recovery_core.h"
+#include "hutuji_speed_core.h"
 
 #include <esp_timer.h>
 #include <atomic>
@@ -58,11 +59,11 @@ public:
     std::string RequestManualControl(const std::string& action);
 
     /**
-     * 量产机移动速度上限（3000~16000 毫米/分钟）。立即返回 accepted/request_id，
-     * 后台核对新鲜 Idle 与同连接两轴应答，结果由 StatusJson.speed 发布。
+     * 量产三轴调速：XY 3000~16000、Z 100~3000；rate=0 只读。立即返回 accepted，
+     * 后台只写选中轴并读回三轴，结果由 StatusJson.speed 发布。
      * Grbl 将参数写入 NVS，重启保留，恢复出厂回该机型默认。
      */
-    std::string RequestSpeed(int rate);
+    std::string RequestSpeed(int rate, const std::string& axis = "xy");
 
     /** 当前点动步进（1 或 10mm，默认 10）。 */
     float GetJogStepMm();
@@ -283,6 +284,8 @@ private:
     uint32_t speed_request_id_ = 0;
     int speed_requested_rate_ = 0;
     int speed_applied_rate_ = 0;
+    std::string speed_axis_{"xy"};
+    MachineSpeedSnapshot speed_readback_;
     std::string speed_state_{"idle"};
     std::string speed_reason_;
     // 在已归位的收尾提交点置位；stream_mutex_ 保护，旧任务释放 busy 前清除。

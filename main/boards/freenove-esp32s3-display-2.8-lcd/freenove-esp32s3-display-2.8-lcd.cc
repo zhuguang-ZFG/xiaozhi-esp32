@@ -378,14 +378,17 @@ private:
 
         mcp_server.AddTool(
             "hutuji.speed",
-            "调整写字机移动速度上限（毫米/分钟，3000-16000）：画图和空走都受这个"
-            "上限限制，数值越大笔移动越快。返回 accepted 仅代表受理，须查询 status.speed 确认完成。"
-            "用户说「写字机速度调到 8000」「速度快一点/慢一点」时用；"
-            "写字机在画图时无法调整；参数在写字机重启后保留，恢复出厂回机型默认。",
-            PropertyList({Property("rate", kPropertyTypeInteger)}),
+            "查询或调整写字机各轴速度上限，单位毫米/分钟。axis 为 x、y、z 或 xy，默认 xy；"
+            "rate 不填或为 0 时只读取三轴当前速度，正整数只修改选中轴。"
+            "X/Y 范围 3000-16000（默认 10000），Z 抬落笔范围 100-3000、保留当前值。"
+            "画图与空走都受轴速度上限限制；画图中不能调整。accepted 只是受理，"
+            "须查询 status.speed 匹配 request_id、axis、done 和 rates 读回值确认。"
+            "参数重启保留，恢复出厂回机型默认。",
+            PropertyList({Property("rate", kPropertyTypeInteger, 0),
+                          Property("axis", kPropertyTypeString, "xy")}),
             [](const PropertyList& properties) -> ReturnValue {
                 return hutuji::Job::GetInstance().RequestSpeed(
-                    properties["rate"].value<int>());
+                    properties["rate"].value<int>(), properties["axis"].value<std::string>());
             });
 
         // 唱歌与绘图完全解耦：只走 AudioService 播放泵，不碰写字机管道。

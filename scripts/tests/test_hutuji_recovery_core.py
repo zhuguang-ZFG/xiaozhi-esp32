@@ -2015,7 +2015,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertNotIn('JsonString("busy")', source)
         # 旧四入口保持中文正文；速度入口须为结构化 error，不能被 portal 当成功。
         self.assertEqual(source.count('JsonString("写字机正忙，请稍候再试")'), 4)
-        speed = source.split("std::string Job::RequestSpeed(int rate) {", 1)[1].split(
+        speed = source.split("std::string Job::RequestSpeed(", 1)[1].split(
             "void Job::SpeedTaskEntry", 1
         )[0]
         self.assertIn('写字机正忙，请稍候再试', speed)

@@ -788,6 +788,16 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
         return;
     }
 
+    // 只观察已收到的参数行；status 不发普通查询，主动读回由调速 worker 消费 ok。
+    if (!line.empty() && line[0] == '$') {
+        std::string key;
+        double value = 0.0;
+        if (ParseGrblSettingLine(line, key, value)) {
+            std::lock_guard<std::mutex> lock(machine_speed_mutex_);
+            machine_speed_snapshot_.Observe(key, value);
+        }
+    }
+
     if (auth_probe_stage_ == AuthProbeStage::WaitingSettingQuery && !line.empty() &&
         line[0] == '$') {
         std::string key;
@@ -1098,6 +1108,10 @@ void Pipe::ScheduleAuthProbeRetryOrFail(const char* what, int error_code) {
 }
 
 void Pipe::ResetSettingsFingerprintState() {
+    {
+        std::lock_guard<std::mutex> lock(machine_speed_mutex_);
+        machine_speed_snapshot_ = {};
+    }
     settings_verified_.store(false);
     settings_query_index_ = 0;
     settings_line_ok_ = false;
@@ -1126,6 +1140,11 @@ bool Pipe::BeginSettingsFingerprintProbe() {
         return false;
     }
     return true;
+}
+
+MachineSpeedSnapshot Pipe::GetMachineSpeedSnapshot() const {
+    std::lock_guard<std::mutex> lock(machine_speed_mutex_);
+    return machine_speed_snapshot_;
 }
 
 std::string Pipe::GetSettingsMismatchKey() const {

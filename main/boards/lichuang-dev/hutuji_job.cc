@@ -111,7 +111,7 @@ constexpr uint32_t kOkFallbackIdleTimeoutMs = 2000;
 // 假失败「点动前未取到新鲜坐标」。6s 覆盖实测最坏 3.2s 仍有裕量；越界判定与
 // 限幅不变，超时依旧 fail closed（宁可拒动，不拿旧坐标放行运动）。
 constexpr uint32_t kJogFreshStateTimeoutMs = 6000;
-// hutuji.speed 写 $110/$111 的 ok 预算：Idle 下 `$` 命令是毫秒级应答，5s 足够；
+// hutuji.speed 读写 $110/$111/$112 的单条预算：Idle 下通常毫秒级，5s 覆盖慢网；
 // 上限卡住换纸窗口误伤场景（settled 闸已拒换纸期，这里只是兜底）。
 constexpr uint32_t kSpeedWriteTimeoutMs = 5000;
 // 兜底次数上限。Telnet 偶发吃 ok 每页最多出现个别次；真丢行/真卡死必须暴露成
@@ -1243,9 +1243,11 @@ std::string Job::RequestManualControl(const std::string& action) {
     return JsonString("started");
 }
 
-std::string Job::RequestSpeed(int rate) {
-    if (!IsMachineSpeedValid(rate)) {
-        return "{\"error\":\"速度超出允许范围（3000-16000 毫米/分钟）\"}";
+std::string Job::RequestSpeed(int rate, const std::string& axis) {
+    const auto selected = ParseMachineSpeedAxis(axis);
+    if (selected == MachineSpeedAxis::Invalid ||
+        (rate != 0 && !IsMachineSpeedValid(rate, selected))) {
+        return "{\"error\":\"轴或速度无效（XY 3000-16000，Z 100-3000 毫米/分钟）\"}";
     }
     // MCP 在主事件循环执行；锁忙时立刻拒绝，网络等待全部交给独立任务。
     std::unique_lock<std::mutex> stream_lock(stream_mutex_, std::try_to_lock);
@@ -1271,6 +1273,9 @@ std::string Job::RequestSpeed(int rate) {
         }
         speed_request_id_ = request_id;
         speed_requested_rate_ = rate;
+        speed_axis_ = axis;
+        speed_applied_rate_ = 0;
+        speed_readback_ = {};
         speed_state_ = "pending";
         speed_reason_.clear();
     }
@@ -1289,9 +1294,10 @@ std::string Job::RequestSpeed(int rate) {
         speed_reason_ = "无法创建速度调整任务";
         return "{\"error\":\"无法创建速度调整任务\"}";
     }
-    char result[112];
-    snprintf(result, sizeof(result), "{\"status\":\"accepted\",\"request_id\":%lu,\"rate\":%d}",
-             static_cast<unsigned long>(request_id), rate);
+    char result[128];
+    snprintf(result, sizeof(result),
+             "{\"status\":\"accepted\",\"request_id\":%lu,\"rate\":%d,\"axis\":\"%s\"}",
+             static_cast<unsigned long>(request_id), rate, axis.c_str());
     return result;
 }
 
@@ -1303,9 +1309,11 @@ void Job::SpeedTaskEntry(void* arg) {
 void Job::RunSpeedUpdate() {
     auto& pipe = Pipe::GetInstance();
     int rate;
+    MachineSpeedAxis selected;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         rate = speed_requested_rate_;
+        selected = ParseMachineSpeedAxis(speed_axis_);
     }
     const uint32_t connection = speed_connection_seq_;
     const auto same_session = [&]() {
@@ -1313,7 +1321,22 @@ void Job::RunSpeedUpdate() {
                pipe.IsSettingsVerified() && pipe.IsNopaperMachine() &&
                pipe.GetConnectionSequence() == connection;
     };
+    // 每条普通命令单独消费应答，查询行也不留下孤儿 ok。
+    const auto exchange = [&](const char* line) {
+        if (!same_session() || !pipe.SendLine(line))
+            return false;
+        const TickType_t sent = xTaskGetTickCount();
+        while (same_session() && xTaskGetTickCount() - sent < pdMS_TO_TICKS(kSpeedWriteTimeoutMs)) {
+            const WaitResult reply = pipe.WaitResponse(100);
+            if (reply == WaitResult::Ok)
+                return same_session();
+            if (reply != WaitResult::Timeout)
+                return false;
+        }
+        return false;
+    };
     std::string reason;
+    MachineSpeedSnapshot readback;
     StartPerformanceHold();
     const uint32_t before = pipe.GetStatusReportSequence();
     bool fresh = same_session() && pipe.SendRealtime('?');
@@ -1327,39 +1350,52 @@ void Job::RunSpeedUpdate() {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     if (!fresh || !same_session() || pipe.GetGrblState() != GrblState::Idle) {
-        reason = "写字机未确认空闲，未调整速度";
+        reason = "写字机未确认空闲，未读写速度";
     } else {
-        const SpeedWriteResult result = WriteMachineSpeed(same_session, [&](int axis) {
-            char line[32];
-            snprintf(line, sizeof(line), "$%d=%d", axis, rate);
-            if (!pipe.SendLine(line))
-                return false;
-            const TickType_t sent = xTaskGetTickCount();
-            while (same_session() &&
-                   xTaskGetTickCount() - sent < pdMS_TO_TICKS(kSpeedWriteTimeoutMs)) {
-                const WaitResult reply = pipe.WaitResponse(100);
-                if (reply == WaitResult::Ok)
-                    return true;
-                if (reply != WaitResult::Timeout)
-                    return false;
+        if (rate > 0) {
+            const SpeedWriteResult result = WriteMachineSpeed(
+                same_session,
+                [&](int setting) {
+                    char line[32];
+                    snprintf(line, sizeof(line), "$%d=%d", setting, rate);
+                    return exchange(line);
+                },
+                selected);
+            switch (result) {
+                case SpeedWriteResult::Ok:
+                    break;
+                case SpeedWriteResult::InvalidAxis:
+                    reason = "调速轴无效";
+                    break;
+                case SpeedWriteResult::SessionLost:
+                    reason = "调速期间连接变化，请重新读取速度";
+                    break;
+                case SpeedWriteResult::XFailed:
+                    reason = "X 轴速度写入未确认，请重新读取";
+                    break;
+                case SpeedWriteResult::YFailed:
+                    reason = "Y 轴速度写入未确认，请重新读取";
+                    break;
+                case SpeedWriteResult::ZFailed:
+                    reason = "Z 轴速度写入未确认，请重新读取";
+                    break;
             }
-            return false;
-        });
-        switch (result) {
-            case SpeedWriteResult::Ok:
-                break;
-            case SpeedWriteResult::SessionLost:
-                reason = "调速期间连接变化，请重新查询机器参数";
-                break;
-            case SpeedWriteResult::XFailed:
-                reason = "X 轴速度写入未确认，请重新查询机器参数";
-                break;
-            case SpeedWriteResult::YFailed:
-                reason = "X 轴已调整，Y 轴写入未确认，请重试";
-                break;
         }
-        // 错误/超时后的迟到 ok 不能被下一次普通命令认领；仅关闭本次连接。
-        if (result != SpeedWriteResult::Ok)
+        for (int index = 0; reason.empty() && index < 3; ++index) {
+            const auto previous = pipe.GetMachineSpeedSnapshot();
+            char line[16];
+            snprintf(line, sizeof(line), "$%d", 110 + index);
+            const bool ok = exchange(line);
+            readback = pipe.GetMachineSpeedSnapshot();
+            if (!ok || !same_session() || readback.revisions[index] == previous.revisions[index]) {
+                reason = "速度读回未确认，请重新读取";
+            }
+        }
+        if (reason.empty() && !SpeedReadbackMatches(selected, rate, readback)) {
+            reason = "读回速度与设置不符，请重新读取";
+        }
+        // 错误/超时的迟到 ok 不能被下一次普通命令认领；只关闭本次连接。
+        if (!reason.empty())
             pipe.ShutdownSocket(connection);
     }
     StopPerformanceHold();
@@ -1369,6 +1405,7 @@ void Job::RunSpeedUpdate() {
         speed_state_ = reason.empty() ? "done" : "error";
         speed_reason_ = reason;
         speed_applied_rate_ = reason.empty() ? rate : 0;
+        speed_readback_ = reason.empty() ? readback : MachineSpeedSnapshot{};
     }
     pipe.SetTaskSessionActive(false);
     speed_active_.store(false);
@@ -1541,11 +1578,21 @@ std::string Job::StatusJson() const {
     cJSON* speed = cJSON_AddObjectToObject(root, "speed");
     if (speed != nullptr) {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        cJSON_AddBoolToObject(speed, "axis_control", true);
+        cJSON_AddStringToObject(speed, "axis", speed_axis_.c_str());
         cJSON_AddStringToObject(speed, "state", speed_state_.c_str());
         cJSON_AddNumberToObject(speed, "request_id", speed_request_id_);
         cJSON_AddNumberToObject(speed, "requested_rate", speed_requested_rate_);
         if (speed_applied_rate_ > 0)
             cJSON_AddNumberToObject(speed, "rate", speed_applied_rate_);
+        if (speed_state_ == "done" && speed_readback_.Complete()) {
+            cJSON* rates = cJSON_AddObjectToObject(speed, "rates");
+            if (rates != nullptr) {
+                cJSON_AddNumberToObject(rates, "x", speed_readback_.rates[0]);
+                cJSON_AddNumberToObject(rates, "y", speed_readback_.rates[1]);
+                cJSON_AddNumberToObject(rates, "z", speed_readback_.rates[2]);
+            }
+        }
         if (!speed_reason_.empty())
             cJSON_AddStringToObject(speed, "reason", speed_reason_.c_str());
     }
