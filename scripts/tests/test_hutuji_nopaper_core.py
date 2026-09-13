@@ -216,6 +216,95 @@ int main() {
         self.assertNotIn("$SLP", body)
         self.assertNotIn("$1=", body)
 
+    def test_repeated_abort_reuses_the_actual_worker_until_job_cleanup(self):
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("无 host C++ 编译器")
+        source = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        request = source[source.index("std::string Job::RequestAbort()"):
+                         source.index("bool Job::StartAbortResetTask()")]
+        start_begin = source.index("bool Job::StartAbortDrainHomeTask()")
+        start = source[start_begin:source.index("bool Job::PerformAbortDrainHome()", start_begin)]
+        # 编译产品的真实入口和任务创建函数；只替换 RTOS 调度与 UI，保持 worker 未执行，
+        # 模拟用户在归位期间连点停止，以及 worker 已结束但 Job 尚未释放 busy 的窗口。
+        self._compile_and_run(compiler, r'''
+#include <atomic>
+#include <cassert>
+#include <cstdint>
+#include <mutex>
+#include <string>
+using BaseType_t = int;
+constexpr int pdPASS = 1;
+int create_calls = 0;
+bool creation_succeeds = true;
+void (*pending)(void*) = nullptr;
+int xTaskCreate(void (*entry)(void*), const char*, int, void*, int, void*) {
+    ++create_calls;
+    if (creation_succeeds) pending = entry;
+    return creation_succeeds ? pdPASS : 0;
+}
+void vTaskDelete(void*) {}
+std::string JsonString(const char* text) { return text; }
+uint32_t NextStreamControlEpoch(uint32_t value) { return value + 1; }
+struct Job {
+    std::mutex stream_mutex_, state_mutex_;
+    std::atomic<bool> busy_{true}, speed_active_{false}, awaiting_confirmation_{false};
+    std::atomic<bool> prefetch_cancel_{false}, abort_requested_{false};
+    std::atomic<bool> pen_test_active_{false}, paper_active_{false};
+    std::atomic<bool> abort_reset_worker_active_{false};
+    std::atomic<uint32_t> stream_control_epoch_{0};
+    bool finishing_at_home_ = false;
+    std::string state_ = "streaming";
+    static Job& GetInstance() { static Job instance; return instance; }
+    void ClearPreview() {}
+    void Notify(const char*) {}
+    void SetState(const char* text) { state_ = text; }
+    bool PerformAbortDrainHome() { return false; }
+    std::string RequestAbort();
+    bool StartAbortDrainHomeTask();
+};
+''' + request + start + r'''
+int main() {
+    auto& job = Job::GetInstance();
+    job.RequestAbort();
+    assert(create_calls == 1 && job.abort_reset_worker_active_.load());
+    const auto epoch = job.stream_control_epoch_.load();
+    for (int i = 0; i < 20; ++i) job.RequestAbort();
+    assert(create_calls == 1);
+    assert(job.stream_control_epoch_.load() == epoch);
+    assert(job.StartAbortDrainHomeTask());
+    assert(create_calls == 1);  // 任务创建面也拒重复占有者。
+    pending(nullptr);
+    assert(!job.abort_reset_worker_active_.load());
+    job.RequestAbort();
+    assert(create_calls == 1);  // 已归位，Job 尚未清 busy 也不再启动。
+    job.busy_.store(false);
+    job.RequestAbort();
+    assert(create_calls == 1);
+    // 新任务与任务创建失败后的重试都能重新取得 worker。
+    job.busy_.store(true);
+    job.abort_requested_.store(false);
+    creation_succeeds = false;
+    assert(job.RequestAbort().find("error") != std::string::npos);
+    assert(!job.abort_requested_.load() && !job.abort_reset_worker_active_.load());
+    assert(create_calls == 2);
+    creation_succeeds = true;
+    job.RequestAbort();
+    assert(create_calls == 3 && job.abort_reset_worker_active_.load());
+    pending(nullptr);
+    return 0;
+}
+''', "abort_worker_idempotence")
+
+    def test_abort_terminal_is_published_after_the_worker_settles(self):
+        source = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        tail = source[source.index("const bool nopaper_end ="):
+                      source.index("Http* Job::AcquireFetchClient()")]
+        waited = tail.index("const bool waited = WaitForAbortReset();")
+        terminal = tail.index('SetState("aborted");')
+        self.assertGreater(terminal, waited)
+        self.assertLess(terminal, tail.index("busy_.store(false, std::memory_order_release);"))
+
 
 if __name__ == "__main__":
     unittest.main()

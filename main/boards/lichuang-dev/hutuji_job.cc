@@ -522,6 +522,11 @@ std::string Job::RequestAbort() {
             SetState("aborted");
             return JsonString("预览已取消");
         }
+        // 停止包含排空、抬笔、归位与释放；重复请求必须复用同一收尾事务。
+        // 只看 busy 会在旧 worker 仍归位时再创建 worker，令两边争抢 ok。
+        if (abort_requested_.load()) {
+            return JsonString("停止处理中");
+        }
         abort_requested_.store(true);
         prefetch_cancel_.store(true);
         stream_control_epoch_.store(
@@ -756,8 +761,10 @@ bool Job::PerformAbortReset(bool wait_for_stream_quiescence, bool owner_claimed,
 }
 
 bool Job::StartAbortDrainHomeTask() {
-    // 与 reset 任务共用 abort_reset_worker_active_ 发布面：Run 尾部只认这一个旗标。
-    abort_reset_worker_active_.store(true, std::memory_order_release);
+    // 与 reset 任务共用 worker 发布面；原子抢占使重复入口也只创建一个收尾者。
+    if (abort_reset_worker_active_.exchange(true, std::memory_order_acq_rel)) {
+        return true;
+    }
     BaseType_t created = xTaskCreate(
         [](void*) {
             auto& job = Job::GetInstance();
@@ -2286,9 +2293,7 @@ void Job::Run() {
             ok = ReleaseMotorsAfterHome(stream_connection_seq_, home_banner, true);
         }
         if (abort_requested_.load()) {
-            SetState("aborted");
-            if (auto* d = Board::GetInstance().GetDisplay())
-                d->SetStatus("已取消");
+            // 归位 worker 此时可能还在排空运动；终态与屏幕提示在尾部等它收敛后发布。
         } else if (ok) {
             if (more_pages) {
                 // 文章翻页：换纸已成功，释放本页缓冲并推进到下一页重新下载。
@@ -2376,6 +2381,11 @@ void Job::Run() {
         // 在 reset 失败时是假话；只在这里记录，循环外发。
         if (abort_requested_.load()) {
             abort_notify = reset_ok ? 1 : 2;
+            if (reset_ok) {
+                SetState("aborted");
+                if (auto* d = Board::GetInstance().GetDisplay())
+                    d->SetStatus("已取消");
+            }
         }
 
         // stream_mutex 同时是新任务的发布门：旧任务全部资源/状态写入必须先完成。
