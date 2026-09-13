@@ -149,5 +149,73 @@ int main() {
 ''', "nopaper_goldens")
 
 
+    def test_motor_release_requires_fresh_idle_on_the_same_verified_machine(self):
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("无 host C++ 编译器")
+        self._compile_and_run(compiler, r"""
+#include <cassert>
+#include <cstdint>
+#include "main/boards/lichuang-dev/hutuji_nopaper_core.h"
+
+int main() {
+    using namespace hutuji;
+    const IdleMotorReleaseSnapshot valid{true, true, true, true, true, true, true, 8, 3, 41};
+    assert(CanReleaseNopaperMotors(valid, 8, 3, 40));
+    for (int field = 0; field < 7; ++field) {
+        auto changed = valid;
+        bool* gates[] = {&changed.connected, &changed.ready, &changed.authorized,
+                        &changed.settings_verified, &changed.nopaper, &changed.idle,
+                        &changed.line_mode};
+        *gates[field] = false;
+        assert(!CanReleaseNopaperMotors(changed, 8, 3, 40));
+    }
+    assert(!CanReleaseNopaperMotors(valid, 9, 3, 40));
+    assert(!CanReleaseNopaperMotors(valid, 8, 4, 40));
+    assert(!CanReleaseNopaperMotors(valid, 8, 3, 41));
+    auto wrapped = valid;
+    wrapped.status = 0;
+    assert(CanReleaseNopaperMotors(wrapped, 8, 3, UINT32_MAX));
+    return 0;
+}
+""", "nopaper_motor_release")
+
+    def test_release_follows_confirmed_home_and_never_the_page_continue(self):
+        # 机械收尾接线回归：不是把任意 Idle 当作任务完成，也不能在下一页前释放。
+        source = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        run = source[source.index("void Job::Run() {"):source.index("Http* Job::AcquireFetchClient()")]
+        release = run.index("ok = ReleaseMotorsAfterHome(")
+        self.assertLess(run.index("ok = ReturnHomeAfterDraw();"), release)
+        self.assertIn("if (ok && !more_pages && nopaper_end)", run[:release])
+        self.assertLess(release, run.index('SetState("done")'))
+        # 多页后验拒绝必须先改变 ok，再进入 error/done 分支；拒绝不能落入 done。
+        reject = run.index("last_error_ = hutuji::kNopaperMultiPageRejectMsg;")
+        self.assertLess(reject, run.index("} else if (ok)", reject))
+        for begin, end in (("bool Job::PerformAbortDrainHome()", "bool Job::WaitForAbortReset()"),
+                           ("bool Job::HomeAfterAbort(", "bool Job::ChangePaperAfterDraw()")):
+            body = source[source.index(begin):source.index(end)]
+            self.assertLess(body.index("WaitForIdle(false, kHomeIdleTimeoutMs)"),
+                            body.index("ReleaseMotorsAfterHome("))
+
+    def test_release_commit_excludes_late_controls_and_does_not_leak_ack(self):
+        source = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        for begin, end in (("std::string Job::RequestAbort()", "bool Job::StartAbortResetTask()"),
+                           ("std::string Job::RequestPause()", "std::string Job::RequestResume()"),
+                           ("std::string Job::RequestResume()", "std::string Job::RequestRepeat()")):
+            body = source[source.index(begin):source.index(end)]
+            self.assertIn("finishing_at_home_", body)
+        release = source[source.index("bool Job::ReleaseMotorsAfterHome("):]
+        self.assertLess(release.index("WaitForIdle(honor_abort"), release.index("finishing_at_home_ = true"))
+        self.assertLess(release.index("finishing_at_home_ = true"), release.index("SendMotorDisableAtIdle("))
+        self.assertIn("pipe.ShutdownSocket(connection);", release)
+        pipe = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(encoding="utf-8")
+        body = pipe[pipe.index("bool Pipe::SendMotorDisableAtIdle("):pipe.index("bool Pipe::HasFreshStoppedStatus(")]
+        self.assertLess(body.index("lock(write_mutex_)"), body.index("CanReleaseNopaperMotors("))
+        self.assertLess(body.index("CanReleaseNopaperMotors("), body.index("SendRawLocked("))
+        self.assertIn("kMotorDisableLine", body)
+        self.assertNotIn("$SLP", body)
+        self.assertNotIn("$1=", body)
+
+
 if __name__ == "__main__":
     unittest.main()

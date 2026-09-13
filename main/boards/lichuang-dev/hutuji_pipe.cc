@@ -1205,6 +1205,26 @@ bool Pipe::SendLine(const std::string& line) {
     return true;
 }
 
+bool Pipe::SendMotorDisableAtIdle(uint32_t connection, uint32_t banner, uint32_t previous_status) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    const IdleMotorReleaseSnapshot snapshot{
+        connected_.load(),         ready_.load(),           authorized_.load(),
+        settings_verified_.load(), nopaper_machine_.load(), grbl_state_.load() == GrblState::Idle,
+        drain_on_send_.load(),     connection_seq_.load(),  reset_banner_seq_.load(),
+        status_report_seq_.load()};
+    if (!CanReleaseNopaperMotors(snapshot, connection, banner, previous_status)) {
+        return false;
+    }
+    DrainResponses();
+    std::string payload(kMotorDisableLine);
+    payload.push_back('\n');
+    if (!SendRawLocked(payload.data(), payload.size())) {
+        return false;
+    }
+    ESP_LOGI(TAG, "-> %s（归位后释放）", kMotorDisableLine);
+    return true;
+}
+
 bool Pipe::HasFreshStoppedStatus(uint32_t previous_status_sequence,
                                  uint32_t expected_connection_sequence) const {
     if (connection_seq_.load() != expected_connection_sequence ||

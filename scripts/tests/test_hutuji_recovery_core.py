@@ -969,12 +969,17 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
         ).read_text(encoding="utf-8")
 
-        # 归位实现：发送的必须是 G1 形式的原点行，且函数内只有这一条发送。
+        # 归位实现：量产机先 G1 抬笔，随后各机型仍只用 G1 返回原点。
         start = source.index("bool Job::ReturnHomeAfterDraw()")
         end = source.index("bool Job::HomeAfterAbort(", start)
         body = source[start:end]
         homes = re.findall(r'pipe\.SendLine\("([^"]+)"\)', body)
-        self.assertEqual(homes, ["G1G90 X0Y0F8000"])
+        self.assertEqual(homes, ["G1G90 Z0.0F10000", "G1G90 X0Y0F8000"])
+        self.assertIn("if (pipe.IsNopaperMachine())", body)
+        self.assertLess(body.index('"G1G90 Z0.0F10000"'),
+                        body.index("WaitForIdle(true, kPenOriginIdleTimeoutMs)"))
+        self.assertLess(body.index("WaitForIdle(true, kPenOriginIdleTimeoutMs)"),
+                        body.index('"G1G90 X0Y0F8000"'))
         # 2026-08-28 用户决策「停止后也要自己回原点」：abort 归位同样必须是 G1
         # （G0 X0Y0 会触发换纸），且必须先 G92 复原 Hold 快照坐标再归位——复位后
         # MPos 已被清成 0,0，缺了 G92 复原就是原地不动的假归位。
@@ -1035,8 +1040,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("ok = false;", advance_block)  # 下一轮重新累计
 
         # 单页语义不变：article_pages_ 空时不进翻页分支，直接 done。
-        self.assertIn("if (!article_pages_.empty() && article_index_ + 1 < article_pages_.size())",
-                      run_body)
+        self.assertRegex(run_body, r"const bool more_pages =\s*"
+                         r"!article_pages_\.empty\(\) && article_index_ \+ 1 < article_pages_\.size\(\);")
+        self.assertIn("if (more_pages)", run_body)
 
     def test_start_draw_pairs_pages_with_preview_and_repeat_restarts_article(self):
         """StartDraw 的 pages 必须与 url/preview_url 同源；文章重画从第 1 页重来。

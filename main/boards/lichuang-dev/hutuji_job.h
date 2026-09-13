@@ -150,6 +150,8 @@ private:
     bool QueryAndWaitFreshMachineState(uint32_t timeout_ms);
     /** 正常页尾专有：G1 归位（不触发换纸），随后才允许 ChangePaperAfterDraw。 */
     bool ReturnHomeAfterDraw();
+    /** 仅量产机、已抬笔归位的任务终点；新鲜 Idle 与连接身份复核后释放，等待应答。 */
+    bool ReleaseMotorsAfterHome(uint32_t connection, uint32_t banner, bool honor_abort);
     /**
      * abort 专有归位（2026-08-28 用户决策「停止后也要自己回原点」）：受限 reset 会
      * 把 Grbl 坐标清零（物理笔架停在原处），且 pipe 每条状态报告都覆写 MPos——
@@ -283,6 +285,9 @@ private:
     int speed_applied_rate_ = 0;
     std::string speed_state_{"idle"};
     std::string speed_reason_;
+    // 在已归位的收尾提交点置位；stream_mutex_ 保护，旧任务释放 busy 前清除。
+    // 此时没有剩余运动，拒绝迟到的 pause/abort 再启动机械编排。
+    bool finishing_at_home_ = false;
     std::atomic<bool> busy_{false};
     std::atomic<bool> awaiting_confirmation_{false};
     std::atomic<bool> abort_requested_{false};

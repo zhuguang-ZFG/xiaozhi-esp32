@@ -58,6 +58,8 @@ public:
 
     /** 写一行普通命令（自动补 \\n）。未连接返回 false。吃 ok（单写者锁）。 */
     bool SendLine(const std::string& line);
+    /** 已归位任务专用：单写者锁内复核同一连接/横幅及新鲜 Idle，仅发送固定 $MD。 */
+    bool SendMotorDisableAtIdle(uint32_t connection, uint32_t banner, uint32_t previous_status);
 
     /**
      * 发实时字符（`?` / `!` / `0x18`），不吃 ok、不清应答位。

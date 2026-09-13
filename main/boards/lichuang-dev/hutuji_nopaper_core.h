@@ -15,6 +15,7 @@
 //   擦写使 NVS 回落机头默认，刷后须 $$ 只读取证校准——见枢纽仓 inventory）。
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "hutuji_recovery_core.h"
@@ -47,6 +48,29 @@ inline bool GrblVerLineIsNopaperSku(const std::string& line) {
 
 // 页尾换纸编排（M30 + 等换纸完成）是否跳过：无换纸机整个跳过，归位保留。
 inline bool NopaperSkipsPaperChange(bool nopaper_machine) { return nopaper_machine; }
+
+// 任务层先证明整单终结、抬笔和归位；发送层在单写者锁内复核这些实时条件。
+// status 用“不相等”判新报告，允许 uint32_t 正常回绕；重连/复位靠独立序号拒绝。
+struct IdleMotorReleaseSnapshot {
+    bool connected;
+    bool ready;
+    bool authorized;
+    bool settings_verified;
+    bool nopaper;
+    bool idle;
+    bool line_mode;
+    uint32_t connection;
+    uint32_t banner;
+    uint32_t status;
+};
+
+inline bool CanReleaseNopaperMotors(const IdleMotorReleaseSnapshot& snapshot, uint32_t connection,
+                                    uint32_t banner, uint32_t previous_status) {
+    return snapshot.connected && snapshot.ready && snapshot.authorized &&
+           snapshot.settings_verified && snapshot.nopaper && snapshot.idle && snapshot.line_mode &&
+           snapshot.connection == connection && snapshot.banner == banner &&
+           snapshot.status != previous_status;
+}
 
 // 多页任务（pages>1）在无换纸机上拒绝（不做多页，2026-09-10 用户拍板）。
 inline bool NopaperRejectsMultiPage(bool nopaper_machine, size_t page_count) {

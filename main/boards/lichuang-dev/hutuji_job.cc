@@ -119,7 +119,7 @@ constexpr uint32_t kSpeedWriteTimeoutMs = 5000;
 constexpr int kMaxOkFallback = 3;
 // MPos 与在途行终点的比较容差（mm）。Grbl 报告保留 3 位小数。
 constexpr float kOkFallbackPosTolMm = 0.05f;
-// 本机 $1=255（2026-08-28 机设）：任务期/闲置期电机保持通电（治虚实交替）。Idle 后等弹簧回到自然抬笔位再声明 Z0。
+// $1=255 保持任务中的笔位；量产机仅在任务归位收尾显式 $MD。失能/抬笔后留出弹簧沉降时间再声明 Z0。
 constexpr uint32_t kPenSpringReturnMs = 100;
 constexpr uint32_t kReconnectReadyTimeoutMs = 2 * 60 * 1000;
 constexpr uint32_t kResetRecoveryTimeoutMs = 30000;
@@ -511,6 +511,9 @@ std::string Job::RequestAbort() {
         if (speed_active_.load()) {
             return "{\"error\":\"正在调整速度，请稍候查询结果\"}";
         }
+        if (finishing_at_home_) {
+            return JsonString("已回原点，正在完成收尾");
+        }
         if (awaiting_confirmation_.exchange(false)) {
             ClearPreview();
             prefetch_cancel_.store(true);
@@ -550,6 +553,9 @@ std::string Job::RequestAbort() {
     {
         // owner 抢占与 Run 的 busy_ 释放共用 stream_mutex_，避免任务收尾后迟到创建 reset。
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (finishing_at_home_) {
+            return JsonString("已回原点，正在完成收尾");
+        }
         if (!busy_.load()) {
             return JsonString("ok");
         }
@@ -775,6 +781,9 @@ bool Job::StartAbortDrainHomeTask() {
 // 返回 true 表示已移交 reset 任务（worker 旗标随走），false 表示本路径已收尾。
 bool Job::PerformAbortDrainHome() {
     auto& pipe = Pipe::GetInstance();
+    const bool nopaper = pipe.IsNopaperMachine();
+    const uint32_t home_connection = pipe.GetConnectionSequence();
+    const uint32_t home_banner = pipe.GetResetBannerSequence();
     bool homed = false;
     do {
         // 顺序关键（2026-08-28 二轮 HIL 实证）：paused_ 是 S3 侧冻结闸，不解它
@@ -844,6 +853,9 @@ bool Job::PerformAbortDrainHome() {
         if (!WaitForIdle(false, kHomeIdleTimeoutMs)) {
             break;
         }
+        if (nopaper && !ReleaseMotorsAfterHome(home_connection, home_banner, false)) {
+            break;
+        }
         homed = true;
         ESP_LOGI(TAG, "abort 断流归位完成（无 reset，坐标未失效）");
     } while (false);
@@ -874,6 +886,9 @@ std::string Job::RequestPause() {
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
+    }
+    if (finishing_at_home_) {
+        return "{\"error\":\"已回原点，正在完成收尾\"}";
     }
     if (pen_test_active_.load()) {
         return JsonString("正在试笔，请稍候");
@@ -909,6 +924,9 @@ std::string Job::RequestResume() {
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
+    }
+    if (finishing_at_home_) {
+        return "{\"error\":\"已回原点，正在完成收尾\"}";
     }
     // 与 RequestPause 对称：试笔期间两个工具给同一个解释。
     if (pen_test_active_.load()) {
@@ -2244,6 +2262,8 @@ void Job::Run() {
             }
             ok = false;
         }
+        const bool nopaper_end = pipe.IsNopaperMachine();
+        const uint32_t home_banner = pipe.GetResetBannerSequence();
         if (ok) {
             ok = ReturnHomeAfterDraw();
         }
@@ -2254,19 +2274,23 @@ void Job::Run() {
         } else if (ok) {
             ok = ChangePaperAfterDraw();
         }
+        const bool more_pages =
+            !article_pages_.empty() && article_index_ + 1 < article_pages_.size();
+        if (ok && more_pages &&
+            hutuji::NopaperRejectsMultiPage(nopaper_end, article_pages_.size())) {
+            // 未知机型时接收的多页任务，识别为量产机后拒绝续页，也不得误报整单完成。
+            last_error_ = hutuji::kNopaperMultiPageRejectMsg;
+            ok = false;
+        }
+        if (ok && !more_pages && nopaper_end) {
+            ok = ReleaseMotorsAfterHome(stream_connection_seq_, home_banner, true);
+        }
         if (abort_requested_.load()) {
             SetState("aborted");
             if (auto* d = Board::GetInstance().GetDisplay())
                 d->SetStatus("已取消");
         } else if (ok) {
-            if (!article_pages_.empty() && article_index_ + 1 < article_pages_.size() &&
-                hutuji::NopaperRejectsMultiPage(pipe.IsNopaperMachine(),
-                                                article_pages_.size())) {
-                // 提交闸时 Pipe 未连（机型未知）放行的多页任务，在此收口：
-                // 不换纸直接续页 = 第 2 页画在同一张纸上，必须拦。
-                last_error_ = hutuji::kNopaperMultiPageRejectMsg;
-                ok = false;
-            } else if (!article_pages_.empty() && article_index_ + 1 < article_pages_.size()) {
+            if (more_pages) {
                 // 文章翻页：换纸已成功，释放本页缓冲并推进到下一页重新下载。
                 // paper_change_notified_ 逐页重武装（每页各有一次 M30 播报）；
                 // 预取只对第 1 页有效，后续页 url 不同自然 miss 回落直下载。
@@ -2374,6 +2398,7 @@ void Job::Run() {
         }
         Pipe::GetInstance().SetExpectBlockingPeer(false);
         Pipe::GetInstance().SetTaskSessionActive(false);
+        finishing_at_home_ = false;
         // 必须是旧任务最后一次共享写入；解锁后 StartDraw/Repeat/PenTest 才可发布新任务。
         busy_.store(false, std::memory_order_release);
         break;
@@ -2644,7 +2669,7 @@ bool Job::PreparePenOrigin() {
             return false;
         }
 
-        // `$1=255` 起闲置不自动失能（M30 页尾强制失能除外）；此处留的是弹簧物理回位时间（与 $1 无关）。
+        // $1=255 不在行间失能；量产任务末尾 $MD 后弹簧会回位，新任务必须重新声明 Z0。
         vTaskDelay(pdMS_TO_TICKS(kPenSpringReturnMs));
         bool retry_after_pause = false;
         {
@@ -3048,6 +3073,27 @@ bool Job::RecoverDisconnectedDraw() {
 
 bool Job::ReturnHomeAfterDraw() {
     auto& pipe = Pipe::GetInstance();
+    if (pipe.IsNopaperMachine()) {
+        // 量产任务结束将释放 XYZ，先显式抬笔并等弹簧沉降，避免归位拖痕。
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            if (abort_requested_.load()) {
+                last_error_ = "aborted";
+                return false;
+            }
+            if (!pipe.SendLine("G1G90 Z0.0F10000")) {
+                last_error_ = "归位前抬笔命令发送失败";
+                return false;
+            }
+        }
+        if (pipe.WaitResponse(kHomeOkTimeoutMs) != WaitResult::Ok ||
+            !WaitForIdle(true, kPenOriginIdleTimeoutMs)) {
+            if (last_error_.empty())
+                last_error_ = "归位前抬笔未确认";
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(kPenSpringReturnMs));
+    }
 
     // 归位（2026-08-14 用户决策「画完一张之后要归位」）：画完一页先把笔架送回
     // 原点，再进换纸。必须用 G1 不能用 G0：固件「回原点后换纸」触发
@@ -3101,6 +3147,9 @@ bool Job::ReturnHomeAfterDraw() {
 
 bool Job::HomeAfterAbort(float hold_x, float hold_y) {
     auto& pipe = Pipe::GetInstance();
+    const bool nopaper = pipe.IsNopaperMachine();
+    const uint32_t home_connection = pipe.GetConnectionSequence();
+    const uint32_t home_banner = pipe.GetResetBannerSequence();
     // 受限 reset 已把 Grbl 坐标清零；坐标由调用方在 Hold 确认时快照传入
     // （pipe 每条状态报告都覆写 MPos，函数内现读会拿到复位后的 0,0 假位置）。
     char g92[64];
@@ -3124,6 +3173,9 @@ bool Job::HomeAfterAbort(float hold_x, float hold_y) {
         if (last_error_.empty()) {
             last_error_ = "归位后未确认写字机 Idle";
         }
+        return false;
+    }
+    if (nopaper && !ReleaseMotorsAfterHome(home_connection, home_banner, false)) {
         return false;
     }
     ESP_LOGI(TAG, "abort 归位完成（G92 复原 + G1 X0Y0）");
@@ -3842,6 +3894,68 @@ bool Job::StreamToGrbl() {
                  (unsigned long)dbg_oklat_hist[4], (unsigned long)dbg_oklat_hist[5],
                  (unsigned long)(ok_n ? dbg_oklat_sum_ms / ok_n : 0));
     }
+    return true;
+}
+
+bool Job::ReleaseMotorsAfterHome(uint32_t connection, uint32_t banner, bool honor_abort) {
+    auto& pipe = Pipe::GetInstance();
+    const auto same_session = [&]() {
+        return pipe.IsConnected() && pipe.IsReady() && pipe.IsAuthorized() &&
+               pipe.IsSettingsVerified() && pipe.IsNopaperMachine() &&
+               pipe.GetConnectionSequence() == connection &&
+               pipe.GetResetBannerSequence() == banner;
+    };
+    uint32_t previous_status = 0;
+    while (true) {
+        if (!same_session()) {
+            last_error_ = "归位后连接变化，未释放电机";
+            return false;
+        }
+        previous_status = pipe.GetStatusReportSequence();
+        if (!WaitForIdle(honor_abort, kPenOriginIdleTimeoutMs)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        if (honor_abort && abort_requested_.load()) {
+            last_error_ = "aborted";
+            return false;
+        }
+        if (paused_.load()) {
+            if (honor_abort)
+                continue;
+            last_error_ = "归位后仍处于暂停，未释放电机";
+            return false;
+        }
+        if (paper_active_.load() || !same_session()) {
+            last_error_ = "归位后状态变化，未释放电机";
+            return false;
+        }
+        // 此提交点之后只有 $MD 与收应答，没有后续运动。拒绝迟到控制，直到 busy 释放。
+        finishing_at_home_ = true;
+        break;
+    }
+    // 不能持 stream_mutex_ 等网络；主循环仍可响应 status 与迟到控制请求。
+    bool confirmed = false;
+    if (pipe.SendMotorDisableAtIdle(connection, banner, previous_status)) {
+        const TickType_t began = xTaskGetTickCount();
+        while (same_session() && xTaskGetTickCount() - began < pdMS_TO_TICKS(kHomeOkTimeoutMs)) {
+            const WaitResult reply = pipe.WaitResponse(100);
+            if (reply == WaitResult::Ok) {
+                confirmed = same_session();
+                break;
+            }
+            if (reply != WaitResult::Timeout)
+                break;
+        }
+    }
+    if (!confirmed) {
+        // 超时/断连后的迟到 ok 不得被下一任务认领，也不能在新连接上补发 $MD。
+        pipe.ShutdownSocket(connection);
+        last_error_ = "已归位，电机释放未确认，请重新连接后再试";
+        ESP_LOGW(TAG, "%s", last_error_.c_str());
+        return false;
+    }
+    ESP_LOGI(TAG, "量产机归位后电机释放已确认；下一运动自动使能");
     return true;
 }
 
