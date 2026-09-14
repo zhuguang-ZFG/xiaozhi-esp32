@@ -224,6 +224,16 @@ private:
 
     void ScheduleMachineControl(const char* action, MachineControlRequest request) {
         ESP_LOGI(TAG, "ui machine action=%s", action);
+        if (request == &hutuji::Job::RequestRepeat) {
+            if (!McpServer::GetInstance().ScheduleBackground([this, request]() {
+                    const std::string result = (hutuji::Job::GetInstance().*request)();
+                    Application::GetInstance().Schedule([this, result]() {
+                        display_->ShowNotification(MachineControlFeedback(result));
+                    });
+                }))
+                display_->ShowNotification("正在处理上一个操作，请稍候");
+            return;
+        }
         Application::GetInstance().Schedule([this, request]() {
             const std::string result = (hutuji::Job::GetInstance().*request)();
             display_->ShowNotification(MachineControlFeedback(result));
@@ -232,10 +242,15 @@ private:
     void ScheduleManualControl(const char* action) {
         ESP_LOGI(TAG, "ui machine action=%s", action);
         const std::string act = action;
-        Application::GetInstance().Schedule([this, act]() {
-            const std::string result = hutuji::Job::GetInstance().RequestManualControl(act);
-            display_->ShowNotification(MachineControlFeedback(result));
-        });
+        // 坐标预检可能等待网络，不能占用主循环或 LVGL 触摸任务。
+        if (!McpServer::GetInstance().ScheduleBackground([this, act]() {
+                const std::string result = hutuji::Job::GetInstance().RequestManualControl(act);
+                Application::GetInstance().Schedule([this, result]() {
+                    display_->ShowNotification(MachineControlFeedback(result));
+                });
+            })) {
+            display_->ShowNotification("正在处理上一个操作，请稍候");
+        }
     }
 
     void InitializeTools() {
@@ -259,6 +274,30 @@ private:
 
         hutuji::ota::RegisterTools(mcp_server);
         hutuji::memory::RegisterTools(mcp_server);
+
+        if (auto* lcd = dynamic_cast<LcdDisplay*>(display_)) {
+            lcd->ConfigurePaperControls([](const std::string& action, const std::string& expected) {
+                hutuji::Job::GetInstance().RequestPaperFromScreen(action, expected);
+            });
+        }
+        mcp_server.AddBackgroundTool(
+            "hutuji.paper",
+            "读取或设置本机纸张。config 为空只读；写入使用包含 paper/width_mm/height_mm/"
+            "landscape/margin_mm/swap_xy/max_x_mm/max_y_mm 的 JSON，expected 取刚读回的配置标记。"
+            "只有用户核对实际可绘制行程后才传 range_confirmed=true；任务或预览中不允许修改。"
+            "restore_defaults 仅在用户明确确认恢复 A4 默认范围时使用。"
+            "成功返回完整状态和 paper_config 读回值，旧 paper 字段仍表示有无纸。",
+            PropertyList({Property("config", kPropertyTypeString, ""),
+                          Property("expected", kPropertyTypeString, ""),
+                          Property("range_confirmed", kPropertyTypeBoolean, false),
+                          Property("restore_defaults", kPropertyTypeBoolean, false)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestPaper(
+                    properties["config"].value<std::string>(),
+                    properties["expected"].value<std::string>(),
+                    properties["range_confirmed"].value<bool>(),
+                    properties["restore_defaults"].value<bool>());
+            });
 
         display_->ConfigureMachineControls(
             [this]() { ScheduleMachineControl("pause", &hutuji::Job::RequestPause); },
@@ -323,7 +362,8 @@ private:
                 return hutuji::Job::GetInstance().StartDraw(url, preview_url, pages);
             });
 
-        mcp_server.AddTool("hutuji.confirm",
+        mcp_server.AddBackgroundTool(
+            "hutuji.confirm",
             "用户看过屏幕预览后确认出图：说「开始画/可以/就这个」时用。"
             "仅在 state 为 awaiting_confirmation 时有效；等价于用户点屏幕「开始画」按钮。",
             PropertyList(), [](const PropertyList& properties) -> ReturnValue {
@@ -346,10 +386,10 @@ private:
                 return hutuji::Job::GetInstance().RequestResume();
             });
 
-        mcp_server.AddTool("hutuji.repeat", "把上一张画再画一遍。", PropertyList(),
-            [](const PropertyList& properties) -> ReturnValue {
-                return hutuji::Job::GetInstance().RequestRepeat();
-            });
+        mcp_server.AddBackgroundTool("hutuji.repeat", "把上一张画再画一遍。", PropertyList(),
+                                     [](const PropertyList& properties) -> ReturnValue {
+                                         return hutuji::Job::GetInstance().RequestRepeat();
+                                     });
 
         mcp_server.AddTool("hutuji.pen_test", "笔测试：落笔停 1 秒再抬笔。", PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
@@ -357,7 +397,7 @@ private:
             });
 
         // 语音手动控制：描述与 lichuang_dev_board 保持逐字一致，避免双板行为漂移。
-        mcp_server.AddTool(
+        mcp_server.AddBackgroundTool(
             "hutuji.manual",
             "手动控制写字机轴运动，仅空闲可用。action 取值："
             "\"jog_x+\"/\"jog_x-\"/\"jog_y+\"/\"jog_y-\" 按当前步距点动（步距用 "

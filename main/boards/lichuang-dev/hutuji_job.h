@@ -2,6 +2,7 @@
 #define HUTUJI_JOB_H
 
 #include "http.h"
+#include "hutuji_paper_core.h"
 #include "hutuji_recovery_core.h"
 #include "hutuji_speed_core.h"
 
@@ -65,6 +66,13 @@ public:
      */
     std::string RequestSpeed(int rate, const std::string& axis = "xy");
 
+    /** 纸张单事务写入；仅后台工具/屏幕 worker 调用，读回确认后才发布。 */
+    std::string RequestPaper(const std::string& config, const std::string& expected,
+                             bool range_confirmed, bool restore_defaults = false);
+    bool GetPaperConfig(PaperConfig& config) const;
+    /** 屏幕只选预设/方向/交换，不隐含增加机器行程。 */
+    void RequestPaperFromScreen(const std::string& action, const std::string& expected);
+
     /** 当前点动步进（1 或 10mm，默认 10）。 */
     float GetJogStepMm();
 
@@ -86,7 +94,7 @@ public:
     }
 
 private:
-    Job() = default;
+    Job();
 
     static void TaskEntry(void* arg);
     static void PreviewTaskEntry(void* arg);
@@ -224,9 +232,28 @@ private:
 
     void SetJogStepMm(float step);
     void EnsureJogStepLoaded();
+    bool CheckPaperHeader(Http* http, std::string& marker) const;
+    bool GetPaperJogEnvelope(float& max_x, float& max_y) const;
+    mutable std::mutex paper_mutex_;
+    PaperConfig saved_paper_;
+    bool paper_persisted_ = false;
+    bool paper_store_fault_ = false;
+    bool paper_saved_nopaper_ = false;
+    mutable bool paper_machine_known_ = false;
+    mutable bool paper_last_nopaper_ = false;
+    std::atomic<bool> paper_update_active_{false};
+    // busy 可能在预览取消时释放；独立旗标必须等旧 TLS/预取 worker 真退出才释放。
+    std::atomic<bool> preview_worker_active_{false};
+    std::string job_paper_marker_;
+    std::string buffer_paper_marker_;
+    std::string prefetch_paper_marker_;
 
     /** 手动控制动作载荷：RequestManualControl 写入、ManualTask 消费（busy_ 保护）。 */
     std::string pending_manual_action_;
+    uint32_t manual_connection_seq_ = 0;
+    uint32_t manual_banner_seq_ = 0;
+    // 只在 state_mutex_ 下发布/读取；离开本次 error/manual 状态后清空。
+    std::string manual_error_;
     float jog_step_mm_ = kJogStepMmDefault;
     bool jog_step_loaded_ = false;
     std::string url_;

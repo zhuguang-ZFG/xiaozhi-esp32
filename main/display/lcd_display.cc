@@ -17,6 +17,7 @@
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
+#include <cJSON.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <material_symbols.h>
@@ -25,6 +26,7 @@
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -39,7 +41,8 @@
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 && CONFIG_HUTUJI_GROBOT_FACE
 #include "boards/lichuang-dev/hutuji_pi_splash.h"
 #endif
-#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 || \
+    CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
 #include "boards/lichuang-dev/hutuji_job.h"
 #include "boards/lichuang-dev/hutuji_pipe.h"
 #include "boards/lichuang-dev/hutuji_recovery_core.h"
@@ -48,6 +51,15 @@
 #define TAG "LcdDisplay"
 
 namespace {
+
+bool IsCompactHutujiScreen() {
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 || \
+    CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
+    return LV_HOR_RES <= 360 && LV_VER_RES <= 260;
+#else
+    return false;
+#endif
+}
 
 void QrPixelCallback(esp_qrcode_handle_t qrcode, void* user_data) {
     auto* modules = static_cast<std::vector<uint8_t>*>(user_data);
@@ -834,6 +846,7 @@ void LcdDisplay::EnsureMachineControlUi() {
     // （本文件头注 CONSTRAINTS / PRODUCT.md:55「at least 56 px」/
     // DESIGN.md:169），2026-08-20 改版降到 48px 属违规漂移；08-26 诊断日志
     // 距离分析（脱靶 29-52px）亦证明 48px 不够，恢复 56。
+    const bool compact = IsCompactHutujiScreen();
     const lv_coord_t corner_btn_size = 56;
     const lv_coord_t talk_diameter = 96;
     // 抽屉内按钮行高：主操作行 20% 屏高、其余 17%，56px 下限兜底（儿童命中面）。
@@ -923,7 +936,7 @@ void LcdDisplay::EnsureMachineControlUi() {
     AttachHomeEntryButton(wifi_config_btn_, &wifi_config_drag_, &wifi_config_, "wifi");
     // 布局记忆恢复：NVS 有存档就覆盖上面的默认位（越界/无存档回默认，不会
     // 把按钮藏到屏外）。
-    {
+    if (!compact) {
         lv_coord_t saved_x, saved_y;
         if (LoadHomeButtonPos("talk", &saved_x, &saved_y)) {
             lv_obj_set_pos(voice_talk_btn_, saved_x, saved_y);
@@ -933,6 +946,26 @@ void LcdDisplay::EnsureMachineControlUi() {
         }
         if (LoadHomeButtonPos("wifi", &saved_x, &saved_y)) {
             lv_obj_set_pos(wifi_config_btn_, saved_x, saved_y);
+        }
+    }
+    if (compact) {
+        // 320×240 的底部是固定入口区；旧 NVS 坐标保留但不再导致按钮重叠。
+        const lv_coord_t widths[] = {72, LV_HOR_RES - 180, 92};
+        lv_obj_t* buttons[] = {wifi_config_btn_, voice_talk_btn_, machine_control_trigger_btn_};
+        lv_coord_t x = 4;
+        for (int i = 0; i < 3; ++i) {
+            lv_obj_set_size(buttons[i], widths[i], 56);
+            lv_obj_set_pos(buttons[i], x, LV_VER_RES - 60);
+            lv_obj_set_ext_click_area(buttons[i], 0);
+            lv_obj_set_style_pad_all(buttons[i], 4, 0);
+            lv_obj_set_style_radius(buttons[i], 16, 0);
+            lv_obj_set_style_shadow_width(buttons[i], 0, 0);
+            if (buttons[i] != voice_talk_btn_) {
+                lv_obj_set_style_bg_color(buttons[i], theme->surface_color(), 0);
+                lv_obj_set_style_text_color(lv_obj_get_child(buttons[i], 0), theme->text_color(),
+                                            0);
+            }
+            x += widths[i] + 4;
         }
     }
     // 开机打印三钮恢复后的实际几何：命中归因依赖真实落点（08-26 距离分析
@@ -966,12 +999,12 @@ void LcdDisplay::EnsureMachineControlUi() {
     // 内容。具体阻断滚动的 LVGL 环节未逐一定位，不据此断言机制；但结论是确定的：
     // 任何依赖「面板滚动到达满铺按钮之外内容」的方案在 480x320 上不可交付。改为固定
     // 高 + 主操作区/手动区互斥切页，每页都塞得进视口，彻底不靠滚动到达任何按钮。
-    const lv_coord_t panel_width = LV_HOR_RES - theme->spacing(16);
-    const lv_coord_t content_width = panel_width - theme->spacing(8);
-    const lv_coord_t half_width = (content_width - theme->spacing(4)) / 2;
+    const lv_coord_t panel_width = compact ? LV_HOR_RES : LV_HOR_RES - theme->spacing(16);
+    const lv_coord_t content_width = compact ? panel_width - 4 : panel_width - theme->spacing(8);
+    const lv_coord_t half_width = (content_width - (compact ? 4 : theme->spacing(4))) / 2;
     lv_obj_t* panel = lv_obj_create(machine_control_root_);
     lv_obj_set_width(panel, panel_width);
-    lv_obj_set_height(panel, LV_VER_RES - theme->spacing(4));
+    lv_obj_set_height(panel, compact ? LV_VER_RES : LV_VER_RES - theme->spacing(4));
     lv_obj_align(panel, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(panel, 24, 0);
     lv_obj_set_style_border_width(panel, 1, 0);
@@ -982,7 +1015,12 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_obj_set_style_shadow_color(panel, lv_color_black(), 0);
     lv_obj_set_style_shadow_opa(panel, LV_OPA_30, 0);
     lv_obj_set_style_pad_all(panel, theme->spacing(4), 0);
-    lv_obj_set_style_pad_row(panel, theme->spacing(4), 0);
+    lv_obj_set_style_pad_row(panel, compact ? 2 : theme->spacing(4), 0);
+    if (compact) {
+        lv_obj_set_style_pad_all(panel, 2, 0);
+        lv_obj_set_style_border_width(panel, 0, 0);
+        lv_obj_set_style_radius(panel, 0, 0);
+    }
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     // 面板不滚动：分页保证每页都装得下，滚动条与滚动方向一并去掉，避免留下
@@ -1008,6 +1046,8 @@ void LcdDisplay::EnsureMachineControlUi() {
         // 面板已分页且不可滚动，按钮无需清 SCROLL_CHAIN；点按防误触靠板级 24px
         // indev 滚动阈值（esp32-s3-touch-lcd-3.5.cc InitializeTouch），抖动不误判。
         lv_obj_set_size(btn, width, height);
+        if (compact)
+            lv_obj_set_style_pad_all(btn, 2, 0);
         lv_obj_set_style_radius(btn, 18, 0);
         lv_obj_set_style_bg_color(btn, color, 0);
         lv_obj_set_style_bg_color(btn, disabled_bg, LV_STATE_DISABLED);
@@ -1063,6 +1103,15 @@ void LcdDisplay::EnsureMachineControlUi() {
         make_button(header, Lang::Strings::MACHINE_CLOSE, theme->assistant_bubble_color(),
                     theme->text_color(), LV_HOR_RES / 5, safe_button_height);
 
+    if (compact) {
+        lv_obj_add_flag(title, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_pad_column(header, 4, 0);
+        lv_obj_set_width(machine_state_label_, content_width - 204);
+        lv_obj_set_style_max_width(machine_state_label_, content_width - 204, 0);
+        lv_obj_set_size(machine_manual_toggle_btn_, 132, 56);
+        lv_obj_set_size(machine_close_btn_, 64, 56);
+    }
+
     // ── 主页：暂停/继续 + 再画一张/试试笔 + 停止（56+8+56+8+64 = 192 ≤ 232）──
     machine_main_section_ = lv_obj_create(panel);
     lv_obj_remove_style_all(machine_main_section_);
@@ -1096,6 +1145,15 @@ void LcdDisplay::EnsureMachineControlUi() {
     machine_abort_btn_ =
         make_button(machine_main_section_, Lang::Strings::MACHINE_STOP, theme->danger_color(),
                     lv_color_white(), content_width, safe_button_height);
+
+    if (compact) {
+        // 两行覆盖全部任务动作，停止始终可见；第三行在 240px 高屏上放不下。
+        lv_obj_set_style_pad_row(machine_main_section_, 4, 0);
+        lv_obj_set_parent(machine_abort_btn_, primary_row);
+        for (lv_obj_t* btn : {machine_pause_btn_, machine_resume_btn_, machine_abort_btn_}) {
+            lv_obj_set_size(btn, (content_width - 8) / 3, 56);
+        }
+    }
 
     // ── 手动页：左列点动十字 + 右列六个工具键，3 行 ×56 + 2 间距 = 184 ≤ 232 ──
     // 单列纵排（旧实现）共 6 行 336px，必然溢出面板；面板又不可滚（见上方固定高
@@ -1138,9 +1196,11 @@ void LcdDisplay::EnsureMachineControlUi() {
                           LV_FLEX_ALIGN_START);
     lv_obj_clear_flag(manual_body, LV_OBJ_FLAG_SCROLLABLE);
 
-    const lv_coord_t jog_size = safe_button_height;
-    const lv_coord_t jog_col_width = jog_size * 3 + theme->spacing(4) * 2;
-    const lv_coord_t tool_col_width = content_width - jog_col_width - theme->spacing(4);
+    // 实际 20px 字体的“10mm”宽 59px；68px 容纳字形与描边，仍保留 56px 行高。
+    const lv_coord_t jog_size = std::max<lv_coord_t>(safe_button_height, 68);
+    const lv_coord_t jog_col_width = jog_size * 3 + (compact ? 4 : theme->spacing(4)) * 2;
+    const lv_coord_t tool_col_width =
+        content_width - jog_col_width - (compact ? 4 : theme->spacing(4));
     const lv_coord_t tool_width = (tool_col_width - theme->spacing(4)) / 2;
     auto make_col = [&](lv_coord_t width) {
         lv_obj_t* col = lv_obj_create(manual_body);
@@ -1148,7 +1208,7 @@ void LcdDisplay::EnsureMachineControlUi() {
         lv_obj_set_size(col, width, LV_SIZE_CONTENT);
         lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_row(col, theme->spacing(4), 0);
+        lv_obj_set_style_pad_row(col, compact ? 4 : theme->spacing(4), 0);
         lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
         return col;
     };
@@ -1214,6 +1274,30 @@ void LcdDisplay::EnsureMachineControlUi() {
     make_manual(power_row, Lang::Strings::MACHINE_RESET, theme->danger_color(), lv_color_white(),
                 tool_width, "reset");
 
+    if (compact) {
+        machine_tools_section_ = lv_obj_create(panel);
+        lv_obj_remove_style_all(machine_tools_section_);
+        lv_obj_set_size(machine_tools_section_, content_width, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(machine_tools_section_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(machine_tools_section_, 4, 0);
+        lv_obj_clear_flag(machine_tools_section_, LV_OBJ_FLAG_SCROLLABLE);
+        // 坐标移到调试页；点动页保留三行 56px 十字和右侧抬/落笔。
+        for (lv_obj_t* row : {origin_row, power_row}) {
+            lv_obj_set_parent(row, machine_tools_section_);
+            lv_obj_set_width(row, content_width);
+            for (uint32_t i = 0; i < lv_obj_get_child_count(row); ++i) {
+                lv_obj_set_width(lv_obj_get_child(row, i), half_width);
+            }
+        }
+        lv_obj_set_parent(machine_hud_label_, machine_tools_section_);
+        lv_obj_set_style_pad_row(machine_manual_section_, 0, 0);
+        lv_obj_set_flex_flow(pen_row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(pen_row, 4, 0);
+        for (uint32_t i = 0; i < lv_obj_get_child_count(pen_row); ++i) {
+            lv_obj_set_width(lv_obj_get_child(pen_row, i), tool_col_width);
+        }
+    }
+
     // ── 维护页（第三页）：写字机零接触配网的手动入口。写字机被重置回出厂热点
     // 或更换新机时，S3 停在户网上不会产生新的 Connected 事件，自动巡检不触发，
     // 由本入口强制走一遍「扫描出厂热点→跳配→写凭据→回切验证」。
@@ -1253,6 +1337,74 @@ void LcdDisplay::EnsureMachineControlUi() {
         lv_obj_add_flag(bind_hint, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(machine_draw_bind_btn_, LV_OBJ_FLAG_HIDDEN);
     }
+    if (compact) {
+        lv_obj_add_flag(maint_hint, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bind_hint, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_pad_row(machine_maint_section_, 4, 0);
+    }
+    // 纸张单独分页：两个 56px 操作行与两行摘要，小屏也保留完整命中面。
+    machine_paper_section_ = lv_obj_create(panel);
+    lv_obj_remove_style_all(machine_paper_section_);
+    lv_obj_set_size(machine_paper_section_, content_width, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(machine_paper_section_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(machine_paper_section_, compact ? 2 : 4, 0);
+    lv_obj_clear_flag(machine_paper_section_, LV_OBJ_FLAG_SCROLLABLE);
+    machine_paper_summary_ = lv_label_create(machine_paper_section_);
+    lv_obj_set_width(machine_paper_summary_, content_width);
+    lv_label_set_long_mode(machine_paper_summary_, LV_LABEL_LONG_MODE_WRAP);
+    // 实际 common 20 字体行高 31px；两行摘要不可按字号 20 估高度。
+    lv_obj_set_style_text_line_space(machine_paper_summary_, 0, 0);
+    lv_obj_set_height(machine_paper_summary_, 62);
+    lv_label_set_text(machine_paper_summary_, "纸张设置\n正在读取...");
+    lv_obj_set_style_text_color(machine_paper_summary_, theme->muted_text_color(), 0);
+    auto make_paper_button = [&](lv_obj_t* parent, const char* label, int action,
+                                 lv_coord_t width) {
+        lv_obj_t* btn = make_button(parent, label, theme->assistant_bubble_color(),
+                                    theme->text_color(), width, safe_button_height);
+        machine_paper_buttons_.push_back(btn);
+        lv_obj_add_event_cb(
+            btn,
+            [](lv_event_t* event) {
+                auto* button = static_cast<PaperButton*>(lv_event_get_user_data(event));
+                auto* self = button->display;
+                if (!self->machine_paper_)
+                    return;
+                if (std::strcmp(button->action, "restore") == 0 &&
+                    !self->machine_paper_restore_armed_) {
+                    self->machine_paper_restore_armed_ = true;
+                    lv_label_set_text(self->machine_paper_restore_hint_,
+                                      "确认已核对 A4 的可绘制范围\n再次点击恢复默认");
+                    return;
+                }
+                const std::string marker = self->machine_paper_marker_;
+                self->machine_paper_restore_armed_ = false;
+                self->machine_paper_(button->action, marker);
+            },
+            LV_EVENT_CLICKED, &machine_paper_actions_[action]);
+        return btn;
+    };
+    lv_obj_t* paper_sizes = make_row(machine_paper_section_);
+    const lv_coord_t third_width = (content_width - 8) / 3;
+    make_paper_button(paper_sizes, "A4", 0, third_width);
+    make_paper_button(paper_sizes, "A3", 1, third_width);
+    make_paper_button(paper_sizes, "A2", 2, third_width);
+    lv_obj_t* paper_direction = make_row(machine_paper_section_);
+    make_paper_button(paper_direction, "横竖切换", 3, half_width);
+    make_paper_button(paper_direction, "交换 XY", 4, half_width);
+
+    machine_paper_restore_section_ = lv_obj_create(panel);
+    lv_obj_remove_style_all(machine_paper_restore_section_);
+    lv_obj_set_size(machine_paper_restore_section_, content_width, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(machine_paper_restore_section_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(machine_paper_restore_section_, 4, 0);
+    lv_obj_clear_flag(machine_paper_restore_section_, LV_OBJ_FLAG_SCROLLABLE);
+    machine_paper_restore_hint_ = lv_label_create(machine_paper_restore_section_);
+    lv_obj_set_width(machine_paper_restore_hint_, content_width);
+    lv_label_set_long_mode(machine_paper_restore_hint_, LV_LABEL_LONG_MODE_WRAP);
+    lv_label_set_text(machine_paper_restore_hint_,
+                      "自定义纸张、留边与行程\n请在小程序纸张设置中调整");
+    lv_obj_set_style_text_color(machine_paper_restore_hint_, theme->muted_text_color(), 0);
+    make_paper_button(machine_paper_restore_section_, "恢复默认 A4", 5, content_width);
     SetMachineDrawerPage(0);
 
     // 抽屉盖住主屏状态栏，断连/失败通知必须画在遮罩上面，否则点 XY 像没反应。
@@ -1277,6 +1429,14 @@ void LcdDisplay::EnsureMachineControlUi() {
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             lv_obj_t* btn = self->machine_control_trigger_btn_;
+            if (IsCompactHutujiScreen()) {
+                if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+                    self->ApplyMachineControlState();
+                    lv_obj_move_foreground(self->machine_control_root_);
+                    lv_obj_remove_flag(self->machine_control_root_, LV_OBJ_FLAG_HIDDEN);
+                }
+                return;
+            }
             switch (lv_event_get_code(e)) {
                 case LV_EVENT_PRESSED: {
                     lv_indev_t* indev = lv_event_get_indev(e);
@@ -1359,7 +1519,20 @@ void LcdDisplay::EnsureMachineControlUi() {
         [](lv_event_t* e) {
             auto* self = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
             // 主页 → 手动 → 维护 → 主页 循环切页。
-            self->SetMachineDrawerPage((self->machine_page_ + 1) % 3);
+            int next = IsCompactHutujiScreen() ? (self->machine_page_ == 0   ? 1
+                                                  : self->machine_page_ == 1 ? 3
+                                                  : self->machine_page_ == 3 ? 2
+                                                                             : 0)
+                                               : (self->machine_page_ + 1) % 3;
+            if (self->machine_paper_) {
+                if (self->machine_page_ == 0)
+                    next = 4;
+                else if (self->machine_page_ == 4)
+                    next = 5;
+                else if (self->machine_page_ == 5)
+                    next = 1;
+            }
+            self->SetMachineDrawerPage(next);
         },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
@@ -1477,7 +1650,7 @@ void LcdDisplay::SetMachineDrawerPage(int page) {
     const bool show_manual = (page == 1);
     const bool show_maint = (page == 2);
     if (machine_main_section_ != nullptr) {
-        if (show_manual || show_maint) {
+        if (show_manual || show_maint || page == 3 || page == 4 || page == 5) {
             lv_obj_add_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_remove_flag(machine_main_section_, LV_OBJ_FLAG_HIDDEN);
@@ -1493,11 +1666,48 @@ void LcdDisplay::SetMachineDrawerPage(int page) {
     } else {
         lv_obj_add_flag(machine_maint_section_, LV_OBJ_FLAG_HIDDEN);
     }
+    if (machine_tools_section_ != nullptr) {
+        if (page == 3)
+            lv_obj_remove_flag(machine_tools_section_, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(machine_tools_section_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (machine_paper_section_) {
+        if (page == 4)
+            lv_obj_remove_flag(machine_paper_section_, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(machine_paper_section_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (machine_paper_restore_section_) {
+        if (page == 5)
+            lv_obj_remove_flag(machine_paper_restore_section_, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(machine_paper_restore_section_, LV_OBJ_FLAG_HIDDEN);
+    }
+    machine_paper_restore_armed_ = false;
+    if (machine_paper_restore_hint_)
+        lv_label_set_text(machine_paper_restore_hint_,
+                          "自定义纸张、留边与行程\n请在小程序纸张设置中调整");
+    if ((page == 4 || page == 5) && machine_paper_)
+        machine_paper_("read", "");
     // 切页钮文案 = 下一页目标：主页→点动·手动→维护→主页。
     lv_label_set_text(machine_manual_toggle_label_, page == 0 ? Lang::Strings::MACHINE_MANUAL_EXPAND
                                                     : page == 1
                                                         ? Lang::Strings::MACHINE_MAINT_EXPAND
                                                         : Lang::Strings::MACHINE_MAIN_PAGE);
+    if (IsCompactHutujiScreen() && page == 1) {
+        lv_label_set_text(machine_manual_toggle_label_, Lang::Strings::MACHINE_MANUAL_SECTION);
+    } else if (page == 3) {
+        lv_label_set_text(machine_manual_toggle_label_, Lang::Strings::MACHINE_MAINT_EXPAND);
+    }
+    if (machine_paper_) {
+        if (page == 0)
+            lv_label_set_text(machine_manual_toggle_label_, "纸张设置");
+        else if (page == 4)
+            lv_label_set_text(machine_manual_toggle_label_, "更多设置");
+        else if (page == 5)
+            lv_label_set_text(machine_manual_toggle_label_, "点动工具");
+    }
     // 切页无其他日志面，HIL 取证需要区分「CLICKED 没发」与「发了但别的环节断」。
     // 顺带记 taskLVGL 历史最深空闲栈（HWM 单调只减，此刻读到的是手动页布局+绘制
     // 全程峰值余量）：证据化 12288 抬栈后手动页是否仍贴底，防止它静默回压穿。
@@ -1518,7 +1728,8 @@ void LcdDisplay::MachineHudTimerCb(lv_timer_t* timer) {
     self->ApplyMachineControlState();
 }
 
-#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 || \
+    CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
 void LcdDisplay::EnsureGrblStatusDot(lv_obj_t* right_icons) {
     if (right_icons == nullptr || grbl_dot_ != nullptr) {
         return;
@@ -1640,7 +1851,8 @@ void LcdDisplay::ApplyMachineControlState() {
         lv_obj_set_style_text_color(machine_state_label_, state_color, 0);
         lv_obj_set_style_bg_color(machine_state_label_, theme->assistant_bubble_color(), 0);
     }
-#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 || \
+    CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
     if (machine_hud_label_ != nullptr) {
         auto* hud_theme = static_cast<LvglTheme*>(current_theme_);
         auto& hud_pipe = hutuji::Pipe::GetInstance();
@@ -1720,6 +1932,54 @@ void LcdDisplay::ConfigureDrawBind(std::function<void()> on_bind) {
     }
 }
 
+void LcdDisplay::ConfigurePaperControls(
+    std::function<void(const std::string&, const std::string&)> on_paper) {
+    machine_paper_ = std::move(on_paper);
+    if (setup_ui_called_ && machine_manual_toggle_label_) {
+        DisplayLockGuard lock(this);
+        SetMachineDrawerPage(machine_page_);
+    }
+}
+
+void LcdDisplay::UpdatePaperControls(const std::string& status) {
+    DisplayLockGuard lock(this);
+    cJSON* root = cJSON_Parse(status.c_str());
+    const cJSON* section = cJSON_GetObjectItemCaseSensitive(root, "paper_config");
+    const cJSON* config = cJSON_GetObjectItemCaseSensitive(section, "config");
+    const cJSON* marker = cJSON_GetObjectItemCaseSensitive(section, "marker");
+    const cJSON* name = cJSON_GetObjectItemCaseSensitive(config, "paper");
+    const cJSON* x = cJSON_GetObjectItemCaseSensitive(config, "max_x_mm");
+    const cJSON* y = cJSON_GetObjectItemCaseSensitive(config, "max_y_mm");
+    const bool valid = cJSON_IsString(marker) && marker->valuestring && cJSON_IsString(name) &&
+                       name->valuestring && cJSON_IsNumber(x) && cJSON_IsNumber(y);
+    machine_paper_marker_ =
+        cJSON_IsString(marker) && marker->valuestring ? marker->valuestring : "invalid";
+    if (machine_paper_summary_) {
+        char summary[160];
+        if (valid) {
+            const bool landscape =
+                cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(config, "landscape"));
+            const bool swap = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(config, "swap_xy"));
+            std::snprintf(summary, sizeof(summary), "%s %s · XY %s\n可绘制 %.1f × %.1f mm",
+                          name->valuestring, landscape ? "横版" : "竖版", swap ? "交换" : "直连",
+                          x->valuedouble, y->valuedouble);
+        } else {
+            std::snprintf(summary, sizeof(summary), "纸张记录需恢复\n请进入更多设置");
+        }
+        lv_label_set_text(machine_paper_summary_, summary);
+    }
+    const bool ready = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "connected")) &&
+                       cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "ready"));
+    const bool updating = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(section, "updating"));
+    for (size_t i = 0; i < machine_paper_buttons_.size(); ++i) {
+        if (ready && !updating && (valid || i == 5))
+            lv_obj_remove_state(machine_paper_buttons_[i], LV_STATE_DISABLED);
+        else
+            lv_obj_add_state(machine_paper_buttons_[i], LV_STATE_DISABLED);
+    }
+    cJSON_Delete(root);
+}
+
 // 布局记忆（2026-08-20 用户决策）：主页三个可拖按钮的落点存 NVS「hutuji_ui」
 // 命名空间（trig/talk/wifi × _x/_y），重启后原地恢复。键值对少、写入频次低
 // （仅拖动松手一次），直接用项目 Settings 封装。
@@ -1750,6 +2010,17 @@ void LcdDisplay::AttachHomeEntryButton(lv_obj_t* btn, HomeButtonDrag* state,
     // 不吞起步位移），越 24px 记拖动，松手未拖才触发动作；PRESS_LOCK 由创建处加。
     state->action = action;
     state->nvs_prefix = nvs_prefix;
+    if (IsCompactHutujiScreen()) {
+        lv_obj_add_event_cb(
+            btn,
+            [](lv_event_t* e) {
+                auto* state = static_cast<HomeButtonDrag*>(lv_event_get_user_data(e));
+                if (state->action != nullptr && *state->action)
+                    (*state->action)();
+            },
+            LV_EVENT_CLICKED, state);
+        return;
+    }
     lv_obj_add_event_cb(
         btn,
         [](lv_event_t* e) {
@@ -2029,6 +2300,11 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     constexpr int kFaceHeight = 232;
 #endif
     lv_obj_set_size(emoji_box_, kFaceWidth, kFaceHeight);
+    if (IsCompactHutujiScreen()) {
+        // 顶栏 28px、字幕 30px、入口 56px 各自留位，不再遮住嘴和眼睛。
+        lv_obj_set_size(emoji_box_, LV_HOR_RES - 8, LV_VER_RES - 128);
+        lv_obj_align(emoji_box_, LV_ALIGN_TOP_MID, 0, 28);
+    }
     // 兑现上方「状态栏继续独立叠在最前层」：WeChat 分支的创建顺序是栏在前、脸在后，
     // 460x300 整屏脸会把顶栏/状态胶囊压到不可见（普通分支栏在脸后创建，天然在上，
     // 此处空指针跳过）。z-order 只在兄弟间生效——顶栏原是 container_ 子件，须先改挂
@@ -2050,8 +2326,10 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     lv_obj_set_style_bg_color(emoji_box_, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_COVER, 0);
     InitKawaiiFace();
-    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    if (kawaii_face_active_) {
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
     CreateGrobotSubtitleBar(screen, theme);
 #else
     // Grobot 自己从 π splash 的共享渐变取色；主题 accent 仍只用于按钮/状态语义。
@@ -2088,6 +2366,14 @@ void LcdDisplay::CreateGrobotSubtitleBar(lv_obj_t* screen, LvglTheme* theme) {
     lv_obj_set_style_text_color(grobot_subtitle_label_, theme->text_color(), 0);
     lv_label_set_text(grobot_subtitle_label_, "");
     lv_obj_center(grobot_subtitle_label_);
+    if (IsCompactHutujiScreen()) {
+        lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES - 8, 30);
+        lv_obj_align(grobot_subtitle_bar_, LV_ALIGN_BOTTOM_MID, 0, -64);
+        lv_obj_set_width(grobot_subtitle_label_, LV_HOR_RES - 24);
+        lv_label_set_long_mode(grobot_subtitle_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_style_anim_duration(grobot_subtitle_label_,
+                                       lv_anim_speed_clamped(35, 1000, 60000), 0);
+    }
     lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
 }
 #endif
@@ -2149,12 +2435,13 @@ void LcdDisplay::AccentDriftTimerCb(lv_timer_t* timer) {
     lv_obj_t* targets[] = {self->voice_talk_btn_, self->machine_control_trigger_btn_,
                            self->wifi_config_btn_, self->draw_preview_confirm_btn_};
     for (lv_obj_t* btn : targets) {
-        if (btn != nullptr) {
+        if (btn != nullptr && (!IsCompactHutujiScreen() || btn == self->voice_talk_btn_ ||
+                               btn == self->draw_preview_confirm_btn_)) {
             lv_obj_set_style_bg_color(btn, btn == self->voice_talk_btn_ ? talk_c : c, 0);
         }
     }
     // 说话大圆钮再叠 2.5s 呼吸光晕：彩色阴影宽度/不透明度脉动，全屏视觉主角。
-    if (self->voice_talk_btn_ != nullptr) {
+    if (self->voice_talk_btn_ != nullptr && !IsCompactHutujiScreen()) {
         const float breath = 0.5f + 0.5f * sinf((float)(tick % 2500) / 2500.0f * 6.2832f);
         lv_obj_set_style_shadow_width(self->voice_talk_btn_, 24 + (int)(12.0f * breath), 0);
         lv_obj_set_style_shadow_color(self->voice_talk_btn_, talk_c, 0);
@@ -2228,7 +2515,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_align(right_icons, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
-#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 || \
+    CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
     // 右图标组最左落 Grbl 状态圆点（静音/电池之前）。
     EnsureGrblStatusDot(right_icons);
 #endif
@@ -2737,7 +3025,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_align(right_icons, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
-#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+#if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 || \
+    CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
     // 右图标组最左落 Grbl 状态圆点（静音/电池之前）。
     EnsureGrblStatusDot(right_icons);
 #endif
@@ -2767,7 +3056,9 @@ void LcdDisplay::SetupUI() {
     lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);        // Overlap with top_bar_
 
     notification_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
+    lv_obj_set_width(notification_label_,
+                     IsCompactHutujiScreen() ? LV_HOR_RES - 144 : LV_HOR_RES * 0.75);
+    lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(notification_label_, "");
@@ -2775,7 +3066,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
 
     status_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(status_label_, LV_HOR_RES * 0.75);
+    lv_obj_set_width(status_label_, IsCompactHutujiScreen() ? LV_HOR_RES - 144 : LV_HOR_RES * 0.75);
     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
@@ -2984,7 +3275,16 @@ void LcdDisplay::SetStatus(const char* status) {
             grobot_eyes_->SetSpeaking(std::strcmp(status, Lang::Strings::SPEAKING) == 0);
             grobot_eyes_->SetListening(listening);
         }
+#if CONFIG_HUTUJI_KAWAII_FACE
+        if (kawaii_face_active_) {
+            face_set_activity(listening, std::strcmp(status, Lang::Strings::SPEAKING) == 0);
+        }
+#endif
         status_listening_ = listening;
+        if (voice_talk_btn_ != nullptr) {
+            lv_label_set_text(lv_obj_get_child(voice_talk_btn_, 0),
+                              listening ? Lang::Strings::LISTENING : Lang::Strings::VOICE_TALK);
+        }
         if (status_label_ != nullptr) {
             auto* status_theme = static_cast<LvglTheme*>(current_theme_);
             lv_color_t status_color = status_theme->text_color();

@@ -1203,6 +1203,33 @@ bool Pipe::SendLine(const std::string& line) {
     }
 
     std::lock_guard<std::mutex> lock(write_mutex_);
+    return SendLineLocked(line);
+}
+
+bool Pipe::IsCommandSessionCurrent(uint32_t connection, uint32_t banner) const {
+    return connected_.load() && ready_.load() && authorized_.load() && settings_verified_.load() &&
+           task_session_active_.load() && connection_seq_.load() == connection &&
+           reset_banner_seq_.load() == banner;
+}
+
+bool Pipe::SendLineForSession(const std::string& line, uint32_t connection, uint32_t banner) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    if (!IsCommandSessionCurrent(connection, banner)) {
+        return false;
+    }
+    return SendLineLocked(line);
+}
+
+bool Pipe::SendManualReset(uint32_t connection, uint32_t banner) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    if (!IsCommandSessionCurrent(connection, banner)) {
+        return false;
+    }
+    const char reset = 0x18;
+    return SendRawLocked(&reset, 1);
+}
+
+bool Pipe::SendLineLocked(const std::string& line) {
     // 逐行模式：发新行前清掉残留应答，防止上一行超时后迟到的 ok 满足本行的等待。
     // 窗口化模式必须关掉这个清空——那时队列里的应答是「在途」的合法凭据，
     // 清掉会让在途计数永久漂移（设计文档 §4.1）。

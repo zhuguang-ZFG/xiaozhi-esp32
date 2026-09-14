@@ -366,7 +366,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('Property("preview_url", kPropertyTypeString)', board)
-        self.assertIn('mcp_server.AddTool("hutuji.confirm"', board)
+        self.assertRegex(board, r'mcp_server\.AddBackgroundTool\(\s*"hutuji\.confirm"')
         self.assertIn("RequestConfirm()", board)
         self.assertIn("StartDraw(url, preview_url)", board)
 
@@ -436,8 +436,15 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertGreaterEqual(releases_before_show, 2)  # 入口清理 + 相位尾
         prefetch_fn = job[job.index("void Job::PrefetchGcode") : job.index("bool Job::AdoptPrefetch")]
         self.assertIn("预取相位结束必卸 TLS", prefetch_fn)
-        self.assertTrue(prefetch_fn.rstrip().endswith("}") or "ReleaseFetchClient();" in prefetch_fn[-200:])
-        self.assertIn("ReleaseFetchClient();", prefetch_fn[-120:])
+        # 确认线程观察 Ready/Idle 即可进入下载；旧相位必须在发布前卸载 TLS。
+        released_at = prefetch_fn.index("ReleaseFetchClient();")
+        ready_at = prefetch_fn.index("prefetch_state_.store(PrefetchState::Ready")
+        self.assertLess(released_at, ready_at)
+        failure_tail = prefetch_fn[prefetch_fn.index("catch (const std::exception&)") :]
+        self.assertLess(
+            failure_tail.index("ReleaseFetchClient();"),
+            failure_tail.index("prefetch_state_.store(PrefetchState::Idle"),
+        )
         gcode_fn = job[job.index("bool Job::DownloadToPsram") : job.index("bool Job::VerifyCrc")]
         self.assertIn("下载相位结束即卸 TLS", gcode_fn)
         success_at = gcode_fn.index('下载完成')
@@ -2556,7 +2563,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
             / "main/boards/waveshare/esp32-s3-touch-lcd-3.5/esp32-s3-touch-lcd-3.5.cc"
         ).read_text(encoding="utf-8")
         self.assertIn('Property("preview_url", kPropertyTypeString)', board)
-        self.assertIn('mcp_server.AddTool("hutuji.confirm"', board)
+        self.assertRegex(board, r'mcp_server\.AddBackgroundTool\(\s*"hutuji\.confirm"')
         self.assertIn("StartDraw(url, preview_url, pages)", board)
         # 多页文章（§10.2 pages）：属性缺失时 LLM 无法表达多页，文章只会写第 1 页。
         self.assertIn('Property("pages", kPropertyTypeString, std::string(""))', board)
@@ -2564,7 +2571,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("RequestConfirm()", board)
         # 单参 StartDraw 会编译失败，但更要防「只注册 draw 不注册 confirm」：
         # 那样预览停在 awaiting_confirmation，语音无法确认，只能点屏幕。
-        self.assertEqual(board.count('mcp_server.AddTool("hutuji.confirm"'), 1)
+        self.assertEqual(len(re.findall(r'mcp_server\.AddBackgroundTool\(\s*"hutuji\.confirm"', board)), 1)
 
     def test_draw_preview_overlay_has_touch_confirm_and_cancel_buttons(self):
         """预览层必须自带「开始画」「取消」按钮：语音确认可能听不清，
@@ -2750,7 +2757,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 被裁掉不画；阻断滚动的具体 LVGL 环节未逐一定位，但用户连续四轮实测按钮
         # 依次丢 X/Y 十字、Y+、整段工具键，最后一轮明确「也不能滑动」——结论确定：
         # 依赖面板滚动到达满铺按钮之外内容的方案在 480x320 上不可交付，故禁复活。
-        self.assertIn("lv_obj_set_height(panel, LV_VER_RES - theme->spacing(4))", ui_body)
+        self.assertIn("const bool compact = IsCompactHutujiScreen();", ui_body)
+        self.assertIn("lv_obj_set_height(panel, compact ? LV_VER_RES : LV_VER_RES - theme->spacing(4))", ui_body)
         self.assertNotIn("lv_obj_set_height(panel, LV_SIZE_CONTENT)", ui_body)
         self.assertNotIn("lv_obj_set_style_max_height(panel", ui_body)
         self.assertNotIn("lv_obj_set_scroll_dir(panel", ui_body)
@@ -2782,9 +2790,9 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # 手动页两列布局：左列点动十字（3×56 方键），右列 6 个工具键，3 行 ×56 = 184
         # ≤ 232 可用高，无需滚动即全可见。
         self.assertIn("LV_FLEX_FLOW_ROW", ui_body)
-        self.assertIn("const lv_coord_t jog_size = safe_button_height", ui_body)
-        self.assertIn("jog_size * 3 + theme->spacing(4) * 2", ui_body)
-        self.assertIn("content_width - jog_col_width - theme->spacing(4)", ui_body)
+        self.assertIn("const lv_coord_t jog_size = std::max<lv_coord_t>(safe_button_height, 68)", ui_body)
+        self.assertIn("jog_size * 3 + (compact ? 4 : theme->spacing(4)) * 2", ui_body)
+        self.assertIn("content_width - jog_col_width - (compact ? 4 : theme->spacing(4))", ui_body)
         for action in ("jog_step_1", "jog_y+", "jog_step_10", "jog_x-", "home", "jog_x+", "jog_y-"):
             self.assertIn(f'"{action}"', ui_body)
         self.assertIn("FormatMachineHud", lcd_cc)
@@ -2986,10 +2994,10 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn('"$X"', task)
         self.assertIn("kMotorDisableLine", task)
         self.assertNotIn('"$SLP"', task)
-        self.assertIn("SendRealtime(0x18)", task)
+        self.assertIn("SendManualReset(connection, banner)", task)
         self.assertIn("GetResetBannerSequence()", task)
-        # 收尾：释放 busy 并回 idle，结果走通知。
-        self.assertIn('SetState("idle")', task)
+        # 收尾：成功回 idle，失败保留 error；通知与小程序都能看到失败。
+        self.assertIn('SetState(ok ? "idle" : "error")', task)
         self.assertIn("busy_.store(false)", task)
         # 手动控制全程禁止触碰纸路机械命令（换纸职责边界不变）。
         for forbidden in ("M30", "ESP911", "ESP912", "ESP913", "M701", "M711"):
@@ -3958,5 +3966,3 @@ class StreamingLogGateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

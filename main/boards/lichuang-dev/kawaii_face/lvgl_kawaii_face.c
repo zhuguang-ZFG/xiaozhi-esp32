@@ -31,6 +31,7 @@
 
 #include "lvgl_kawaii_face.h"
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 #ifdef ESP_PLATFORM
@@ -162,6 +163,9 @@ typedef struct
 
     lv_timer_t *anim_timer;
     bool initialized;
+    bool listening;
+    bool speaking;
+    bool activity_dirty;
 } face_state_t;
 
 static face_state_t face_state = {0};
@@ -817,6 +821,23 @@ static void draw_mouth(lv_obj_t *canvas, int8_t curve)
     int16_t curve_offset = (height * curve) / 140;
 
     int16_t center_y = height / 2 + face_state.bounce_offset;
+
+    if (face_state.speaking)
+    {
+        /* 复用原帧率做轻微开合；这是说话状态提示，不伪装成音量采样。 */
+        float pulse = 0.5f + 0.5f * sinf((lv_tick_get() % 700) * 6.283185f / 700.0f);
+        int16_t opening = 4 + (int16_t)((height - 12) * pulse * 0.7f);
+        lv_draw_rect_dsc_t talking;
+        lv_draw_rect_dsc_init(&talking);
+        talking.bg_color = face_state.iris_color;
+        talking.bg_opa = LV_OPA_COVER;
+        talking.radius = LV_RADIUS_CIRCLE;
+        lv_area_t area = {center_x - mouth_width / 4, height / 2 - opening / 2,
+                          center_x + mouth_width / 4, height / 2 + opening / 2};
+        lv_draw_rect(&layer, &talking, &area);
+        lv_canvas_finish_layer(canvas, &layer);
+        return;
+    }
 
     int16_t margin = 5;
     int16_t min_y = margin;
@@ -2052,6 +2073,15 @@ static void animation_timer_cb(lv_timer_t *timer)
         needs_redraw = true;
     }
 
+    if (face_state.listening && !face_state.is_blinking)
+    {
+        face_state.pupil_offset_x = 0;
+        face_state.pupil_offset_y = -2;
+        face_state.left_eye_openness = 100;
+        face_state.right_eye_openness = 100;
+    }
+    needs_redraw = needs_redraw || face_state.activity_dirty || face_state.listening || face_state.speaking;
+    face_state.activity_dirty = false;
     if (needs_redraw)
     {
         draw_eye(face_state.left_eye_canvas, face_state.left_eye_openness, true);
@@ -2093,6 +2123,25 @@ void face_set_emotion(face_emotion_t emotion, bool smooth)
     {
         face_state.transition_progress = 0;
     }
+}
+
+void face_set_activity(bool listening, bool speaking)
+{
+    face_lock();
+    if (face_state.initialized && (face_state.listening != listening || face_state.speaking != speaking))
+    {
+        face_state.listening = listening;
+        face_state.speaking = speaking;
+        face_state.activity_dirty = true;
+        if (!listening && !face_state.is_blinking)
+        {
+            update_emotion_parameters(face_state.current_emotion, &face_state.left_eye_openness,
+                                     &face_state.right_eye_openness, &face_state.mouth_curve,
+                                     &face_state.left_eyebrow_angle, &face_state.right_eyebrow_angle,
+                                     &face_state.eyebrow_height);
+        }
+    }
+    face_unlock();
 }
 
 face_emotion_t face_get_emotion(void)

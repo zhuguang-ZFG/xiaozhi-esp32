@@ -210,6 +210,9 @@ void face_animation_deinit(void);
  */
 void face_animation_set_paused(bool paused);
 
+/* 本地补丁：由真实对话状态驱动，不代表音量；暂停期只记状态，下一帧应用。 */
+void face_set_activity(bool listening, bool speaking);
+
 #ifdef __cplusplus
 }
 #endif

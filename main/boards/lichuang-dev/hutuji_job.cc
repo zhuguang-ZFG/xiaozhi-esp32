@@ -9,23 +9,25 @@
 #include "board.h"
 #include "display.h"
 #include "http.h"
-#include "lvgl_display.h"
 #include "lcd_display.h"
+#include "lvgl_display.h"
 #include "lvgl_image.h"
-#include "system_info.h"
+#include "mcp_server.h"
 #include "settings.h"
+#include "system_info.h"
 
 #include <esp_app_desc.h>
-#include <esp_random.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_random.h>
 #include <cJSON.h>
-#include <freertos/FreeRTOS.h>
-#include <lvgl.h>
 #include <draw/lv_image_decoder.h>
 #include <draw/lv_image_decoder_private.h>
-#include <freertos/task.h>
+#include <freertos/FreeRTOS.h>
 #include <freertos/idf_additions.h>
+#include <freertos/task.h>
+#include <lvgl.h>
+#include <nvs.h>
 
 #include <cctype>
 #include <cmath>
@@ -152,6 +154,323 @@ std::string JsonString(const char* value) {
 }
 }  // namespace
 
+// 严格解析 8 个字段；cJSON 本身允许重复键，不能仅取第一项后继续执行。
+static bool ParsePaperConfigJson(const std::string& text, PaperConfig& value) {
+    if (text.empty() || text.size() > 512 || text.find('\0') != std::string::npos ||
+        text.find("\\u0000") != std::string::npos)
+        return false;
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(
+        cJSON_ParseWithLengthOpts(text.c_str(), text.size() + 1, nullptr, true), cJSON_Delete);
+    if (!cJSON_IsObject(root.get()))
+        return false;
+    unsigned seen = 0;
+    PaperConfig parsed;
+    const char* keys[] = {"paper",     "width_mm", "height_mm", "landscape",
+                          "margin_mm", "swap_xy",  "max_x_mm",  "max_y_mm"};
+    for (const cJSON* field = root->child; field != nullptr; field = field->next) {
+        unsigned index = 0;
+        while (index < 8 && (!field->string || std::strcmp(field->string, keys[index]) != 0))
+            ++index;
+        if (index == 8 || (seen & (1u << index)))
+            return false;
+        seen |= 1u << index;
+        if (index == 0) {
+            if (!cJSON_IsString(field) || !field->valuestring)
+                return false;
+            parsed.paper = field->valuestring;
+        } else if (index == 3 || index == 5) {
+            if (!cJSON_IsBool(field))
+                return false;
+            (index == 3 ? parsed.landscape : parsed.swap_xy) = cJSON_IsTrue(field);
+        } else {
+            int* target = index == 1   ? &parsed.width
+                          : index == 2 ? &parsed.height
+                          : index == 4 ? &parsed.margin
+                          : index == 6 ? &parsed.max_x
+                                       : &parsed.max_y;
+            if (!cJSON_IsNumber(field) || !PaperMillimetersToTenths(field->valuedouble, *target))
+                return false;
+        }
+    }
+    if (seen != 255 || !ValidatePaperConfig(parsed))
+        return false;
+    value = parsed;
+    return true;
+}
+
+static cJSON* PaperConfigJson(const PaperConfig& value) {
+    cJSON* config = cJSON_CreateObject();
+    if (!config)
+        return nullptr;
+    cJSON_AddStringToObject(config, "paper", value.paper.c_str());
+    cJSON_AddNumberToObject(config, "width_mm", value.width / 10.0);
+    cJSON_AddNumberToObject(config, "height_mm", value.height / 10.0);
+    cJSON_AddBoolToObject(config, "landscape", value.landscape);
+    cJSON_AddNumberToObject(config, "margin_mm", value.margin / 10.0);
+    cJSON_AddBoolToObject(config, "swap_xy", value.swap_xy);
+    cJSON_AddNumberToObject(config, "max_x_mm", value.max_x / 10.0);
+    cJSON_AddNumberToObject(config, "max_y_mm", value.max_y / 10.0);
+    return config;
+}
+
+Job::Job() {
+    nvs_handle_t handle;
+    const esp_err_t opened = nvs_open("hutuji_paper", NVS_READONLY, &handle);
+    if (opened == ESP_ERR_NVS_NOT_FOUND)
+        return;
+    if (opened != ESP_OK) {
+        paper_store_fault_ = true;
+        return;
+    }
+    char record[128]{};
+    size_t length = sizeof(record);
+    const esp_err_t read = nvs_get_str(handle, "config_v1", record, &length);
+    nvs_close(handle);
+    if (read == ESP_ERR_NVS_NOT_FOUND)
+        return;
+    const std::string text = read == ESP_OK ? record : "";
+    const bool nopaper = text.rfind("nopaper|", 0) == 0;
+    const size_t prefix = nopaper ? 8 : 6;
+    if (read != ESP_OK || (!nopaper && text.rfind("paper|", 0) != 0) ||
+        !ParsePaperMarker(text.substr(prefix), saved_paper_)) {
+        paper_store_fault_ = true;
+        return;
+    }
+    paper_persisted_ = true;
+    paper_saved_nopaper_ = nopaper;
+}
+
+bool Job::GetPaperConfig(PaperConfig& config) const {
+    auto& pipe = Pipe::GetInstance();
+    std::lock_guard<std::mutex> lock(paper_mutex_);
+    if (paper_store_fault_)
+        return false;
+    if (pipe.IsReady()) {
+        paper_machine_known_ = true;
+        paper_last_nopaper_ = pipe.IsNopaperMachine();
+    }
+    if (paper_persisted_) {
+        // 换成另一类写字机后须明确重设，不能沿用上一机型的方向和行程。
+        if (pipe.IsReady() && paper_saved_nopaper_ != pipe.IsNopaperMachine())
+            return false;
+        config = saved_paper_;
+    } else {
+        config = DefaultPaperConfig(paper_machine_known_ && paper_last_nopaper_);
+    }
+    return ValidatePaperConfig(config);
+}
+
+bool Job::GetPaperJogEnvelope(float& max_x, float& max_y) const {
+    PaperConfig config;
+    if (!GetPaperConfig(config))
+        return false;
+    max_x = config.max_x / 10.0f;
+    max_y = config.max_y / 10.0f;
+    return true;
+}
+
+bool Job::CheckPaperHeader(Http* http, std::string& marker) const {
+    auto& pipe = Pipe::GetInstance();
+    PaperConfig current;
+    if (!pipe.IsConnected() || !pipe.IsReady() || !GetPaperConfig(current))
+        return false;
+    std::string header = http->GetResponseHeader("X-Hutuji-Paper");
+    if (header.empty())
+        header = http->GetResponseHeader("x-hutuji-paper");
+    marker = PaperMarker(current);
+    return marker == job_paper_marker_ &&
+           PaperHeaderMatches(header, current, pipe.IsNopaperMachine());
+}
+
+std::string Job::RequestPaper(const std::string& config_json, const std::string& expected,
+                              bool range_confirmed, bool restore_defaults) {
+    if (config_json.empty() && !restore_defaults)
+        return StatusJson();
+    PaperConfig desired;
+    if (!restore_defaults && !ParsePaperConfigJson(config_json, desired))
+        return "{\"error\":\"纸张尺寸、留边或可绘制范围无效\"}";
+    auto& pipe = Pipe::GetInstance();
+    std::unique_lock<std::mutex> stream_lock(stream_mutex_, std::try_to_lock);
+    if (!stream_lock.owns_lock())
+        return "{\"error\":\"任务正在收尾，请稍候\"}";
+    std::string state;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state = state_;
+    }
+    if (!PaperChangeAllowed(state, busy_.load(), preview_worker_active_.load(),
+                            abort_reset_worker_active_.load() || abort_reset_owner_.Running(),
+                            paper_active_.load()) ||
+        speed_active_.load())
+        return "{\"error\":\"请先结束任务或取消预览，再修改纸张\"}";
+    if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized() ||
+        !pipe.IsSettingsVerified())
+        return "{\"error\":\"写字机未就绪，请连接后重试\"}";
+    const bool nopaper = pipe.IsNopaperMachine();
+    PaperConfig before;
+    const bool valid = GetPaperConfig(before);
+    if (expected != (valid ? PaperMarker(before) : "invalid"))
+        return "{\"error\":\"纸张设置已变化，请刷新后重试\"}";
+    if (!valid && !restore_defaults)
+        return "{\"error\":\"纸张记录损坏或机型已变化，请明确恢复默认设置\"}";
+    if (restore_defaults)
+        desired = DefaultPaperConfig(nopaper);
+    if ((!valid || PaperRangeIncreased(before, desired)) && !range_confirmed)
+        return "{\"error\":\"请先核对并确认设备实际可绘制范围\"}";
+    if (valid && before == desired)
+        return StatusJson();
+    // 占用事务前完成可分配的序列化，低内存不能遗留 busy。
+    const std::string record = std::string(nopaper ? "nopaper|" : "paper|") + PaperMarker(desired);
+    const uint32_t connection = pipe.GetConnectionSequence();
+    const uint32_t banner = pipe.GetResetBannerSequence();
+    const auto same_session = [&]() {
+        return pipe.IsConnected() && pipe.IsReady() && pipe.IsAuthorized() &&
+               pipe.IsSettingsVerified() && pipe.IsNopaperMachine() == nopaper &&
+               pipe.GetConnectionSequence() == connection &&
+               pipe.GetResetBannerSequence() == banner;
+    };
+    bool ok = false;
+    bool attempted_write = false;
+    {
+        // 查询、NVS 或分配异常都走同一收尾；不能依赖后台工具的异常处理释放机器。
+        struct PaperUpdateGuard {
+            Job& job;
+            Pipe& pipe;
+            std::unique_lock<std::mutex>& stream_lock;
+            bool& ok;
+            bool& attempted_write;
+            ~PaperUpdateGuard() {
+                job.StopPerformanceHold();
+                if (!stream_lock.owns_lock())
+                    stream_lock.lock();
+                if (attempted_write) {
+                    if (!ok) {
+                        std::lock_guard<std::mutex> lock(job.paper_mutex_);
+                        job.paper_store_fault_ = true;
+                    }
+                    job.ReleaseBuffer();
+                    job.buffer_replayable_.store(false);
+                    job.repeat_mode_.store(false);
+                    job.CancelPrefetch();
+                    job.url_.clear();
+                    job.preview_url_.clear();
+                    job.job_paper_marker_.clear();
+                    job.article_pages_.clear();
+                    job.article_index_ = 0;
+                    job.article_page_.store(0);
+                    job.article_total_.store(0);
+                }
+                pipe.SetTaskSessionActive(false);
+                job.paper_update_active_.store(false);
+                job.busy_.store(false, std::memory_order_release);
+                stream_lock.unlock();
+            }
+        } guard{*this, pipe, stream_lock, ok, attempted_write};
+        busy_.store(true);
+        paper_update_active_.store(true);
+        pipe.SetTaskSessionActive(true);
+        stream_lock.unlock();
+        try {
+            StartPerformanceHold();
+            ok = same_session() && QueryAndWaitFreshMachineState(kJogFreshStateTimeoutMs) &&
+                 same_session() && pipe.GetGrblState() == GrblState::Idle &&
+                 pipe.GetPaperChangingState() != PaperChangingState::On;
+            if (ok) {
+                nvs_handle_t handle;
+                ok = nvs_open("hutuji_paper", NVS_READWRITE, &handle) == ESP_OK;
+                if (ok) {
+                    struct NvsGuard {
+                        nvs_handle_t handle;
+                        ~NvsGuard() { nvs_close(handle); }
+                    } nvs_guard{handle};
+                    // commit 与读回都通过后才能发布；中途异常视为写入状态不明。
+                    attempted_write = true;
+                    ok = nvs_set_str(handle, "config_v1", record.c_str()) == ESP_OK &&
+                         nvs_commit(handle) == ESP_OK;
+                    char readback[128]{};
+                    size_t length = sizeof(readback);
+                    ok = ok && nvs_get_str(handle, "config_v1", readback, &length) == ESP_OK &&
+                         record == readback;
+                }
+                ok = ok && same_session();
+            }
+            if (ok) {
+                std::lock_guard<std::mutex> lock(paper_mutex_);
+                saved_paper_ = std::move(desired);
+                paper_persisted_ = true;
+                paper_saved_nopaper_ = nopaper;
+                paper_store_fault_ = false;
+            }
+        } catch (const std::exception&) {
+            ok = false;
+        }
+    }
+    return ok ? StatusJson()
+              : "{\"error\":\"未能确认纸张设置，请连接设备后刷新；若记录异常请恢复默认\"}";
+}
+
+void Job::RequestPaperFromScreen(const std::string& action, const std::string& expected) {
+    // 屏幕与云端慢操作共用有界槽位，不因重复点击堆积任务栈。
+    const bool started = McpServer::GetInstance().ScheduleBackground([this, action, expected]() {
+        std::string result;
+        if (action == "read") {
+            result = StatusJson();
+        } else if (action == "restore") {
+            result = RequestPaper("", expected, true, true);
+        } else {
+            PaperConfig desired;
+            bool valid = GetPaperConfig(desired);
+            if (action == "A4") {
+                desired.paper = "A4";
+                desired.width = 2100;
+                desired.height = 2970;
+            } else if (action == "A3") {
+                desired.paper = "A3";
+                desired.width = 2970;
+                desired.height = 4200;
+            } else if (action == "A2") {
+                desired.paper = "A2";
+                desired.width = 4200;
+                desired.height = 5940;
+            } else if (action == "orientation")
+                desired.landscape = !desired.landscape;
+            else if (action == "swap")
+                desired.swap_xy = !desired.swap_xy;
+            else
+                valid = false;
+            if (!valid || !ValidatePaperConfig(desired)) {
+                result = "{\"error\":\"当前方向或纸张放不下，请在小程序中核对行程与设置\"}";
+            } else {
+                cJSON* json = PaperConfigJson(desired);
+                char* text = json ? cJSON_PrintUnformatted(json) : nullptr;
+                const std::string config = text ? text : "";
+                cJSON_free(text);
+                cJSON_Delete(json);
+                result = config.empty() ? "{\"error\":\"暂时无法保存，请稍后重试\"}"
+                                        : RequestPaper(config, expected, false);
+            }
+        }
+        cJSON* json = cJSON_Parse(result.c_str());
+        const cJSON* error = cJSON_GetObjectItemCaseSensitive(json, "error");
+        std::string notice = action == "read" ? "" : "纸张设置已保存";
+        if (cJSON_IsString(error) && error->valuestring)
+            notice = error->valuestring;
+        cJSON_Delete(json);
+        const std::string status = StatusJson();
+        Application::GetInstance().Schedule([status, notice]() {
+            if (auto* display = dynamic_cast<LcdDisplay*>(Board::GetInstance().GetDisplay())) {
+                display->UpdatePaperControls(status);
+                if (!notice.empty())
+                    display->ShowNotification(notice.c_str(), 5000);
+            }
+        });
+    });
+    if (!started) {
+        if (auto* display = dynamic_cast<LcdDisplay*>(Board::GetInstance().GetDisplay()))
+            display->ShowNotification("正在处理上一个操作，请稍候");
+    }
+}
+
 Job& Job::GetInstance() {
     static Job instance;
     return instance;
@@ -167,6 +486,9 @@ void Job::SetState(const char* state) {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         state_ = state;
+        if (state_ != "error") {
+            manual_error_.clear();
+        }
         state_snapshot = state_;
     }
     // 落笔棘轮闸清除（见 manual_pen_down_latched_ 注释）：settled/manual 之外的任何
@@ -284,6 +606,8 @@ void Job::ReleaseBuffer() {
         buffer_ = nullptr;
     }
     buffer_len_ = 0;
+    buffer_paper_marker_.clear();
+    buffer_replayable_.store(false);
 }
 
 bool Job::LooksLikePaperLine(const std::string& line) {
@@ -395,6 +719,9 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
         return std::string("{\"error\":\"") + hutuji::kNopaperMultiPageRejectMsg + "\"}";
     }
     std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    if (!busy_.load() && preview_worker_active_.load()) {
+        return "{\"error\":\"上次预览正在收尾，请稍候\"}";
+    }
     if (busy_.exchange(true)) {
         // P1-3 同参数幂等重入：服务端链式调用在生成完成点即发，云端第二步以同
         // url/preview_url 重入时回 previewing（等价「你要的这张已在预览/等确认」），
@@ -413,6 +740,13 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
         }
         return JsonString("写字机正忙，请稍候再试");
     }
+    PaperConfig paper;
+    if (!Pipe::GetInstance().IsConnected() || !Pipe::GetInstance().IsReady() ||
+        !GetPaperConfig(paper)) {
+        busy_.store(false);
+        return "{\"error\":\"写字机或纸张配置未就绪，请连接设备后重试\"}";
+    }
+    job_paper_marker_ = PaperMarker(paper);
     if (!ResetAbortResetState()) {
         busy_.store(false);
         return "{\"error\":\"上一 reset owner 尚未收敛\"}";
@@ -436,11 +770,14 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     // 新任务作废旧预取：上一个任务的预取可能仍在跑，epoch 推进后其发布会被拒绝。
     CancelPrefetch();
     SetState("previewing");
+    prefetch_cancel_.store(false);
     // R8：预览任务栈进 PSRAM，把内部连续块留给 ssl_receive/mbedtls（COM14 实锤
     // 内部 6144 栈与 TLS 4KB 栈互抢是预览终态不呈现的根因之一）。
+    preview_worker_active_.store(true);
     BaseType_t ok = xTaskCreateWithCaps(PreviewTaskEntry, "hutuji_preview", 8192, this, 4,
                                         nullptr, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdTRUE) {
+        preview_worker_active_.store(false);
         busy_.store(false);
         SetState("idle");
         return "{\"error\":\"无法创建预览任务\"}";
@@ -507,6 +844,9 @@ std::string Job::RequestAbort() {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (!busy_.load()) {
             return JsonString("ok");
+        }
+        if (paper_update_active_.load()) {
+            return "{\"error\":\"正在保存纸张设置，请稍候查询结果\"}";
         }
         if (speed_active_.load()) {
             return "{\"error\":\"正在调整速度，请稍候查询结果\"}";
@@ -894,6 +1234,9 @@ std::string Job::RequestPause() {
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
     }
+    if (paper_update_active_.load() || speed_active_.load()) {
+        return "{\"error\":\"正在保存设备设置，请稍候\"}";
+    }
     if (finishing_at_home_) {
         return "{\"error\":\"已回原点，正在完成收尾\"}";
     }
@@ -932,6 +1275,9 @@ std::string Job::RequestResume() {
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
     }
+    if (paper_update_active_.load() || speed_active_.load()) {
+        return "{\"error\":\"正在保存设备设置，请稍候\"}";
+    }
     if (finishing_at_home_) {
         return "{\"error\":\"已回原点，正在完成收尾\"}";
     }
@@ -960,7 +1306,7 @@ std::string Job::RequestRepeat() {
     bool replay = false;
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-        if (busy_.exchange(true)) {
+        if (preview_worker_active_.load() || busy_.exchange(true)) {
             return JsonString("写字机正忙，请稍候再试");
         }
         auto& pipe = Pipe::GetInstance();
@@ -971,6 +1317,12 @@ std::string Job::RequestRepeat() {
         if (!pipe.IsReady()) {
             busy_.store(false);
             return "{\"error\":\"写字机未就绪（未收到版本应答）\"}";
+        }
+        PaperConfig paper;
+        if (!GetPaperConfig(paper) || PaperMarker(paper) != job_paper_marker_ ||
+            (buffer_replayable_.load() && buffer_paper_marker_ != job_paper_marker_)) {
+            busy_.store(false);
+            return "{\"error\":\"作品与当前纸张不一致，请重新生成\"}";
         }
         // 有留存 buffer 走快路（跳下载+CRC）；否则回落重新下载上次 url_。
         // 文章模式禁用快路：buffer 留存的只是最后一页，重画语义是整篇重写，
@@ -1030,7 +1382,7 @@ std::string Job::RequestPenTest() {
     {
         // 试笔状态与 busy 一起发布，RequestAbort 在同一把锁下分流，不能看到半成品状态。
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-        if (busy_.load()) {
+        if (busy_.load() || preview_worker_active_.load()) {
             return JsonString("写字机正忙，请稍候再试");
         }
         if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
@@ -1154,7 +1506,7 @@ std::string Job::RequestManualControl(const std::string& action) {
     auto& pipe = Pipe::GetInstance();
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-        if (busy_.exchange(true)) {
+        if (preview_worker_active_.load() || busy_.exchange(true)) {
             return JsonString("写字机正忙，请稍候再试");
         }
         std::string state;
@@ -1188,7 +1540,8 @@ std::string Job::RequestManualControl(const std::string& action) {
         // 工具早已回 "started"，失败只进 notify，LLM 会把拒绝播报成「已经往左挪啦」。
         // 此处与任务内用同一份新鲜坐标 + 同一个 DecideJog（同源 core，改一处即两处）
         // 先判一次，越界/坐标不可信直接以返回值回 LLM；任务内判定保留作纵深防御。
-        // 阻塞上界 kJogFreshStateTimeoutMs，MCP 工具线程可接受（语音链路本就秒级）。
+        // 阻塞上界 kJogFreshStateTimeoutMs；三板 MCP 入口显式使用后台工具任务，
+        // 保留同步拒绝结果，同时避免坐标查询占住主事件循环。
         if (action.rfind("jog_x", 0) == 0 || action.rfind("jog_y", 0) == 0) {
             const float pre_step = GetJogStepMm();
             const float pre_dx =
@@ -1201,14 +1554,12 @@ std::string Job::RequestManualControl(const std::string& action) {
             if (fresh) {
                 pipe.GetMachinePos(mx, my, mz);
             }
-            // 机型包线（2026-09-11 §10.4.15）：nopaper 205/290，换纸机 277/190；
-            // VER 未达 → IsNopaperMachine=false 保守档（与金标表同口径）。
-            const bool nopaper_jog = pipe.IsNopaperMachine();
             float jog_env_x = 0, jog_env_y = 0;
-            hutuji::MachineJogEnvelope(nopaper_jog, jog_env_x, jog_env_y);
+            const bool paper_valid = GetPaperJogEnvelope(jog_env_x, jog_env_y);
             const hutuji::JogVerdict verdict =
-                fresh ? hutuji::DecideJog(mx, my, pre_dx, pre_dy, jog_env_x, jog_env_y)
-                      : hutuji::JogVerdict::kStalePosition;
+                fresh && paper_valid
+                    ? hutuji::DecideJog(mx, my, pre_dx, pre_dy, jog_env_x, jog_env_y)
+                    : hutuji::JogVerdict::kStalePosition;
             StopPerformanceHold();
             if (verdict != hutuji::JogVerdict::kOk) {
                 busy_.store(false);
@@ -1231,11 +1582,16 @@ std::string Job::RequestManualControl(const std::string& action) {
         }
         abort_requested_.store(false);
         pending_manual_action_ = action;
+        manual_connection_seq_ = pipe.GetConnectionSequence();
+        manual_banner_seq_ = pipe.GetResetBannerSequence();
+        // 接受与 worker 真正运行之间也可能重连；此后禁止探活的 ok 混进本动作。
+        pipe.SetTaskSessionActive(true);
         SetState("manual");
     }
     BaseType_t created = xTaskCreate(ManualTaskEntry, "hutuji_manual", 4096, this, 4, nullptr);
     if (created != pdTRUE) {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        pipe.SetTaskSessionActive(false);
         busy_.store(false);
         SetState("idle");
         return "{\"error\":\"无法创建手动控制任务\"}";
@@ -1251,7 +1607,7 @@ std::string Job::RequestSpeed(int rate, const std::string& axis) {
     }
     // MCP 在主事件循环执行；锁忙时立刻拒绝，网络等待全部交给独立任务。
     std::unique_lock<std::mutex> stream_lock(stream_mutex_, std::try_to_lock);
-    if (!stream_lock.owns_lock() || busy_.load()) {
+    if (!stream_lock.owns_lock() || busy_.load() || preview_worker_active_.load()) {
         return "{\"error\":\"写字机正忙，请稍候再试\"}";
     }
     auto& pipe = Pipe::GetInstance();
@@ -1444,18 +1800,33 @@ void Job::ManualTaskEntry(void* arg) {
 void Job::ManualTask() {
     auto& pipe = Pipe::GetInstance();
     const std::string action = pending_manual_action_;
-    bool ok = true;
+    const uint32_t connection = manual_connection_seq_;
+    const uint32_t banner = manual_banner_seq_;
+    const auto same_session = [&]() {
+        return pipe.IsConnected() && pipe.IsReady() && pipe.IsAuthorized() &&
+               pipe.IsSettingsVerified() && pipe.GetConnectionSequence() == connection &&
+               pipe.GetResetBannerSequence() == banner;
+    };
+    bool ok = same_session();
     std::string failed_step;
+    last_error_.clear();
 
     // 逐行模式应答：SendLine 发前已清残留，WaitResponse 等本行 ok/error。
     auto send_ok = [&](const char* line, const char* what) -> bool {
-        if (!pipe.SendLine(line)) {
+        if (!same_session() || !pipe.SendLineForSession(line, connection, banner)) {
             failed_step = what;
             return false;
         }
         int error_code = -1;
-        const WaitResult wr = pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &error_code);
-        if (wr != WaitResult::Ok) {
+        WaitResult wr = WaitResult::Timeout;
+        const TickType_t began = xTaskGetTickCount();
+        while (same_session() && xTaskGetTickCount() - began < pdMS_TO_TICKS(kHomeOkTimeoutMs)) {
+            wr = pipe.WaitResponse(100, nullptr, &error_code);
+            if (wr != WaitResult::Timeout) {
+                break;
+            }
+        }
+        if (wr != WaitResult::Ok || !same_session()) {
             failed_step = what;
             if (error_code >= 0) {
                 failed_step += " (error:" + std::to_string(error_code) + ")";
@@ -1465,7 +1836,9 @@ void Job::ManualTask() {
         return true;
     };
 
-    if (action == "pen_up") {
+    if (!ok) {
+        failed_step = "连接或就绪状态已变化，请重新尝试";
+    } else if (action == "pen_up") {
         ok = send_ok("G1G90 Z0.0F10000", "抬笔") && WaitForIdle(false, kPenOriginIdleTimeoutMs);
     } else if (action == "pen_down") {
         // 对齐奎享实测落笔序列：先 G92 Z0 声明当前位，再 Z5 落笔。
@@ -1488,12 +1861,11 @@ void Job::ManualTask() {
             failed_step = "点动前未取到新鲜坐标";
         } else {
             pipe.GetMachinePos(mx, my, mz);
-            // 纵深防御同机型包线：任务内判定与工具侧预检同源 core（2026-09-11）。
+            // 任务内再次取已确认配置，损坏记录不能退回更大的默认行程。
             float task_env_x = 0, task_env_y = 0;
-            hutuji::MachineJogEnvelope(Pipe::GetInstance().IsNopaperMachine(), task_env_x,
-                                       task_env_y);
-            if (hutuji::DecideJog(mx, my, dx, dy, task_env_x, task_env_y) !=
-                hutuji::JogVerdict::kOk) {
+            if (!GetPaperJogEnvelope(task_env_x, task_env_y) ||
+                hutuji::DecideJog(mx, my, dx, dy, task_env_x, task_env_y) !=
+                    hutuji::JogVerdict::kOk) {
                 ok = false;
                 failed_step = "点动越界";
             } else {
@@ -1517,24 +1889,36 @@ void Job::ManualTask() {
         ok = send_ok(hutuji::kMotorDisableLine, "关闭电机");
     } else if (action == "reset") {
         const uint32_t banner_before = pipe.GetResetBannerSequence();
-        if (!pipe.SendRealtime(0x18)) {
+        if (!pipe.SendManualReset(connection, banner)) {
             ok = false;
             failed_step = "复位";
         } else {
-            const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(10000);
-            while (xTaskGetTickCount() < deadline) {
+            const TickType_t reset_began = xTaskGetTickCount();
+            while (pipe.IsConnected() && pipe.GetConnectionSequence() == connection &&
+                   xTaskGetTickCount() - reset_began < pdMS_TO_TICKS(10000)) {
                 if (pipe.GetResetBannerSequence() != banner_before) {
                     break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
-            if (pipe.GetResetBannerSequence() == banner_before) {
+            if (!pipe.IsConnected() || pipe.GetConnectionSequence() != connection ||
+                pipe.GetResetBannerSequence() == banner_before) {
                 ok = false;
                 failed_step = "复位后未收到新启动横幅";
             }
         }
     }
 
+    // 主动 reset 的新横幅是预期结果；其它动作始终属于接受请求时的连接/横幅。
+    ok = ok && (action == "reset" ? pipe.IsConnected() && pipe.GetConnectionSequence() == connection
+                                  : same_session());
+    if (!ok) {
+        if (failed_step.empty()) {
+            failed_step = last_error_.empty() ? "动作结果未确认，请检查设备后重试" : last_error_;
+        }
+        // 超时的迟到 ok 不能给下一动作使用；旧 worker 不得拆掉已重建的连接。
+        pipe.ShutdownSocket(connection);
+    }
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         // 落笔棘轮闸锁存/解除：只在动作整体成功（含等 Idle）后更新，失败保持
@@ -1544,7 +1928,12 @@ void Job::ManualTask() {
         } else if (ok && action == "pen_up") {
             manual_pen_down_latched_.store(false);
         }
-        SetState("idle");
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            manual_error_ = ok ? "" : "手动控制失败：" + failed_step;
+        }
+        SetState(ok ? "idle" : "error");
+        pipe.SetTaskSessionActive(false);
         busy_.store(false);
     }
     Notify(ok ? "手动控制完成" : "手动控制失败: " + failed_step);
@@ -1562,15 +1951,31 @@ std::string Job::StatusJson() const {
     // 「发 + WaitResponse 消费」的路径，status 永远只报最近一次已消费应答的值。
 
     std::string state;
+    std::string manual_error;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         state = state_;
+        manual_error = manual_error_;
     }
     cJSON* root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "connected", pipe.IsConnected());
     cJSON_AddBoolToObject(root, "ready", pipe.IsReady());
     cJSON_AddBoolToObject(root, "authorized", pipe.IsAuthorized());
     cJSON_AddBoolToObject(root, "grbl_settings_ok", pipe.IsSettingsVerified());
+    cJSON_AddStringToObject(root, "device_id", SystemInfo::GetMacAddress().c_str());
+    cJSON* paper_section = cJSON_AddObjectToObject(root, "paper_config");
+    if (paper_section) {
+        PaperConfig paper;
+        const bool valid = GetPaperConfig(paper);
+        cJSON_AddNumberToObject(paper_section, "schema", 1);
+        cJSON_AddBoolToObject(paper_section, "updating", paper_update_active_.load());
+        cJSON_AddStringToObject(paper_section, "marker",
+                                valid ? PaperMarker(paper).c_str() : "invalid");
+        if (valid)
+            cJSON_AddItemToObject(paper_section, "config", PaperConfigJson(paper));
+        else
+            cJSON_AddNullToObject(paper_section, "config");
+    }
     const std::string mismatch_key = pipe.GetSettingsMismatchKey();
     if (!pipe.IsSettingsVerified() && !mismatch_key.empty()) {
         cJSON_AddStringToObject(root, "grbl_settings_mismatch", mismatch_key.c_str());
@@ -1598,7 +2003,9 @@ std::string Job::StatusJson() const {
     }
     cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());
     cJSON_AddStringToObject(root, "state", state.c_str());
-    cJSON_AddStringToObject(root, "board", BOARD_NAME);
+    if (state == "error" && !manual_error.empty()) {
+        cJSON_AddStringToObject(root, "control_error", manual_error.c_str());
+    }
     // 机型词汇（protocol §10.4.15，2026-09-11）：$I VER build 段识别的现值；
     // VER 未达（pipe 未连/未认证）= "paper" 保守档，与金标表口径一致。
     cJSON_AddStringToObject(root, "plotter_sku",
@@ -1685,7 +2092,38 @@ void Job::SetOtaUpdateAvailable(bool available) {
 }
 
 void Job::PreviewTaskEntry(void* arg) {
-    static_cast<Job*>(arg)->Preview();
+    auto* job = static_cast<Job*>(arg);
+    try {
+        job->Preview();
+    } catch (const std::exception&) {
+        ESP_LOGW(TAG, "预览阶段异常，回收资源并允许重试");
+        job->ReleaseFetchClient();
+        std::lock_guard<std::mutex> stream_lock(job->stream_mutex_);
+        job->CancelPrefetch();
+        bool owns_preview = false;
+        const char* terminal_state = job->abort_requested_.load() ? "aborted" : "error";
+        {
+            std::lock_guard<std::mutex> state_lock(job->state_mutex_);
+            owns_preview = job->state_ == "previewing" || job->awaiting_confirmation_.load();
+            if (owns_preview)
+                job->state_ = terminal_state;
+        }
+        // 秒确认可能已将 busy 所有权交给 Run；只能结清本任务仍持有的预览阶段。
+        if (owns_preview) {
+            job->awaiting_confirmation_.store(false);
+            job->abort_requested_.store(false);
+            job->busy_.store(false, std::memory_order_release);
+            job->StopPerformanceHold();
+            try {
+                job->SetState(terminal_state);
+                job->ClearPreview();
+            } catch (const std::exception&) {
+                // 界面分配失败也不能把 worker 留活；下次状态刷新可重新同步显示。
+                ESP_LOGW(TAG, "预览异常后的界面更新失败");
+            }
+        }
+    }
+    job->preview_worker_active_.store(false, std::memory_order_release);
     // WithCaps 创建的任务必须用 WithCaps 删除，否则 PSRAM 栈泄漏。
     vTaskDeleteWithCaps(nullptr);
 }
@@ -1760,6 +2198,8 @@ void Job::Preview() {
         }
         awaiting_confirmation_.store(true);
         SetState("awaiting_confirmation");
+        // 与待确认状态一起发布，秒确认也必须等同一个预取事务。
+        prefetch_state_.store(PrefetchState::Running, std::memory_order_release);
     }
     Notify("预览已出来啦，喜欢就说「开始画」，不喜欢就说「取消」");
     // 预览上屏后后台预取 G-code：确认时 Run() 经 AdoptPrefetch 复用，省掉整段下载/校验等待。
@@ -1767,8 +2207,6 @@ void Job::Preview() {
     // xTaskCreate 在内存低谷静默失败（ minimal sram 5335），预取从未真正跑过；
     // 内联后峰值内存还省一个任务栈。取消/确认竞态与原设计一致：
     // 预取循环轮询 prefetch_cancel_/abort_requested_，AdoptPrefetch 会等 Running 收敛。
-    prefetch_cancel_.store(false);
-    prefetch_state_.store(PrefetchState::Running, std::memory_order_release);
     PrefetchGcode();
 }
 
@@ -1787,140 +2225,164 @@ void Job::CancelPrefetch() {
         prefetch_buffer_ = nullptr;
     }
     prefetch_len_ = 0;
+    prefetch_paper_marker_.clear();
     prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
 }
 
 void Job::PrefetchGcode() {
     const uint32_t epoch = prefetch_epoch_.load(std::memory_order_acquire);
-    std::string url;
-    {
-        // url_ 由 StartDraw 在 stream_mutex_ 内写入；拷贝一份避免读到下一个任务的值。
-        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-        url = url_;
+    if (prefetch_cancel_.load() || abort_requested_.load()) {
+        prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
+        return;
     }
-    // 2026-09-06：预取是正常流程的主下载路径（确认时 AdoptPrefetch 命中即画，
-    // DownloadToPsram 只在预取未中时兜底），此前单发即弃——预览确认窗口内的 TLS
-    // 瞬时低谷（esp-tls -0x0084）会让确认被迫走完整重下，体感「确认后才开始下载」。
-    // 与预览/DownloadToPsram 同口径有界重试；确定性失败立即出局；失败仍静默回落。
-    WaitForAudioOutputIdle();  // 首试前的功放/WiFi 错峰（原口径）；重试分支内另行再等
     uint8_t* buf = nullptr;
     size_t len = 0;
     uint32_t crc = 0;
+    std::string marker;
     bool ok = false;
-    for (int attempt = 0; attempt < kFetchMaxAttempts && !ok; ++attempt) {
-        if (prefetch_cancel_.load() || abort_requested_.load()) {
-            break;
-        }
-        if (attempt > 0) {
-            vTaskDelay(pdMS_TO_TICKS(kFetchRetryBackoffMs[attempt - 1]));
-            WaitForAudioOutputIdle();
-        }
-        if (!WaitForTlsHeapBudget()) {
-            ESP_LOGW(TAG, "预取 TLS 堆预算不足，跳过本轮");
-            continue;  // 传输态：等堆失败当可重试
-        }
-        FetchOutcome outcome = FetchOutcome::kFatal;
-        auto network = Board::GetInstance().GetNetwork();
-        if (!network) {
-            break;
-        }
-        // R7：相位内 keep-alive；锁每次尝试重取，退避/等堆不持锁。
-        std::lock_guard<std::mutex> fetch_lock(fetch_mutex_);
-        Http* http = AcquireFetchClient();
-        if (!http) {
-            outcome = FetchOutcome::kRetryable;  // 堆瞬态可致创建失败
-        }
-        while (http && !ok && outcome == FetchOutcome::kFatal) {
-            http->SetTimeout(attempt == 0 ? kFetchFirstTimeoutMs : kFetchRetryTimeoutMs);
-            if (!http->Open("GET", url)) {
-                outcome = FetchOutcome::kRetryable;
-                break;
-            }
-            const int status = http->GetStatusCode();
-            if (status != 200) {
-                http->Close();
-                if (status < 100) {
-                    outcome = FetchOutcome::kRetryable;  // status=-1=TLS 读败，传输态同预览口径
-                }
-                break;  // 非 200（TTL/名字）确定性失败；<100 传输态外层继续重试
-            }
-            const size_t content_length = http->GetBodyLength();
-            if (content_length == 0 || content_length > kMaxGcodeBytes) {
-                http->Close();
-                break;
-            }
-            std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
-            if (crc_hdr.empty()) {
-                crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
-            }
-            if (!ParseCrc32Header(crc_hdr, crc)) {
-                http->Close();
-                break;
-            }
-            // 与 DownloadToPsram 同策：只用 PSRAM，不饿死内部堆。
-            // 每轮重试前 buf 必为空（retryable 路径已 free+置 nullptr；取消路径到函数尾统一 free）——
-            // 不变量被破时宁可早死也不漏一整包 PSRAM。
-            if (buf != nullptr) {
-                ESP_LOGE(TAG, "预取 buf 生命周期错误：重试轮 buf 非空");
-                break;
-            }
-            buf = static_cast<uint8_t*>(
-                heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-            if (buf == nullptr) {
-                http->Close();
-                break;
-            }
-            size_t total = 0;
-            while (total < content_length) {
-                if (prefetch_cancel_.load() || abort_requested_.load()) {
-                    break;
-                }
-                int n = http->Read(reinterpret_cast<char*>(buf + total), content_length - total);
-                if (n <= 0) {
-                    break;
-                }
-                total += static_cast<size_t>(n);
-            }
-            if (prefetch_cancel_.load() || abort_requested_.load()) {
-                http->Close();  // R7：取消即断连，不把半读连接留给下一取
-                break;  // 取消/中止是 fatal（outcome 保持 kFatal），绝不重试
-            }
-            if (total != content_length || !Crc32Matches(crc, Crc32Ieee(buf, total))) {
-                http->Close();  // R7：半读连接已污染，Close 后下次 Open 重建
-                heap_caps_free(buf);
-                buf = nullptr;
-                outcome = FetchOutcome::kRetryable;
-                break;
-            }
-            len = total;
-            ok = true;  // 相位内可读下一次；函数尾统一 Release，不跨 awaiting
-        }
-        if (!ok && outcome == FetchOutcome::kFatal) {
-            break;
-        }
-    }
     bool published = false;
-    if (ok) {
-        std::lock_guard<std::mutex> lock(prefetch_mutex_);
-        // epoch 变了说明新任务已开始或本任务被作废：产物不得发布。
-        if (!prefetch_cancel_.load() && prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
-            prefetch_buffer_ = buf;
-            prefetch_len_ = len;
-            prefetch_crc_ = crc;
-            prefetch_url_ = url;
-            prefetch_state_.store(PrefetchState::Ready, std::memory_order_release);
-            published = true;
-            ESP_LOGI(TAG, "G-code 预取完成 %zu 字节，确认即画", len);
+    bool fetch_released = false;
+    try {
+        std::string url;
+        {
+            // url_ 由 StartDraw 在 stream_mutex_ 内写入；拷贝一份避免读到下一个任务的值。
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            url = url_;
         }
+        // 2026-09-06：预取是正常流程的主下载路径（确认时 AdoptPrefetch 命中即画，
+        // DownloadToPsram 只在预取未中时兜底），此前单发即弃——预览确认窗口内的 TLS
+        // 瞬时低谷（esp-tls -0x0084）会让确认被迫走完整重下，体感「确认后才开始下载」。
+        // 与预览/DownloadToPsram 同口径有界重试；确定性失败立即出局；失败仍静默回落。
+        WaitForAudioOutputIdle();  // 首试前的功放/WiFi 错峰（原口径）；重试分支内另行再等
+        for (int attempt = 0; attempt < kFetchMaxAttempts && !ok; ++attempt) {
+            if (prefetch_cancel_.load() || abort_requested_.load()) {
+                break;
+            }
+            if (attempt > 0) {
+                vTaskDelay(pdMS_TO_TICKS(kFetchRetryBackoffMs[attempt - 1]));
+                WaitForAudioOutputIdle();
+            }
+            if (!WaitForTlsHeapBudget()) {
+                ESP_LOGW(TAG, "预取 TLS 堆预算不足，跳过本轮");
+                continue;  // 传输态：等堆失败当可重试
+            }
+            FetchOutcome outcome = FetchOutcome::kFatal;
+            auto network = Board::GetInstance().GetNetwork();
+            if (!network) {
+                break;
+            }
+            // R7：相位内 keep-alive；锁每次尝试重取，退避/等堆不持锁。
+            std::lock_guard<std::mutex> fetch_lock(fetch_mutex_);
+            Http* http = AcquireFetchClient();
+            if (!http) {
+                outcome = FetchOutcome::kRetryable;  // 堆瞬态可致创建失败
+            }
+            while (http && !ok && outcome == FetchOutcome::kFatal) {
+                http->SetTimeout(attempt == 0 ? kFetchFirstTimeoutMs : kFetchRetryTimeoutMs);
+                if (!http->Open("GET", url)) {
+                    outcome = FetchOutcome::kRetryable;
+                    break;
+                }
+                const int status = http->GetStatusCode();
+                if (status != 200) {
+                    http->Close();
+                    if (status < 100) {
+                        outcome = FetchOutcome::kRetryable;  // status=-1=TLS 读败，传输态同预览口径
+                    }
+                    break;  // 非 200（TTL/名字）确定性失败；<100 传输态外层继续重试
+                }
+                const size_t content_length = http->GetBodyLength();
+                if (content_length == 0 || content_length > kMaxGcodeBytes) {
+                    http->Close();
+                    break;
+                }
+                std::string crc_hdr = http->GetResponseHeader("X-Hutuji-CRC32");
+                if (crc_hdr.empty()) {
+                    crc_hdr = http->GetResponseHeader("x-hutuji-crc32");
+                }
+                if (!ParseCrc32Header(crc_hdr, crc)) {
+                    http->Close();
+                    break;
+                }
+                if (!CheckPaperHeader(http, marker)) {
+                    http->Close();
+                    break;
+                }
+                // 与 DownloadToPsram 同策：只用 PSRAM，不饿死内部堆。
+                // 每轮重试前 buf 必为空（retryable 路径已 free+置 nullptr；取消路径到函数尾统一
+                // free）—— 不变量被破时宁可早死也不漏一整包 PSRAM。
+                if (buf != nullptr) {
+                    ESP_LOGE(TAG, "预取 buf 生命周期错误：重试轮 buf 非空");
+                    break;
+                }
+                buf = static_cast<uint8_t*>(
+                    heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                if (buf == nullptr) {
+                    http->Close();
+                    break;
+                }
+                size_t total = 0;
+                while (total < content_length) {
+                    if (prefetch_cancel_.load() || abort_requested_.load()) {
+                        break;
+                    }
+                    int n =
+                        http->Read(reinterpret_cast<char*>(buf + total), content_length - total);
+                    if (n <= 0) {
+                        break;
+                    }
+                    total += static_cast<size_t>(n);
+                }
+                if (prefetch_cancel_.load() || abort_requested_.load()) {
+                    http->Close();  // R7：取消即断连，不把半读连接留给下一取
+                    break;          // 取消/中止是 fatal（outcome 保持 kFatal），绝不重试
+                }
+                if (total != content_length || !Crc32Matches(crc, Crc32Ieee(buf, total))) {
+                    http->Close();  // R7：半读连接已污染，Close 后下次 Open 重建
+                    heap_caps_free(buf);
+                    buf = nullptr;
+                    outcome = FetchOutcome::kRetryable;
+                    break;
+                }
+                len = total;
+                ok = true;  // 相位内可读下一次；函数尾统一 Release，不跨 awaiting
+            }
+            if (!ok && outcome == FetchOutcome::kFatal) {
+                break;
+            }
+        }
+        // TLS 先卸载，再发布 Ready/Idle；确认线程不能被旧相位关闭新下载连接。
+        ReleaseFetchClient();
+        fetch_released = true;
+        if (ok) {
+            std::lock_guard<std::mutex> lock(prefetch_mutex_);
+            // epoch 变了说明新任务已开始或本任务被作废：产物不得发布。
+            if (!prefetch_cancel_.load() && !abort_requested_.load() &&
+                prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
+                // 字符串先以无分配的 move 发布，随后才交接 PSRAM 所有权。
+                prefetch_url_ = std::move(url);
+                prefetch_paper_marker_ = std::move(marker);
+                prefetch_buffer_ = buf;
+                prefetch_len_ = len;
+                prefetch_crc_ = crc;
+                prefetch_state_.store(PrefetchState::Ready, std::memory_order_release);
+                published = true;
+                ESP_LOGI(TAG, "G-code 预取完成 %zu 字节，确认即画", len);
+            }
+        }
+    } catch (const std::exception&) {
+        // 失败统一回收，确认线程可以回落到有界下载，不会永远等待 Running。
+        ESP_LOGW(TAG, "G-code 预取异常，回落确认后下载");
     }
     if (!published && buf != nullptr) {
         heap_caps_free(buf);
     }
+    // R7：预取相位结束必卸 TLS，异常也必须先释放再唤醒确认线程。
+    if (!fetch_released)
+        ReleaseFetchClient();
     if (!published && prefetch_epoch_.load(std::memory_order_acquire) == epoch) {
         prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
     }
-    // R7：预取相位结束必卸 TLS——成功早退也曾漏卸，待确认期占着 4KB 栈。
-    ReleaseFetchClient();
 }
 
 bool Job::AdoptPrefetch() {
@@ -1932,7 +2394,8 @@ bool Job::AdoptPrefetch() {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     std::lock_guard<std::mutex> lock(prefetch_mutex_);
-    if (prefetch_state_.load() != PrefetchState::Ready || prefetch_url_ != url_) {
+    if (prefetch_state_.load() != PrefetchState::Ready || prefetch_url_ != url_ ||
+        prefetch_paper_marker_ != job_paper_marker_) {
         return false;
     }
     // PSRAM 所有权：prefetch_buffer_ 在 Ready 后由预取任务持有，Adopt 时移交至
@@ -1948,6 +2411,7 @@ bool Job::AdoptPrefetch() {
     buffer_ = prefetch_buffer_;
     buffer_len_ = prefetch_len_;
     expect_crc_ = prefetch_crc_;
+    buffer_paper_marker_ = std::move(prefetch_paper_marker_);
     prefetch_buffer_ = nullptr;
     prefetch_len_ = 0;
     prefetch_state_.store(PrefetchState::Idle, std::memory_order_release);
@@ -2075,6 +2539,7 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
             // 与 G-code 同策：只用 PSRAM，不回落内部堆，避免饿死 WiFi/音频。
             auto* data = static_cast<uint8_t*>(
                 heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            std::unique_ptr<uint8_t, decltype(&heap_caps_free)> data_guard(data, &heap_caps_free);
             if (data == nullptr) {
                 http->Close();
                 return nullptr;
@@ -2097,12 +2562,10 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
             }
             SystemInfo::LogHeapNow("preview-read-done");  // 取证：TLS 读谷底（成败都打）
             if (aborted) {
-                heap_caps_free(data);
                 return nullptr;  // outcome 默认 kFatal：用户取消绝不重试
             }
             if (total != content_length || !Crc32Matches(expected_crc, Crc32Ieee(data, total))) {
                 http->Close();  // R7：半读连接已污染，Close 后下次 Open 重建
-                heap_caps_free(data);
                 outcome = FetchOutcome::kRetryable;  // 传输截断/中途换文件
                 return nullptr;
             }
@@ -2112,9 +2575,9 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
             std::unique_ptr<LvglAllocatedImage> img;
             try {
                 img = std::make_unique<LvglAllocatedImage>(data, total);
+                data_guard.release();
             } catch (const std::exception& exc) {
                 ESP_LOGW(TAG, "预览 PNG 解码失败: %s", exc.what());
-                heap_caps_free(data);
                 return nullptr;
             }
             SystemInfo::LogHeapNow("preview-decoded");
@@ -2123,29 +2586,39 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
             // 任务里解码 RGB565 512² 完全正常——直接在预览任务里预解码成原始
             // RGB565 位图再交给 UI，绕开渲染期编码图路径；附带收益：解码一次
             // 完成，不再每帧重复。失败时保留 PNG 原图回落旧路径。
+            std::unique_ptr<LvglAllocatedImage> decoded_image;
             {
-                lv_image_decoder_dsc_t probe;
+                lv_image_decoder_dsc_t probe{};
                 if (lv_image_decoder_open(&probe, img->image_dsc(), nullptr) == LV_RESULT_OK) {
+                    struct DecoderGuard {
+                        lv_image_decoder_dsc_t* probe;
+                        ~DecoderGuard() { lv_image_decoder_close(probe); }
+                    } decoder_guard{&probe};
                     auto* decoded = static_cast<const lv_draw_buf_t*>(probe.decoded);
                     if (decoded && decoded->data && decoded->header.cf == LV_COLOR_FORMAT_RGB565) {
                         const size_t bytes = decoded->data_size;
                         auto* raw = static_cast<uint8_t*>(
                             heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                        std::unique_ptr<uint8_t, decltype(&heap_caps_free)> raw_guard(
+                            raw, &heap_caps_free);
                         if (raw) {
                             memcpy(raw, decoded->data, bytes);
-                            img = std::make_unique<LvglAllocatedImage>(
+                            decoded_image = std::make_unique<LvglAllocatedImage>(
                                 raw, bytes, decoded->header.w, decoded->header.h,
                                 decoded->header.stride, LV_COLOR_FORMAT_RGB565);
+                            raw_guard.release();
                             ESP_LOGW(TAG, "预览预解码 RGB565 %lux%lu（绕开渲染期 PNG）",
                                      (unsigned long)decoded->header.w,
                                      (unsigned long)decoded->header.h);
                         }
                     }
-                    lv_image_decoder_close(&probe);
                 } else {
                     ESP_LOGE(TAG, "预览预解码 decoder_open 失败，回落 PNG 渲染期解码");
                 }
             }
+            // 解码器关闭后才释放它借用的 PNG，避免关闭路径访问已释放的输入。
+            if (decoded_image)
+                img = std::move(decoded_image);
             return img;
         }();
         if (!image && outcome == FetchOutcome::kFatal) {
@@ -2163,7 +2636,22 @@ bool Job::DownloadAndShowPreview(const std::string& url) {
         std::move(image), Lang::Strings::DRAW_PREVIEW_HINT,
         []() {
             ESP_LOGI(TAG, "ui preview action=confirm");
-            Application::GetInstance().Schedule([]() { Job::GetInstance().RequestConfirm(); });
+            if (!McpServer::GetInstance().ScheduleBackground([]() {
+                    const std::string result = Job::GetInstance().RequestConfirm();
+                    cJSON* json = cJSON_Parse(result.c_str());
+                    const cJSON* error = cJSON_GetObjectItemCaseSensitive(json, "error");
+                    const std::string notice =
+                        cJSON_IsString(error) && error->valuestring ? error->valuestring : "";
+                    cJSON_Delete(json);
+                    if (!notice.empty())
+                        Application::GetInstance().Schedule([notice]() {
+                            if (auto* display = Board::GetInstance().GetDisplay())
+                                display->ShowNotification(notice.c_str());
+                        });
+                })) {
+                if (auto* display = Board::GetInstance().GetDisplay())
+                    display->ShowNotification("正在处理上一个操作，请稍候");
+            }
         },
         []() {
             ESP_LOGI(TAG, "ui preview action=cancel");
@@ -2272,6 +2760,13 @@ void Job::Run() {
         int disconnect_replays = 0;
         SystemInfo::LogHeapNow("page-draw-begin");  // R6 取证：TLS 复用连接整段页绘期钉住的堆对照
         while (true) {
+            PaperConfig current_paper;
+            if (!GetPaperConfig(current_paper) || PaperMarker(current_paper) != job_paper_marker_ ||
+                buffer_paper_marker_ != job_paper_marker_) {
+                last_error_ = "作品纸张与当前设备不一致，请重新生成";
+                ok = false;
+                break;
+            }
             SetStreamingOrPaused();
             // 奎享完整会话会在首个笔控前旁路 G92 Z0；下载文件本身仍不含 G92。
             // 每轮重画也必须重做：电机失能后弹簧已回位，Grbl 旧 Z 计数不再可信。
@@ -2573,6 +3068,14 @@ bool Job::DownloadToPsram(const std::string& url) {
             ReleaseFetchClient();
             return false;
         }
+        std::string marker;
+        if (!CheckPaperHeader(http, marker)) {
+            last_error_ = "作品纸张与设备配置不一致，请重新生成";
+            http->Close();
+            fetch_lock.unlock();
+            ReleaseFetchClient();
+            return false;
+        }
 
         // 只用 PSRAM，不回落内部 RAM（S3-P3c）：中等文件回落可能成功但饿死内部堆，
         // 把「下载失败」换成 WiFi/音频不可预期崩溃；fail closed 更可诊断。
@@ -2619,6 +3122,7 @@ bool Job::DownloadToPsram(const std::string& url) {
         }
         SystemInfo::LogHeapNow("gcode-dl-done");  // 取证：TLS 读谷底（成败都打）
         buffer_len_ = total;
+        buffer_paper_marker_ = marker;
         ESP_LOGI(TAG, "下载完成 %u 字节 crc_hdr=%08x", (unsigned)buffer_len_, (unsigned)expect_crc_);
         fetch_lock.unlock();
         // R7：下载相位结束即卸 TLS——灌流可达数分钟，不得占着 ssl_receive 栈。
@@ -2861,7 +3365,13 @@ bool Job::PreparePenOrigin() {
 
 bool Job::QueryAndWaitFreshMachineState(uint32_t timeout_ms) {
     auto& pipe = Pipe::GetInstance();
-    if (!pipe.IsConnected() || !pipe.IsReady()) {
+    const uint32_t connection = pipe.GetConnectionSequence();
+    const uint32_t banner = pipe.GetResetBannerSequence();
+    const auto same_session = [&]() {
+        return pipe.IsConnected() && pipe.IsReady() && pipe.GetConnectionSequence() == connection &&
+               pipe.GetResetBannerSequence() == banner;
+    };
+    if (!same_session()) {
         return false;
     }
     // 必须同时取得 `?` 之后的新状态与新有限 MPos；$10=WPos 或 NaN/Inf 只能推进
@@ -2874,12 +3384,13 @@ bool Job::QueryAndWaitFreshMachineState(uint32_t timeout_ms) {
     const TickType_t began = xTaskGetTickCount();
     while (pipe.GetStatusReportSequence() == status_seq ||
            pipe.GetMposReportSequence() == mpos_seq) {
-        if ((xTaskGetTickCount() - began) >= pdMS_TO_TICKS(timeout_ms)) {
+        if (!same_session() || (xTaskGetTickCount() - began) >= pdMS_TO_TICKS(timeout_ms)) {
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    return true;
+    // 新报告可能来自重连或复位之后；序号推进本身不能证明原查询仍然有效。
+    return same_session();
 }
 
 bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t from, size_t to) {
@@ -2935,6 +3446,12 @@ bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t
 bool Job::WaitForIdle(bool honor_abort, uint32_t timeout_ms) {
     auto& pipe = Pipe::GetInstance();
     const TickType_t began = xTaskGetTickCount();
+    const uint32_t connection = honor_abort ? stream_connection_seq_ : pipe.GetConnectionSequence();
+    const uint32_t banner = pipe.GetResetBannerSequence();
+    const auto same_session = [&]() {
+        return pipe.IsConnected() && pipe.IsReady() && pipe.GetConnectionSequence() == connection &&
+               pipe.GetResetBannerSequence() == banner;
+    };
 
     while (!honor_abort || !abort_requested_.load()) {
         if (honor_abort && !WaitWhilePaused()) {
@@ -2945,8 +3462,7 @@ bool Job::WaitForIdle(bool honor_abort, uint32_t timeout_ms) {
             }
             return false;
         }
-        if (!pipe.IsConnected() || !pipe.IsReady() ||
-            (honor_abort && pipe.GetConnectionSequence() != stream_connection_seq_)) {
+        if (!same_session()) {
             if (honor_abort)
                 stream_disconnected_ = true;
             last_error_ = "等待运动完成时链路丢失";
@@ -2967,10 +3483,21 @@ bool Job::WaitForIdle(bool honor_abort, uint32_t timeout_ms) {
             last_error_ = "查询运动完成状态失败";
             return false;
         }
-        for (int i = 0; i < 20 && (!honor_abort || !abort_requested_.load()) &&
+        for (int i = 0; i < 20 && same_session() && (!honor_abort || !abort_requested_.load()) &&
                         pipe.GetStatusReportSequence() == status_seq;
              ++i) {
             vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        // 停止/断连与 Idle 可在同一轮到达，必须先处理失效条件再接受完成。
+        if (honor_abort && abort_requested_.load()) {
+            last_error_ = "aborted";
+            return false;
+        }
+        if (!same_session()) {
+            if (honor_abort)
+                stream_disconnected_ = true;
+            last_error_ = "等待运动完成时链路丢失";
+            return false;
         }
         if (pipe.GetStatusReportSequence() != status_seq &&
             pipe.GetGrblState() == GrblState::Idle) {

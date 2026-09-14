@@ -126,6 +126,21 @@ protected:
     lv_obj_t* machine_main_section_ = nullptr;
     // 维护页（第三页）：写字机零接触配网的手动入口。machine_page_ 0=主页 1=手动 2=维护。
     lv_obj_t* machine_maint_section_ = nullptr;
+    lv_obj_t* machine_tools_section_ = nullptr;  // 小屏单列点动右侧容不下四个维护动作
+    lv_obj_t* machine_paper_section_ = nullptr;
+    lv_obj_t* machine_paper_restore_section_ = nullptr;
+    lv_obj_t* machine_paper_summary_ = nullptr;
+    lv_obj_t* machine_paper_restore_hint_ = nullptr;
+    std::function<void(const std::string&, const std::string&)> machine_paper_;
+    std::string machine_paper_marker_;
+    bool machine_paper_restore_armed_ = false;
+    struct PaperButton {
+        LcdDisplay* display;
+        const char* action;
+    };
+    PaperButton machine_paper_actions_[6]{{this, "A4"},          {this, "A3"},   {this, "A2"},
+                                          {this, "orientation"}, {this, "swap"}, {this, "restore"}};
+    std::vector<lv_obj_t*> machine_paper_buttons_;
     lv_obj_t* machine_reprovision_btn_ = nullptr;
     lv_obj_t* machine_draw_bind_btn_ = nullptr;
     lv_obj_t* machine_draw_bind_hint_ = nullptr;
@@ -199,6 +214,9 @@ public:
                                   std::function<void(const char* action)> on_manual,
                                   std::function<void()> on_reprovision);
     void ConfigureDrawBind(std::function<void()> on_bind);
+    void ConfigurePaperControls(
+        std::function<void(const std::string&, const std::string&)> on_paper);
+    void UpdatePaperControls(const std::string& status);
     /** boot 键功能上屏：on_talk = boot 单击等效，on_wifi = 进配网显二维码。 */
     void ConfigureVoiceEntry(std::function<void()> on_talk, std::function<void()> on_wifi);
     /** 配网二维码「关闭」回调：调用方负责退出配网模式（如 StopConfigAp）。 */

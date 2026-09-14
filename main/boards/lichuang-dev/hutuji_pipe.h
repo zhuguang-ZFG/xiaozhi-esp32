@@ -59,6 +59,10 @@ public:
 
     /** 写一行普通命令（自动补 \\n）。未连接返回 false。吃 ok（单写者锁）。 */
     bool SendLine(const std::string& line);
+    /** 手动控制等短事务：同一写锁内核对接受时的连接/横幅，再发送普通命令。 */
+    bool SendLineForSession(const std::string& line, uint32_t connection, uint32_t banner);
+    /** 用户手动复位：同一写锁内验证原会话后发送固定 Ctrl-X。 */
+    bool SendManualReset(uint32_t connection, uint32_t banner);
     /** 已归位任务专用：单写者锁内复核同一连接/横幅及新鲜 Idle，仅发送固定 $MD。 */
     bool SendMotorDisableAtIdle(uint32_t connection, uint32_t banner, uint32_t previous_status);
 
@@ -232,6 +236,8 @@ private:
     void CloseSocketLocked();  // write_mutex_ 已持有
     // feed_hold_priority=true 仅供单字节 `!`；它不占 write_mutex_，可在普通发送重试间隙抢占。
     bool SendRawLocked(const char* data, size_t len, bool feed_hold_priority = false);
+    bool SendLineLocked(const std::string& line);
+    bool IsCommandSessionCurrent(uint32_t connection, uint32_t banner) const;
     bool SendFeedHold();
 
     void OnRxData(const uint8_t* data, size_t data_len, uint32_t receive_epoch);

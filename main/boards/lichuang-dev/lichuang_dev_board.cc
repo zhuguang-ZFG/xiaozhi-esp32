@@ -327,6 +327,30 @@ private:
         hutuji::ota::RegisterTools(mcp_server);
         hutuji::memory::RegisterTools(mcp_server);
 
+        if (auto* lcd = dynamic_cast<LcdDisplay*>(display_)) {
+            lcd->ConfigurePaperControls([](const std::string& action, const std::string& expected) {
+                hutuji::Job::GetInstance().RequestPaperFromScreen(action, expected);
+            });
+        }
+        mcp_server.AddBackgroundTool(
+            "hutuji.paper",
+            "读取或设置本机纸张。config 为空只读；写入使用包含 paper/width_mm/height_mm/"
+            "landscape/margin_mm/swap_xy/max_x_mm/max_y_mm 的 JSON，expected 取刚读回的配置标记。"
+            "只有用户核对实际可绘制行程后才传 range_confirmed=true；任务或预览中不允许修改。"
+            "restore_defaults 仅在用户明确确认恢复 A4 默认范围时使用。"
+            "成功返回完整状态和 paper_config 读回值，旧 paper 字段仍表示有无纸。",
+            PropertyList({Property("config", kPropertyTypeString, ""),
+                          Property("expected", kPropertyTypeString, ""),
+                          Property("range_confirmed", kPropertyTypeBoolean, false),
+                          Property("restore_defaults", kPropertyTypeBoolean, false)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestPaper(
+                    properties["config"].value<std::string>(),
+                    properties["expected"].value<std::string>(),
+                    properties["range_confirmed"].value<bool>(),
+                    properties["restore_defaults"].value<bool>());
+            });
+
         mcp_server.AddTool(
             "hutuji.status",
             "查询本机与写字机的 Telnet 管道：是否已连接、Grbl "
@@ -361,14 +385,15 @@ private:
                 return hutuji::Job::GetInstance().StartDraw(url, preview_url, pages);
             });
 
-        mcp_server.AddTool("hutuji.confirm",
-                           "用户看过屏幕预览后确认出图：说「开始画/可以/就这个/好看」时用。"
-                           "只在 hutuji.status 的 state 为 awaiting_confirmation 时有效；"
-                           "没有待确认预览时会返回错误，不要凭空调用。"
-                           "用户点屏幕上的「开始画」按钮与本工具等效。",
-                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
-                               return hutuji::Job::GetInstance().RequestConfirm();
-                           });
+        mcp_server.AddBackgroundTool(
+            "hutuji.confirm",
+            "用户看过屏幕预览后确认出图：说「开始画/可以/就这个/好看」时用。"
+            "只在 hutuji.status 的 state 为 awaiting_confirmation 时有效；"
+            "没有待确认预览时会返回错误，不要凭空调用。"
+            "用户点屏幕上的「开始画」按钮与本工具等效。",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return hutuji::Job::GetInstance().RequestConfirm();
+            });
 
         mcp_server.AddTool("hutuji.abort",
                            "中止当前绘图转发，或取消尚未确认的预览。用户说停下/取消/不要这个时用。"
@@ -393,7 +418,7 @@ private:
                                return hutuji::Job::GetInstance().RequestResume();
                            });
 
-        mcp_server.AddTool(
+        mcp_server.AddBackgroundTool(
             "hutuji.repeat",
             "把上一张画再画一遍（复用设备里存的 G-code，不用重新生成，也不用再问云端）。"
             "用户说「再画一张/再来一个/一样的再画一次」时用。"
@@ -410,7 +435,7 @@ private:
                 return hutuji::Job::GetInstance().RequestPenTest();
             });
 
-        mcp_server.AddTool(
+        mcp_server.AddBackgroundTool(
             "hutuji.manual",
             "手动控制写字机轴运动，仅空闲可用。action 取值："
             "\"jog_x+\"/\"jog_x-\"/\"jog_y+\"/\"jog_y-\" 按当前步距点动（步距用 "
