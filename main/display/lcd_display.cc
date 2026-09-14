@@ -78,10 +78,14 @@ void QrPixelCallback(esp_qrcode_handle_t qrcode, void* user_data) {
 }
 
 std::unique_ptr<LvglImage> BuildProvisioningQrImage(const std::string& payload, int target_size) {
+    if (payload.empty()) {
+        return nullptr;
+    }
     std::vector<uint8_t> modules;
     esp_qrcode_config_t config = {
         .display_func_with_cb = QrPixelCallback,
-        .max_qrcode_version = 8,
+        // 身份 v2 配网码 244B；32 字节 SSID 全转义最多 328B，需 V13/M 的 331B 容量。
+        .max_qrcode_version = 13,
         .qrcode_ecc_level = ESP_QRCODE_ECC_MED,
         .user_data = &modules,
     };
@@ -92,7 +96,8 @@ std::unique_ptr<LvglImage> BuildProvisioningQrImage(const std::string& payload, 
     const int qr_size = static_cast<int>(std::sqrt(modules.size()));
     const int full_size = qr_size + 8;  // ISO/IEC 18004 quiet zone: four modules per side.
     const int scale = target_size / full_size;
-    if (qr_size <= 0 || scale <= 0) {
+    // 每模块至少 2 像素，避免长载荷被缩成难以扫码的单像素点阵。
+    if (qr_size <= 0 || scale < 2) {
         return nullptr;
     }
     const int display_size = full_size * scale;
@@ -514,21 +519,24 @@ void LcdDisplay::ShowProvisioningQr(const std::string& payload, const std::strin
         return;
     }
 
-    const int target_size = height_ >= 300 ? 200 : 150;
+    // V13 含四模块静区共 77 格；小屏 160px 可保证每格 2px 且避开左上关闭键。
+    const int target_size = height_ >= 300 ? 220 : 160;
     auto image = BuildProvisioningQrImage(payload, target_size);
-    if (image == nullptr) {
-        ESP_LOGE(TAG, "Failed to generate provisioning QR code");
-        lv_obj_add_flag(provisioning_qr_root_, LV_OBJ_FLAG_HIDDEN);
-        lv_image_set_src(provisioning_qr_code_, nullptr);
-        provisioning_qr_image_.reset();
-        return;
-    }
-
     lv_image_set_src(provisioning_qr_code_, nullptr);
     provisioning_qr_image_ = std::move(image);
-    lv_image_set_src(provisioning_qr_code_, provisioning_qr_image_->image_dsc());
-    if (provisioning_qr_hint_ != nullptr) {
+    if (provisioning_qr_image_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to generate provisioning QR code (%u bytes)",
+                 static_cast<unsigned>(payload.size()));
+        lv_obj_add_flag(provisioning_qr_code_, LV_OBJ_FLAG_HIDDEN);
+        // 保留遮罩、提示和退出键，不能因编码或内存失败静默退回无二维码的主页。
+        lv_label_set_text(provisioning_qr_hint_, "二维码暂不可用\n请关闭后重新进入");
+    } else {
+        lv_image_set_src(provisioning_qr_code_, provisioning_qr_image_->image_dsc());
+        lv_obj_remove_flag(provisioning_qr_code_, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(provisioning_qr_hint_, hint.c_str());
+        const auto* descriptor = provisioning_qr_image_->image_dsc();
+        ESP_LOGI(TAG, "Provisioning QR ready: %ux%u", static_cast<unsigned>(descriptor->header.w),
+                 static_cast<unsigned>(descriptor->header.h));
     }
     if (machine_control_trigger_btn_ != nullptr) {
         lv_obj_add_flag(machine_control_trigger_btn_, LV_OBJ_FLAG_HIDDEN);
