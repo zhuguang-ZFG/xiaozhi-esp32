@@ -2801,7 +2801,14 @@ void Job::Run() {
         // 完成既有受控 reset 事务，保证软件终态与物理终态一致。
         if (stream_error_stop_required_.exchange(false, std::memory_order_acq_rel)) {
             const std::string stream_error = last_error_;
-            if (!PerformAbortReset(false)) {
+            if (hutuji::DeferStreamErrorStopToAbortDrain(abort_requested_.load(),
+                                                         abort_reset_owner_.Started())) {
+                // 用户 abort 的 drain-home 已独占物理收尾，本流只按 abort 记账；
+                // 再开 reset owner 就是 2026-09-23 的双收尾竞速（详见 recovery_core 谓词注释）。
+                ESP_LOGW(TAG, "流错误停机并入 abort 收尾，不再另开 reset owner（%s）",
+                         stream_error.c_str());
+                last_error_ = "aborted";
+            } else if (!PerformAbortReset(false)) {
                 last_error_ = stream_error + "；错误后受控停机失败，请断电重启";
                 failure_notified_ = true;
                 Notify(last_error_);
@@ -2913,6 +2920,16 @@ void Job::Run() {
         if (!ResetAbortResetState()) {
             stream_lock.unlock();
             continue;
+        }
+        if (!reset_ok &&
+            hutuji::AbortSettledDespiteResetFailure(abort_requested_.load(),
+                                                    abort_home_done_.load(),
+                                                    Pipe::GetInstance().IsConnected(),
+                                                    Pipe::GetInstance().GetGrblState() == GrblState::Idle)) {
+            // owner 账面失败但断流归位已完成且机器健康 Idle：按物理事实收尾，
+            // 不把已停稳的停止误判成「取消失败…请断电重启」（2026-09-23 量产机事故）。
+            ESP_LOGW(TAG, "reset owner 未收敛但断流归位完成且机器 Idle，按已停止收尾");
+            reset_ok = true;
         }
         if (!reset_ok) {
             last_error_ = "abort reset 恢复失败";

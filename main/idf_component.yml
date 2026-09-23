@@ -45,7 +45,10 @@ dependencies:
     rules:
     - if: target in [esp32s3]
   espressif/esp_video:
-    version: ^2.0.1
+    # 2026-09-23：注册表 esp_video 2.5.0 的 esp_h264 依赖带
+    # $CONFIG{ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION} 条款，本项目 Kconfig 无此符号，
+    # 组件管理器 missed_keys 校验 exit 10 致三板配置全败；2.3.x 无该条款，暂行钉住。
+    version: 2.3.*
     rules:
     - if: target in [esp32p4, esp32s3]
   

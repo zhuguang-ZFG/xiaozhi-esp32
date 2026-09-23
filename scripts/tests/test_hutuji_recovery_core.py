@@ -1970,6 +1970,61 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertLess(guard, feed_hold)  # 抑制必先于 `!`
         self.assertIn("~TransitionNotifyGuard()", body)  # RAII 覆盖所有 break 早退
 
+    def test_abort_settle_race_defers_and_settles_on_physical_facts(self):
+        """2026-09-23 量产机事故：流错误停机与用户 abort 双收尾竞速。
+
+        drain-home 已独占物理收尾时再开 reset owner → owner 悬挂 53s →
+        WaitForAbortReset teardown 自拆 session → 误判「abort reset 恢复失败」
+        + 假警报播报（机器实际原点/Idle/已释放）。两个纯谓词钉死修复口径：
+        ① 用户 abort 且无 owner 时流错误停机并入 drain-home，不另开 reset；
+        ② owner 账面失败但断流归位完成且机器健康 Idle 时按已停止终态发布。
+        """
+        compiler = find_compiler()
+        if compiler is None:
+            self.skipTest("no supported host C++ compiler found")
+
+        source = textwrap.dedent(
+            r"""
+            #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+
+            #include <cassert>
+
+            int main() {
+                using hutuji::AbortSettledDespiteResetFailure;
+                using hutuji::DeferStreamErrorStopToAbortDrain;
+
+                // ① 并入条件：仅「用户 abort 且无 reset owner」成立。
+                assert(DeferStreamErrorStopToAbortDrain(true, false));
+                // 无 abort：纯流错误仍走既有受控 reset。
+                assert(!DeferStreamErrorStopToAbortDrain(false, false));
+                assert(!DeferStreamErrorStopToAbortDrain(false, true));
+                // owner 已启动（暂停超时取消/drain-home 移交）：不得并入，
+                // 调用方走 PerformAbortReset → TryClaim 失败 → 并入同一 owner。
+                assert(!DeferStreamErrorStopToAbortDrain(true, true));
+
+                // ② 物理事实收尾：四前提缺一不可，不放水真卡死。
+                assert(AbortSettledDespiteResetFailure(true, true, true, true));
+                assert(!AbortSettledDespiteResetFailure(false, true, true, true));   // 非 abort
+                assert(!AbortSettledDespiteResetFailure(true, false, true, true));  // 未归位
+                assert(!AbortSettledDespiteResetFailure(true, true, false, true));  // 断链
+                assert(!AbortSettledDespiteResetFailure(true, true, true, false));  // 非 Idle
+                return 0;
+            }
+            """
+        )
+        self._compile_and_run(compiler, source, "abort_settle_race_predicates")
+
+        job_cc = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
+        # 接线①：错误停机块内并入分支必须先于 PerformAbortReset 调用。
+        stop = job_cc.index("stream_error_stop_required_.exchange(false")
+        defer = job_cc.index("DeferStreamErrorStopToAbortDrain", stop)
+        reset_call = job_cc.index("PerformAbortReset(false)", stop)
+        self.assertLess(defer, reset_call)
+        # 接线②：物理事实兜底必须先于「abort reset 恢复失败」发布。
+        settled = job_cc.index("AbortSettledDespiteResetFailure")
+        condemn = job_cc.index('last_error_ = "abort reset 恢复失败"')
+        self.assertLess(settled, condemn)
+
     def test_progress_notify_percent_only(self):
         """R21-F05：进度播报只留百分比；坐标/行号不再进 Notify（串口日志仍有）。"""
         source = (

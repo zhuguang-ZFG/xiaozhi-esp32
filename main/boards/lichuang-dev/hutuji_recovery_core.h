@@ -748,6 +748,35 @@ inline constexpr bool CanResetAfterStream(StreamQuiescence state) {
     return state == StreamQuiescence::Idle || state == StreamQuiescence::Quiesced;
 }
 
+/**
+ * 流错误停机是否并入用户 abort 收尾（2026-09-23 量产机事故，HIL 双串口证据）。
+ * 灌流错误（fail_window_and_stop）与用户 abort 并发时，drain-home worker 已独占
+ * 物理收尾（排空/抬笔/归位/释放，2026-08-28 用户决策「停止后也要自己回原点」）；
+ * 页循环再开一条 reset owner 只会与它争抢同一台机器——当日实测：owner 悬挂 ~53s，
+ * WaitForAbortReset 逾 30s 预算 teardown 自拆 session，owner 未 Succeeded 被误判
+ * 「abort reset 恢复失败」进 state=error 并播报假警报（机器实际原点/Idle/已释放）。
+ * 故用户 abort 且无 reset owner 时不再另开 reset。pause 超时取消不占本分支：
+ * 它已先抢占 owner（StartAbortResetTask），此处返回 false，调用方走既有
+ * PerformAbortReset → TryClaim 失败 → WaitForAbortReset 并入同一 owner，语义不变。
+ */
+inline constexpr bool DeferStreamErrorStopToAbortDrain(bool abort_requested,
+                                                       bool reset_owner_started) {
+    return abort_requested && !reset_owner_started;
+}
+
+/**
+ * reset owner 账面失败但物理收尾已被证实时按已停止终态发布（同一事故）。
+ * 机器停稳是主结果：断流归位已完成（抬笔/归位/$MD 释放均经应答确认）且链路健康、
+ * Grbl 现处 Idle 时，owner 的失败不能推翻物理事实——否则用户听到的是
+ * 「取消失败…请断电重启」而机器其实已收好。任一前提缺失（未归位/断链/非 Idle）
+ * 都保守走原 error 路径，不放水真卡死。
+ */
+inline constexpr bool AbortSettledDespiteResetFailure(bool abort_requested,
+                                                      bool abort_home_done,
+                                                      bool pipe_connected, bool grbl_idle) {
+    return abort_requested && abort_home_done && pipe_connected && grbl_idle;
+}
+
 inline constexpr StreamQuiescence FinishStream(bool proven_quiesced) {
     return proven_quiesced ? StreamQuiescence::Quiesced : StreamQuiescence::Failed;
 }
