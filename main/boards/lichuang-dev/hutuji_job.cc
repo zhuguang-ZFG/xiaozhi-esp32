@@ -4434,6 +4434,11 @@ bool Job::StreamToGrbl() {
             }
         } else if (wr == WaitResult::Failed) {
             // error 只丢坏行；character-counting 已灌入 RX 的后续行仍会执行。
+            // 取证（2026-09-23 error:21 悬案）：原始字节重放无罪而首块被判模态冲突，
+            // 疑似 Telnet 字节粘连/丢字致并块；日志带应答码、队首行与在途深度自我留证。
+            ESP_LOGE(TAG, "灌流应答 error:%d，队首在途行 [%zu]: %.*s（在途 %zu 行/%zu B）", err,
+                     lines_sent_, (int)front_sv.size(), front_sv.data(), c_line.size(),
+                     c_line_bytes_sum);
             return fail_window_and_stop("error:" + std::to_string(err));
         } else if (wr == WaitResult::Deferred) {
             // 窗口化普通行不应收到 error:8；一旦出现，后续在途同样先物理停机。

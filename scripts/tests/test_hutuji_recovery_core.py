@@ -2025,6 +2025,11 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         condemn = job_cc.index('last_error_ = "abort reset 恢复失败"')
         self.assertLess(settled, condemn)
 
+        # 取证：error 应答分支的肇事行+在途深度日志必须先于 fail 调用（error:21 悬案留证）。
+        forensic = job_cc.index("灌流应答 error:%d，队首在途行")
+        fail_call = job_cc.index('return fail_window_and_stop("error:" + std::to_string(err))')
+        self.assertLess(forensic, fail_call)
+
     def test_progress_notify_percent_only(self):
         """R21-F05：进度播报只留百分比；坐标/行号不再进 Notify（串口日志仍有）。"""
         source = (
