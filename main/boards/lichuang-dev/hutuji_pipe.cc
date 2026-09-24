@@ -577,6 +577,8 @@ bool Pipe::SendRawLocked(const char* data, size_t len, bool feed_hold_priority) 
     int send_errno = 0;
     int last_result = -1;
     bool budget_expired = false;
+    uint32_t diag_sock_ticks = 0, diag_call_ticks = 0, diag_call_max = 0;
+    uint32_t diag_retries = 0, diag_hold_ticks = 0;
     const uint32_t send_began = static_cast<uint32_t>(xTaskGetTickCount());
     SendStallBudget budget(send_began, static_cast<uint32_t>(pdMS_TO_TICKS(kSendStallBudgetMs)));
 
@@ -596,26 +598,45 @@ bool Pipe::SendRawLocked(const char* data, size_t len, bool feed_hold_priority) 
                 vTaskDelay(1);
             } while (ShouldYieldToFeedHold(feed_hold_priority,
                                            feed_hold_waiters_.load(std::memory_order_acquire)));
+            diag_hold_ticks += static_cast<uint32_t>(xTaskGetTickCount()) - suspended_from;
             budget.Suspend(suspended_from, static_cast<uint32_t>(xTaskGetTickCount()));
             continue;
         }
 
         {
+            const uint32_t lock_began = static_cast<uint32_t>(xTaskGetTickCount());
             std::lock_guard<std::mutex> lock(sock_mutex_);
+            const uint32_t call_began = static_cast<uint32_t>(xTaskGetTickCount());
+            diag_sock_ticks += call_began - lock_began;
             if (sock_ < 0) {
                 return false;
             }
             last_result = send(sock_, data + sent, len - sent, MSG_DONTWAIT);
             send_errno = last_result < 0 ? errno : 0;  // 紧贴失败 send() 捕获，防后续调用改写
+            const uint32_t call_ticks = static_cast<uint32_t>(xTaskGetTickCount()) - call_began;
+            diag_call_ticks += call_ticks;
+            if (call_ticks > diag_call_max)
+                diag_call_max = call_ticks;
         }
         if (AdvanceSendProgress(sent, last_result)) {
             continue;
         }
         if (ShouldRetrySend(last_result, send_errno)) {
+            ++diag_retries;
             vTaskDelay(1);
             continue;
         }
         break;
+    }
+    // 仅记录超过250ms的慢发送，不输出载荷；正常短行保持静默。
+    const uint32_t diag_total = static_cast<uint32_t>(xTaskGetTickCount()) - send_began;
+    if (diag_total >= pdMS_TO_TICKS(250)) {
+        ESP_LOGW(TAG, "TCP慢发送 total=%lu sock=%lu call=%lu max=%lu retry=%lu hold=%lu bytes=%u",
+                 (unsigned long)(diag_total * portTICK_PERIOD_MS),
+                 (unsigned long)(diag_sock_ticks * portTICK_PERIOD_MS),
+                 (unsigned long)(diag_call_ticks * portTICK_PERIOD_MS),
+                 (unsigned long)(diag_call_max * portTICK_PERIOD_MS), (unsigned long)diag_retries,
+                 (unsigned long)(diag_hold_ticks * portTICK_PERIOD_MS), (unsigned)len);
     }
     if (sent == len) {
         return true;
@@ -1202,7 +1223,12 @@ bool Pipe::SendLine(const std::string& line) {
         return false;
     }
 
+    const TickType_t lock_began = xTaskGetTickCount();
     std::lock_guard<std::mutex> lock(write_mutex_);
+    const uint32_t lock_ms = (xTaskGetTickCount() - lock_began) * portTICK_PERIOD_MS;
+    if (lock_ms >= 250) {
+        ESP_LOGW(TAG, "TCP写锁等待 ms=%lu", (unsigned long)lock_ms);
+    }
     return SendLineLocked(line);
 }
 

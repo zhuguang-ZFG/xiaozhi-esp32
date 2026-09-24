@@ -139,7 +139,6 @@ constexpr int kDisconnectReplayMaxRetries = 2;
 // 暂停上限：超过则自动放弃，避免 busy_ 被无限期占用导致所有工具返回 busy。
 constexpr uint32_t kMaxPauseMs = 10 * 60 * 1000;
 // S3 窗口化流控窗口（§3 取值：Telnet RX ①的 43%）。应答队列容量由同一常量推导。
-constexpr size_t kWindow = kStreamWindowBytes;
 
 std::string JsonString(const char* value) {
     cJSON* root = cJSON_CreateString(value);
@@ -4236,7 +4235,7 @@ bool Job::StreamToGrbl() {
                 // 普通行窗口化灌：一行一个 Grbl 应答。不要把多行合并成同一 TCP 包；
                 // 当前商业固件链路实测会出现少应答，窗口计数会永久漂移。
                 const size_t need = line.size() + 1;  // R1：含换行符
-                if (c_line_bytes_sum + need < kWindow || c_line.empty()) {
+                if (StreamWindowAllowsSend(c_line_bytes_sum, c_line.size(), need)) {
                     // 快照与暂停/abort 提交在同一把 stream_mutex_ 下做：RequestPause/
                     // RequestAbort 在锁内发布状态并递增 stream_control_epoch_；解锁后、
                     // SendLine 前用 DecideStreamSend 复核「快照后无新提交」。

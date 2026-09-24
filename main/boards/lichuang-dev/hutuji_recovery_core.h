@@ -15,6 +15,18 @@ namespace hutuji {
 // 窗口按 payload+LF 计字节；应答队列须覆盖最短非空行形成的最大在途条数，
 // 否则队满丢掉 error 后，后续 ok 会与错误行错配，破坏 fail-closed。
 inline constexpr size_t kStreamWindowBytes = 512;
+// 量产短段实测：26B小包填满lwIP的16段队列，引发秒级背压。
+// 先取一半队列预算给正常行，留出实时字符和ACK周转余量；字节上限不变。
+inline constexpr size_t kStreamWindowLines = 8;
+
+inline bool StreamWindowAllowsSend(size_t inflight_bytes, size_t inflight_lines, size_t need) {
+    if (inflight_lines >= kStreamWindowLines)
+        return false;
+    // 保留既有空窗首行许可；行长已在文件校验处限制。
+    return inflight_lines == 0 ||
+           (inflight_bytes < kStreamWindowBytes && need < kStreamWindowBytes - inflight_bytes);
+}
+
 inline constexpr size_t kResponseQueueDepth = (kStreamWindowBytes - 1u) / 2u;
 
 /**

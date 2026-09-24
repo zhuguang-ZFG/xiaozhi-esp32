@@ -35,6 +35,7 @@ class CommandSessionTest(unittest.TestCase):
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -43,6 +44,12 @@ class CommandSessionTest(unittest.TestCase):
 #define ESP_LOGE(...) ((void)0)
 #define ESP_LOGI(...) ((void)0)
 #define HUTUJI_QUIET_STREAM_LOG 1
+using TickType_t = uint32_t;
+constexpr uint32_t portTICK_PERIOD_MS = 1;
+TickType_t xTaskGetTickCount() {
+    return static_cast<TickType_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 bool IsStreamingMotionLine(const std::string&) { return false; }
 struct ObservedMutex {
     std::mutex value;
