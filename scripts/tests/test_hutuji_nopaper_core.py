@@ -249,7 +249,7 @@ uint32_t NextStreamControlEpoch(uint32_t value) { return value + 1; }
 struct Job {
     std::mutex stream_mutex_, state_mutex_;
     std::atomic<bool> busy_{true}, speed_active_{false}, awaiting_confirmation_{false};
-    std::atomic<bool> paper_update_active_{false};
+    std::atomic<bool> paper_update_active_{false}, ota_reserved_{false};
     std::atomic<bool> prefetch_cancel_{false}, abort_requested_{false};
     std::atomic<bool> pen_test_active_{false}, paper_active_{false};
     std::atomic<bool> abort_reset_worker_active_{false};
@@ -267,6 +267,10 @@ struct Job {
 ''' + request + start + r'''
 int main() {
     auto& job = Job::GetInstance();
+    job.ota_reserved_.store(true);
+    assert(job.RequestAbort().find("error") != std::string::npos);
+    assert(create_calls == 0 && !job.abort_requested_.load());
+    job.ota_reserved_.store(false);
     job.paper_update_active_.store(true);
     assert(job.RequestAbort().find("error") != std::string::npos);
     assert(create_calls == 0 && !job.abort_requested_.load());

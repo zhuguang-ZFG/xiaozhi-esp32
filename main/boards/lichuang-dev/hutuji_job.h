@@ -85,6 +85,10 @@ public:
      */
     void SetOtaStatus(const std::string& state, int progress, const std::string& reason = "");
     void SetOtaUpdateAvailable(bool available);
+    /** OTA 与绘图共用忙位，受理即占用；失败释放，成功保持到重启。 */
+    bool TryReserveOta();
+    bool OtaReservationActive();
+    void ReleaseOtaReservation();
 
     bool IsPaperActive() const { return paper_active_.load(); }
     /** WiFi 省电门：活跃窗口内板级 SetPowerSaveLevel 拒绝一切非 PERFORMANCE 档位回落。 */
@@ -319,6 +323,7 @@ private:
     // 此时没有剩余运动，拒绝迟到的 pause/abort 再启动机械编排。
     bool finishing_at_home_ = false;
     std::atomic<bool> busy_{false};
+    std::atomic<bool> ota_reserved_{false};
     std::atomic<bool> awaiting_confirmation_{false};
     std::atomic<bool> abort_requested_{false};
     std::atomic<bool> paper_active_{false};

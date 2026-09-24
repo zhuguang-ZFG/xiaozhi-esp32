@@ -389,18 +389,33 @@ void RegisterTools(McpServer& mcp_server) {
                 return MakeReasonJson("check_failed");
             }
 
-            Job::GetInstance().SetOtaStatus("upgrading", 0, "");
-            Job::GetInstance().SetOtaUpdateAvailable(true);
-
-            app.Schedule([url, version]() {
-                auto& application = Application::GetInstance();
-                const bool ok = application.UpgradeFirmware(url, version);
-                if (!ok) {
-                    Job::GetInstance().SetOtaStatus("failed", 0, "download_failed");
-                    ESP_LOGE(kTag, "ota_start UpgradeFirmware failed");
-                }
-                // 成功路径会 reboot，无需清状态。
-            });
+            auto& job = Job::GetInstance();
+            if (!job.TryReserveOta())
+                return MakeReasonJson("busy");
+            try {
+                job.SetOtaStatus("upgrading", 0, "");
+                job.SetOtaUpdateAvailable(true);
+                app.Schedule([url, version]() {
+                    auto& current_job = Job::GetInstance();
+                    bool ok = false;
+                    try {
+                        // 调度前已占用；执行点再确认所有权，不能仅信任旧的空闲快照。
+                        if (current_job.OtaReservationActive())
+                            ok = Application::GetInstance().UpgradeFirmware(url, version);
+                    } catch (...) {
+                        ESP_LOGE(kTag, "ota_start upgrade exception");
+                    }
+                    if (!ok) {
+                        current_job.SetOtaStatus("failed", 0, "download_failed");
+                        current_job.ReleaseOtaReservation();
+                    }
+                    // 成功路径保持占用直到 reboot，不能提前接受新的运动。
+                });
+            } catch (...) {
+                job.SetOtaStatus("failed", 0, "check_failed");
+                job.ReleaseOtaReservation();
+                return MakeReasonJson("check_failed");
+            }
             return std::string("{\"ok\":true}");
         });
 }

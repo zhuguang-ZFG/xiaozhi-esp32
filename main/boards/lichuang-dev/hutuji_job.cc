@@ -845,6 +845,9 @@ std::string Job::RequestAbort() {
         if (!busy_.load()) {
             return JsonString("ok");
         }
+        if (ota_reserved_.load()) {
+            return "{\"error\":\"正在升级固件，请等待设备重启\"}";
+        }
         if (paper_update_active_.load()) {
             return "{\"error\":\"正在保存纸张设置，请稍候查询结果\"}";
         }
@@ -1234,7 +1237,7 @@ std::string Job::RequestPause() {
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
     }
-    if (paper_update_active_.load() || speed_active_.load()) {
+    if (ota_reserved_.load() || paper_update_active_.load() || speed_active_.load()) {
         return "{\"error\":\"正在保存设备设置，请稍候\"}";
     }
     if (finishing_at_home_) {
@@ -1275,7 +1278,7 @@ std::string Job::RequestResume() {
     if (!busy_.load()) {
         return "{\"error\":\"当前没在出图\"}";
     }
-    if (paper_update_active_.load() || speed_active_.load()) {
+    if (ota_reserved_.load() || paper_update_active_.load() || speed_active_.load()) {
         return "{\"error\":\"正在保存设备设置，请稍候\"}";
     }
     if (finishing_at_home_) {
@@ -1954,7 +1957,7 @@ std::string Job::StatusJson() const {
     std::string manual_error;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        state = state_;
+        state = ota_reserved_.load() ? "upgrading" : state_;
         manual_error = manual_error_;
     }
     cJSON* root = cJSON_CreateObject();
@@ -2077,6 +2080,31 @@ std::string Job::StatusJson() const {
     std::string json = str ? str : "{}";
     cJSON_free(str);
     return json;
+}
+
+bool Job::TryReserveOta() {
+    std::unique_lock<std::mutex> stream_lock(stream_mutex_, std::try_to_lock);
+    if (!stream_lock.owns_lock() || busy_.load() || preview_worker_active_.load() ||
+        abort_reset_worker_active_.load() || abort_reset_owner_.Running() || paper_active_.load()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    if (!IsSpeedSettledState(state_))
+        return false;
+    busy_.store(true);
+    ota_reserved_.store(true);
+    return true;
+}
+
+bool Job::OtaReservationActive() {
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    return ota_reserved_.load() && busy_.load();
+}
+
+void Job::ReleaseOtaReservation() {
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    if (ota_reserved_.exchange(false))
+        busy_.store(false);
 }
 
 void Job::SetOtaStatus(const std::string& state, int progress, const std::string& reason) {
