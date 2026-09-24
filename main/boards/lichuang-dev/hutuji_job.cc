@@ -4025,6 +4025,9 @@ bool Job::StreamToGrbl() {
     uint32_t dbg_inflight_hist[6] = {};  // 在途 1 / 2-4 / 5-8 / 9-16 / 17-32 / 33+
     uint32_t dbg_oklat_hist[6] = {};     // <5 / 5-20 / 20-50 / 50-100 / 100-300 / ≥300ms
     uint64_t dbg_oklat_sum_ms = 0;
+    // 仅完成时输出汇总，避免诊断串口本身在短段灌流中制造停顿。
+    uint32_t dbg_send_max_ms = 0, dbg_recv_max_ms = 0, dbg_ui_max_ms = 0;
+    uint64_t dbg_send_sum_ms = 0, dbg_recv_sum_ms = 0;
     size_t next_ = 0;             // 下一条待发
 
     // paper_pending：遇到换纸行时先排空 c_line，排空后在此标记下走逐行模式。
@@ -4269,6 +4272,7 @@ bool Job::StreamToGrbl() {
                         case StreamSendCancel::Allowed:
                             break;
                     }
+                    const TickType_t send_began = xTaskGetTickCount();
                     if (!pipe.SendLine(line)) {
                         // SendRawLocked 已半关 socket；即使接收泵尚未来得及更新原子状态，
                         // 也必须按断连恢复，不能复用可能残留半行的 session。
@@ -4276,6 +4280,9 @@ bool Job::StreamToGrbl() {
                         last_error_ = "转发中链路丢失";
                         return false;
                     }
+                    const uint32_t send_ms = (xTaskGetTickCount() - send_began) * portTICK_PERIOD_MS;
+                    dbg_send_sum_ms += send_ms;
+                    dbg_send_max_ms = std::max(dbg_send_max_ms, send_ms);
                     c_line.push_back(need);
                     c_line_bytes_sum += need;
                     ++next_;
@@ -4365,7 +4372,11 @@ bool Job::StreamToGrbl() {
                 return false;
             }
             uint32_t step = (timeout - waited > slice) ? slice : (timeout - waited);
+            const TickType_t recv_began = xTaskGetTickCount();
             wr = pipe.TakeResponse(step, &err);
+            const uint32_t recv_ms = (xTaskGetTickCount() - recv_began) * portTICK_PERIOD_MS;
+            dbg_recv_sum_ms += recv_ms;
+            dbg_recv_max_ms = std::max(dbg_recv_max_ms, recv_ms);
             if (wr != WaitResult::Timeout) {
                 break;
             }
@@ -4437,6 +4448,8 @@ bool Job::StreamToGrbl() {
             if ((display_now - last_display_tick) >= pdMS_TO_TICKS(250)) {
                 last_display_tick = display_now;
                 UpdateDisplayProgress();
+                dbg_ui_max_ms = std::max(dbg_ui_max_ms,
+                    static_cast<uint32_t>((xTaskGetTickCount() - display_now) * portTICK_PERIOD_MS));
             }
             // 进度推送用 lines_sent_（已确认数），不是 next_（已发数）——已发≠已画
             TickType_t now = xTaskGetTickCount();
@@ -4527,6 +4540,10 @@ bool Job::StreamToGrbl() {
                  (unsigned long)dbg_oklat_hist[2], (unsigned long)dbg_oklat_hist[3],
                  (unsigned long)dbg_oklat_hist[4], (unsigned long)dbg_oklat_hist[5],
                  (unsigned long)(ok_n ? dbg_oklat_sum_ms / ok_n : 0));
+        ESP_LOGI(TAG, "灌流耗时ms send总=%llu max=%lu recv总=%llu max=%lu UI入队max=%lu",
+                 (unsigned long long)dbg_send_sum_ms, (unsigned long)dbg_send_max_ms,
+                 (unsigned long long)dbg_recv_sum_ms, (unsigned long)dbg_recv_max_ms,
+                 (unsigned long)dbg_ui_max_ms);
     }
     return true;
 }

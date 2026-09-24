@@ -5,7 +5,7 @@
 
 #include "hutuji_memory_core.h"
 #include "mcp_server.h"
-#include "settings.h"
+#include <nvs.h>
 
 namespace hutuji::memory {
 namespace {
@@ -15,16 +15,40 @@ constexpr const char* kNvsKey = "json";
 
 std::mutex g_lock;
 
-Store LoadLocked() {
-    Settings settings(kNvsNs, false);
-    const std::string raw = settings.GetString(kNvsKey, "{}");
-    return FromJsonObject(raw);
+struct NvsHandle {
+    nvs_handle_t value = 0;
+    ~NvsHandle() { if (value != 0) nvs_close(value); }
+};
+
+std::string StorageError() {
+    return "{\"ok\":false,\"message\":\"本机记忆存储暂不可用，请稍后重试。\"}";
 }
 
-void SaveLocked(Store& store) {
+bool LoadLocked(Store& store) {
+    NvsHandle handle;
+    esp_err_t result = nvs_open(kNvsNs, NVS_READONLY, &handle.value);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return true;
+    if (result != ESP_OK) return false;
+    size_t length = 0;
+    result = nvs_get_str(handle.value, kNvsKey, nullptr, &length);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return true;
+    // 长度含末尾 NUL；拒绝异常长度，避免故障值挤占设备内存。
+    if (result != ESP_OK || length == 0 || length > kJsonSoftMaxBytes + 1) return false;
+    std::string raw(length, '\0');
+    result = nvs_get_str(handle.value, kNvsKey, raw.data(), &length);
+    if (result != ESP_OK || raw.back() != '\0') return false;
+    raw.pop_back();
+    store = FromJsonObject(raw);
+    return true;
+}
+
+bool SaveLocked(Store& store) {
     const std::string json = CompactToSoftMax(store);
-    Settings settings(kNvsNs, true);
-    settings.SetString(kNvsKey, json);
+    NvsHandle handle;
+    if (nvs_open(kNvsNs, NVS_READWRITE, &handle.value) != ESP_OK) return false;
+    if (nvs_set_str(handle.value, kNvsKey, json.c_str()) != ESP_OK) return false;
+    // 不经 ESP_ERROR_CHECK；持久化失败不能白屏重启或回报记忆成功。
+    return nvs_commit(handle.value) == ESP_OK;
 }
 
 }  // namespace
@@ -41,9 +65,11 @@ void RegisterTools(McpServer& mcp_server) {
             const std::string key = properties["key"].value<std::string>();
             const std::string value = properties["value"].value<std::string>();
             std::lock_guard<std::mutex> lock(g_lock);
-            Store store = LoadLocked();
+            Store store;
+            if (!LoadLocked(store)) return StorageError();
+            const auto before = store.entries;
             const std::string msg = Remember(store, key, value);
-            SaveLocked(store);
+            if (store.entries != before && !SaveLocked(store)) return StorageError();
             return msg;
         });
 
@@ -56,7 +82,8 @@ void RegisterTools(McpServer& mcp_server) {
         [](const PropertyList& properties) -> ReturnValue {
             const std::string key = properties["key"].value<std::string>();
             std::lock_guard<std::mutex> lock(g_lock);
-            const Store store = LoadLocked();
+            Store store;
+            if (!LoadLocked(store)) return StorageError();
             return Recall(store, key);
         });
 
@@ -68,9 +95,11 @@ void RegisterTools(McpServer& mcp_server) {
         [](const PropertyList& properties) -> ReturnValue {
             const std::string key = properties["key"].value<std::string>();
             std::lock_guard<std::mutex> lock(g_lock);
-            Store store = LoadLocked();
+            Store store;
+            if (!LoadLocked(store)) return StorageError();
+            const auto before = store.entries;
             const std::string msg = Forget(store, key);
-            SaveLocked(store);
+            if (store.entries != before && !SaveLocked(store)) return StorageError();
             return msg;
         });
 }

@@ -27,28 +27,53 @@ struct Store {
     std::vector<std::pair<std::string, std::string>> entries;
 };
 
+
+// 严格解码，拒绝过长编码、代理项和截断字节；字数按 Unicode 码点计算。
+inline bool NextCodepoint(const std::string& text, size_t& i, unsigned& cp) {
+    if (i >= text.size()) return false;
+    const auto lead = static_cast<unsigned char>(text[i++]);
+    size_t extra = 0;
+    unsigned minimum = 0;
+    if (lead < 0x80) { cp = lead; return true; }
+    if (lead >= 0xc2 && lead <= 0xdf) { cp = lead & 0x1f; extra = 1; minimum = 0x80; }
+    else if (lead >= 0xe0 && lead <= 0xef) { cp = lead & 0x0f; extra = 2; minimum = 0x800; }
+    else if (lead >= 0xf0 && lead <= 0xf4) { cp = lead & 7; extra = 3; minimum = 0x10000; }
+    else return false;
+    while (extra--) {
+        if (i >= text.size()) return false;
+        const auto c = static_cast<unsigned char>(text[i++]);
+        if ((c & 0xc0) != 0x80) return false;
+        cp = (cp << 6) | (c & 0x3f);
+    }
+    return cp >= minimum && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff);
+}
+
+inline size_t CodepointCount(const std::string& text) {
+    size_t i = 0, count = 0;
+    unsigned cp = 0;
+    while (NextCodepoint(text, i, cp)) ++count;
+    return count;
+}
+
 inline void StripControlAndClamp(std::string& text, size_t limit) {
     std::string out;
     out.reserve(text.size());
-    for (unsigned char c : text) {
-        if (c < 0x20u || c == 0x7fu) {
-            continue;
-        }
-        out.push_back(static_cast<char>(c));
+    size_t i = 0;
+    while (i < text.size()) {
+        const size_t start = i;
+        unsigned cp = 0;
+        // 拒绝整次非法输入，避免不同坏字节被清洗成同一个主题。
+        if (!NextCodepoint(text, i, cp)) { text.clear(); return; }
+        if (cp < 0x20u || cp == 0x7fu) continue;
+        out.append(text, start, i - start);
     }
-    while (!out.empty() && (out.back() == ' ' || out.back() == '\t')) {
-        out.pop_back();
-    }
-    size_t start = 0;
-    while (start < out.size() && (out[start] == ' ' || out[start] == '\t')) {
-        ++start;
-    }
-    if (start > 0) {
-        out.erase(0, start);
-    }
-    if (out.size() > limit) {
-        out.resize(limit);
-    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    const size_t start = out.find_first_not_of(' ');
+    out.erase(0, start == std::string::npos ? out.size() : start);
+    i = 0;
+    unsigned cp = 0;
+    for (size_t count = 0; count < limit && i < out.size(); ++count) NextCodepoint(out, i, cp);
+    out.resize(i);
     text.swap(out);
 }
 
@@ -101,48 +126,70 @@ inline std::string ToJsonObject(const Store& store) {
     return out;
 }
 
-inline bool ParseJsonString(const std::string& raw, size_t& i, std::string& out) {
-    if (i >= raw.size() || raw[i] != '"') {
-        return false;
+
+inline bool ParseHex4(const std::string& raw, size_t& i, unsigned& value) {
+    value = 0;
+    for (int n = 0; n < 4; ++n) {
+        if (i == raw.size()) return false;
+        const char h = raw[i++];
+        unsigned digit;
+        if (h >= '0' && h <= '9') digit = h - '0';
+        else if (h >= 'a' && h <= 'f') digit = h - 'a' + 10;
+        else if (h >= 'A' && h <= 'F') digit = h - 'A' + 10;
+        else return false;
+        value = (value << 4) | digit;
     }
-    ++i;
+    return true;
+}
+
+inline void AppendCodepoint(std::string& out, unsigned cp) {
+    if (cp < 0x80) out.push_back(static_cast<char>(cp));
+    else {
+        if (cp >= 0x10000) out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+        if (cp >= 0x800) out.push_back(static_cast<char>((cp >= 0x10000 ? 0x80 : 0xe0) | ((cp >> 12) & 0x3f)));
+        out.push_back(static_cast<char>((cp >= 0x800 ? 0x80 : 0xc0) | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+}
+
+inline bool ParseJsonString(const std::string& raw, size_t& i, std::string& out) {
+    if (i >= raw.size() || raw[i++] != '"') return false;
     out.clear();
     while (i < raw.size()) {
-        char c = raw[i++];
-        if (c == '"') {
-            return true;
-        }
-        if (c == '\\' && i < raw.size()) {
-            char e = raw[i++];
+        const char c = raw[i++];
+        if (c == '"') return true;
+        if (c == '\\') {
+            if (i == raw.size()) return false;
+            const char e = raw[i++];
             switch (e) {
-                case '"':
-                case '\\':
-                case '/':
-                    out.push_back(e);
+                case '"': case '\\': case '/': out.push_back(e); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'u': {
+                    unsigned cp;
+                    if (!ParseHex4(raw, i, cp)) return false;
+                    if (cp >= 0xd800 && cp <= 0xdbff) {
+                        if (raw.compare(i, 2, "\\u") != 0) return false;
+                        i += 2;
+                        unsigned low;
+                        if (!ParseHex4(raw, i, low) || low < 0xdc00 || low > 0xdfff) return false;
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;
+                    } else if (cp >= 0xdc00 && cp <= 0xdfff) return false;
+                    AppendCodepoint(out, cp);
                     break;
-                case 'n':
-                    out.push_back('\n');
-                    break;
-                case 'r':
-                    out.push_back('\r');
-                    break;
-                case 't':
-                    out.push_back('\t');
-                    break;
-                case 'u':
-                    // 跳过 \uXXXX（四位）；失败则整段拒
-                    if (i + 4 > raw.size()) {
-                        return false;
-                    }
-                    i += 4;
-                    out.push_back('?');
-                    break;
-                default:
-                    return false;
+                }
+                default: return false;
             }
-            continue;
+        } else {
+            if (static_cast<unsigned char>(c) < 0x20) return false;
+            const size_t start = --i;
+            unsigned cp;
+            if (!NextCodepoint(raw, i, cp)) return false;
+            out.append(raw, start, i - start);
         }
-        out.push_back(c);
     }
     return false;
 }
@@ -154,46 +201,44 @@ inline void SkipWs(const std::string& raw, size_t& i) {
     }
 }
 
-/** 仅接受 {"k":"v",...}；损坏 → 空 Store（fail-open）。 */
+
+/** 仅接受完整对象；损坏返回空 Store，不恢复部分解析结果。 */
 inline Store FromJsonObject(const std::string& raw) {
     Store store;
     size_t i = 0;
     SkipWs(raw, i);
-    if (i >= raw.size() || raw[i] != '{') {
-        return store;
-    }
-    ++i;
-    while (true) {
-        SkipWs(raw, i);
-        if (i < raw.size() && raw[i] == '}') {
-            return store;
-        }
-        std::string key;
-        if (!ParseJsonString(raw, i, key)) {
-            return Store{};
-        }
-        SkipWs(raw, i);
-        if (i >= raw.size() || raw[i] != ':') {
-            return Store{};
-        }
+    if (i >= raw.size() || raw[i++] != '{') return store;
+    SkipWs(raw, i);
+    if (i < raw.size() && raw[i] == '}') {
         ++i;
         SkipWs(raw, i);
-        std::string value;
-        if (!ParseJsonString(raw, i, value)) {
-            return Store{};
-        }
+        return store;
+    }
+    while (true) {
+        std::string key, value;
+        if (!ParseJsonString(raw, i, key)) return Store{};
+        SkipWs(raw, i);
+        if (i >= raw.size() || raw[i++] != ':') return Store{};
+        SkipWs(raw, i);
+        if (!ParseJsonString(raw, i, value)) return Store{};
+        StripControlAndClamp(key, kKeyMaxChars);
+        StripControlAndClamp(value, kValueMaxChars);
         if (!key.empty() && !value.empty()) {
+            // 与写入一致：重复主题以最后一次为准，并保留最近 80 条。
+            for (auto it = store.entries.begin(); it != store.entries.end(); ++it) {
+                if (it->first == key) { store.entries.erase(it); break; }
+            }
             store.entries.emplace_back(std::move(key), std::move(value));
+            if (store.entries.size() > kMaxEntries) store.entries.erase(store.entries.begin());
         }
         SkipWs(raw, i);
-        if (i < raw.size() && raw[i] == ',') {
-            ++i;
-            continue;
-        }
         if (i < raw.size() && raw[i] == '}') {
-            return store;
+            ++i;
+            SkipWs(raw, i);
+            return i == raw.size() ? store : Store{};
         }
-        return Store{};
+        if (i >= raw.size() || raw[i++] != ',') return Store{};
+        SkipWs(raw, i);
     }
 }
 
@@ -226,66 +271,28 @@ inline std::string Remember(Store& store, std::string key, std::string value) {
            "」。\",\"key\":\"" + JsonEscape(key) + "\"}";
 }
 
+
 inline std::string Recall(const Store& store, std::string key) {
     StripControlAndClamp(key, kKeyMaxChars);
-    if (key.empty()) {
-        const size_t total = store.entries.size();
-        std::vector<std::pair<std::string, std::string>> items;
-        size_t budget = kRecallAllMaxChars;
-        for (auto it = store.entries.rbegin(); it != store.entries.rend(); ++it) {
-            if (items.size() >= kRecallAllLimit) {
-                break;
-            }
-            const size_t cost = it->first.size() + it->second.size();
-            if (!items.empty() && cost > budget) {
-                break;
-            }
-            budget = cost > budget ? 0 : budget - cost;
-            items.push_back(*it);
-        }
-        // 最新在后 → 输出按写入序
-        std::string out = "{\"total\":";
-        out += std::to_string(total);
-        out += ",\"returned\":";
-        out += std::to_string(items.size());
-        out += ",\"memories\":{";
-        bool first = true;
-        for (auto it = items.rbegin(); it != items.rend(); ++it) {
-            if (!first) {
-                out += ',';
-            }
-            first = false;
-            out += '"';
-            out += JsonEscape(it->first);
-            out += "\":\"";
-            out += JsonEscape(it->second);
-            out += '"';
-        }
-        out += "}}";
-        return out;
-    }
-    std::string hits = "{";
-    bool first = true;
-    for (const auto& kv : store.entries) {
-        if (kv.first.find(key) == std::string::npos) {
+    size_t total = 0, budget = kRecallAllMaxChars;
+    Store selected;
+    bool full = false;
+    for (auto it = store.entries.rbegin(); it != store.entries.rend(); ++it) {
+        if (!key.empty() && it->first.find(key) == std::string::npos) continue;
+        ++total;
+        const size_t cost = CodepointCount(it->first) + CodepointCount(it->second);
+        if (full || selected.entries.size() >= kRecallAllLimit || cost > budget) {
+            full = true;
             continue;
         }
-        if (!first) {
-            hits += ',';
-        }
-        first = false;
-        hits += '"';
-        hits += JsonEscape(kv.first);
-        hits += "\":\"";
-        hits += JsonEscape(kv.second);
-        hits += '"';
+        budget -= cost;
+        selected.entries.insert(selected.entries.begin(), *it);
     }
-    hits += '}';
-    if (first) {
-        return std::string("{\"memories\":{},\"message\":\"没有记住关于「") + JsonEscape(key) +
-               "」的事。\"}";
+    if (!key.empty() && total == 0) {
+        return std::string("{\"memories\":{},\"message\":\"没有记住关于「") + JsonEscape(key) + "」的事。\"}";
     }
-    return std::string("{\"memories\":") + hits + "}";
+    return "{\"total\":" + std::to_string(total) + ",\"returned\":" +
+           std::to_string(selected.entries.size()) + ",\"memories\":" + ToJsonObject(selected) + "}";
 }
 
 inline std::string Forget(Store& store, std::string key) {
