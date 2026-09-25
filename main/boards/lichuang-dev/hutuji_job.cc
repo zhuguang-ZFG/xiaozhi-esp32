@@ -87,6 +87,11 @@ constexpr uint32_t kFetchRetryTimeoutMs = 20000;   // 重试态收紧，避免�
 // 内部 largest 留给 mbedtls/DMA；门限只作「内部仍极低」的保险丝。
 constexpr size_t kMinTlsInternalLargest = 4 * 1024;
 constexpr int kTlsHeapWaitSlices = 20;  // 100ms × 20 = 2s
+// 连续 ≥2 次 TLS 堆预算耗尽才触发自愈重启：单次失败多为预览/推流期瞬态碎片，
+// 连续失败说明内部堆已无法自愈回收。10s 宽限给在途动作收尾，通知后再留 20s。
+constexpr int kTlsHeapFailSelfHealThreshold = 2;
+constexpr uint32_t kSelfHealGraceMs = 10 * 1000;
+constexpr uint32_t kSelfHealNotifyMs = 20 * 1000;
 constexpr uint32_t kOkTimeoutMs = 60000;
 constexpr uint32_t kPaperOkTimeoutMs = 90000;
 constexpr uint32_t kMotionOkTimeoutMs = 30000;
@@ -482,6 +487,7 @@ void Job::SetStreamingOrPaused() {
 
 void Job::SetState(const char* state) {
     std::string state_snapshot;
+    bool request_self_heal = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         state_ = state;
@@ -490,6 +496,11 @@ void Job::SetState(const char* state) {
             status_error_mirror_.clear();
         } else {
             status_error_mirror_ = last_error_;
+            if (tls_heap_fail_count_.load(std::memory_order_relaxed) >=
+                    kTlsHeapFailSelfHealThreshold &&
+                !self_heal_pending_.exchange(true, std::memory_order_acq_rel)) {
+                request_self_heal = true;
+            }
         }
         if (state_ == "idle" || state_ == "done" || state_ == "error" ||
             state_ == "aborted") {
@@ -499,6 +510,13 @@ void Job::SetState(const char* state) {
             draw_start_tick_ = 0;
         }
         state_snapshot = state_;
+    }
+    if (request_self_heal) {
+        // 任务派生放锁外：xTaskCreateWithCaps 会取内存分配内部锁，避免与
+        // state_mutex_ 嵌套出新锁序。
+        ESP_LOGW(TAG, "TLS 堆预算连续耗尽≥%d 次且落 error，派生自愈任务",
+                 kTlsHeapFailSelfHealThreshold);
+        StartSelfHealTask();
     }
     // 落笔棘轮闸清除（见 manual_pen_down_latched_ 注释）：settled/manual 之外的任何
     // 状态都意味着有 Z 接管方（出图流/笔测试/换纸/重连），此后笔位不再可信，
@@ -776,6 +794,7 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     article_total_.store(article_pages_.size(), std::memory_order_relaxed);
     article_page_.store(article_pages_.empty() ? 0u : 1u, std::memory_order_relaxed);
     last_error_.clear();
+    tls_heap_fail_count_.store(0, std::memory_order_relaxed);
     // 新任务作废旧预取：上一个任务的预取可能仍在跑，epoch 推进后其发布会被拒绝。
     CancelPrefetch();
     SetState("previewing");
@@ -2026,6 +2045,20 @@ std::string Job::StatusJson() const {
     if (state == "error" && !status_error_mirror.empty()) {
         cJSON_AddStringToObject(root, "last_error", status_error_mirror.c_str());
     }
+
+    // 2026-09-25：内存面随 status 上云（纯本地读，零成本）——internal_largest
+    // 即 TLS 堆预算判据，碎片逼近 4KiB 门限时云端能先于故障看见。
+    cJSON* heap = cJSON_AddObjectToObject(root, "heap");
+    if (heap != nullptr) {
+        cJSON_AddNumberToObject(heap, "internal_free",
+                                heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        cJSON_AddNumberToObject(heap, "internal_largest",
+                                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        cJSON_AddNumberToObject(heap, "psram_free",
+                                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        cJSON_AddNumberToObject(heap, "psram_largest",
+                                heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    }
     // 机型词汇（protocol §10.4.15，2026-09-11）：$I VER build 段识别的现值；
     // VER 未达（pipe 未连/未认证）= "paper" 保守档，与金标表口径一致。
     cJSON_AddStringToObject(root, "plotter_sku",
@@ -2178,6 +2211,7 @@ bool Job::WaitForTlsHeapBudget() {
     ReleaseFetchClient();
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     if (largest >= kMinTlsInternalLargest) {
+        tls_heap_fail_count_.store(0, std::memory_order_relaxed);
         return true;
     }
     ESP_LOGW(TAG, "TLS 前等内部堆 largest=%u < %u", (unsigned)largest,
@@ -2188,12 +2222,70 @@ bool Job::WaitForTlsHeapBudget() {
         if (largest >= kMinTlsInternalLargest) {
             ESP_LOGI(TAG, "TLS 堆预算就绪 largest=%u after %dms", (unsigned)largest,
                      (i + 1) * 100);
+            tls_heap_fail_count_.store(0, std::memory_order_relaxed);
             return true;
         }
     }
     SystemInfo::LogHeapNow("tls-heap-budget-timeout");
     // 仍不够起 ssl_receive（<6KiB）才硬拒；预览任务活着时 L≈6144 是常态，必须放行。
+    int fails = tls_heap_fail_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    ESP_LOGW(TAG, "TLS 堆预算连续失败 %d 次", fails);
     return false;
+}
+
+void Job::StartSelfHealTask() {
+    // 自愈任务栈进 PSRAM：此刻内部堆正是碎片现场，4KiB 内部栈可能都建不出。
+    BaseType_t ok = xTaskCreateWithCaps(SelfHealTaskEntry, "hutuji_selfheal", 4096,
+                                        this, 2, nullptr,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdTRUE) {
+        // 连 PSRAM 栈都建不出：解除门闩允许下次 error 再试，重启与否交给看门狗。
+        self_heal_pending_.store(false, std::memory_order_release);
+        ESP_LOGE(TAG, "自愈任务创建失败");
+    }
+}
+
+void Job::SelfHealTaskEntry(void* arg) {
+    auto* self = static_cast<Job*>(arg);
+    self->RunSelfHeal();
+    vTaskDelete(nullptr);
+}
+
+void Job::RunSelfHeal() {
+    // 锁分开取：不嵌套 state/stream 两把锁（既有顺序 stream→state 保持不变）。
+    auto give_up = [this](const char* why) {
+        ESP_LOGI(TAG, "自愈重启放弃：%s", why);
+        self_heal_pending_.store(false, std::memory_order_release);
+    };
+    vTaskDelay(pdMS_TO_TICKS(kSelfHealGraceMs));
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (state_ != "error") {
+            give_up("状态已离开 error");
+            return;
+        }
+    }
+    if (busy_.load() || ota_reserved_.load()) {
+        give_up("新任务或 OTA 已接管");
+        return;
+    }
+    ESP_LOGW(TAG, "TLS 堆连续耗尽，通知后 %u ms 自愈重启",
+             (unsigned)kSelfHealNotifyMs);
+    Notify("设备内存不足，将在 20 秒后自动重启恢复");
+    vTaskDelay(pdMS_TO_TICKS(kSelfHealNotifyMs));
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (state_ != "error") {
+            give_up("通知期内状态已变化");
+            return;
+        }
+    }
+    if (busy_.load() || ota_reserved_.load()) {
+        give_up("通知期内新任务或 OTA 已接管");
+        return;
+    }
+    ESP_LOGW(TAG, "自愈重启 esp_restart");
+    esp_restart();
 }
 
 void Job::Preview() {

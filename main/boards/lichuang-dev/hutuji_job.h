@@ -148,6 +148,16 @@ private:
      */
     bool WaitForTlsHeapBudget();
     /**
+     * 连续 TLS 堆预算耗尽自愈：WaitForTlsHeapBudget 连续失败达到阈值且任务落
+     * error 时派生一次性自愈任务——10s 宽限后复查（busy/OTA 预留/状态仍为
+     * error 才继续），先 Notify 告知用户，再留 20s 后 esp_restart()。内部堆
+     * 碎片化到起不了 ssl_receive 时重启是唯一确定性回收路径；期间状态被
+     * 新任务/OTA 接管则自动放弃。
+     */
+    void StartSelfHealTask();
+    static void SelfHealTaskEntry(void* arg);
+    void RunSelfHeal();
+    /**
      * 等 ok 超时后的兜底判定：Grbl WebUI Telnet 输出无 TX 缓冲，`ok` 与 `?` 状态
      * 报告在同核并发写同一 socket，被抢占的部分写会静默吃掉一个 `ok`（不产生
      * error）。此时机器其实已经把在途行走完。取一份 `?` 之后的新状态报告，若为
@@ -262,6 +272,11 @@ private:
     // （进 error 拷入 last_error_，离 error 清空），StatusJson 锁内读取。
     // 2026-09-25 事故教训：state=error 但 status 无任何原因字段，排查看不到。
     std::string status_error_mirror_;
+    // TLS 堆预算连续失败计数（WaitForTlsHeapBudget 失败 +1 / 成功清零，
+    // StartDraw 清零）；≥ 阈值且落 error 时触发 StartSelfHealTask。
+    std::atomic<int> tls_heap_fail_count_{0};
+    // 一次性自愈任务门闩：pending 期间不重复派生，任务放弃/重启前不解除。
+    std::atomic<bool> self_heal_pending_{false};
     float jog_step_mm_ = kJogStepMmDefault;
     bool jog_step_loaded_ = false;
     std::string url_;
