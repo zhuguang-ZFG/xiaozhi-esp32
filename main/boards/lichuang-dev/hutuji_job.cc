@@ -487,6 +487,16 @@ void Job::SetState(const char* state) {
         state_ = state;
         if (state_ != "error") {
             manual_error_.clear();
+            status_error_mirror_.clear();
+        } else {
+            status_error_mirror_ = last_error_;
+        }
+        if (state_ == "idle" || state_ == "done" || state_ == "error" ||
+            state_ == "aborted") {
+            // 终态停表：出图计时只在推流期有效。此前 done/error 后
+            // hutuji.status 的 elapsed_ms 继续按旧起点递增（2026-09-25 事故
+            // 现场见过 2.27h 陈旧计时），误导排查以为任务仍在跑。
+            draw_start_tick_ = 0;
         }
         state_snapshot = state_;
     }
@@ -1954,10 +1964,12 @@ std::string Job::StatusJson() const {
 
     std::string state;
     std::string manual_error;
+    std::string status_error_mirror;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         state = ota_reserved_.load() ? "upgrading" : state_;
         manual_error = manual_error_;
+        status_error_mirror = status_error_mirror_;
     }
     cJSON* root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "connected", pipe.IsConnected());
@@ -2007,6 +2019,12 @@ std::string Job::StatusJson() const {
     cJSON_AddStringToObject(root, "state", state.c_str());
     if (state == "error" && !manual_error.empty()) {
         cJSON_AddStringToObject(root, "control_error", manual_error.c_str());
+    }
+    // 2026-09-25：error 态原因随 status 上云（此前只有串口日志可见，远程排查
+    // 只能看到 state=error 两眼一抹黑）。内容与 control_error 并排放行：
+    // control_error 是手动控制动作错误，last_error 是出图/预览链错误。
+    if (state == "error" && !status_error_mirror.empty()) {
+        cJSON_AddStringToObject(root, "last_error", status_error_mirror.c_str());
     }
     // 机型词汇（protocol §10.4.15，2026-09-11）：$I VER build 段识别的现值；
     // VER 未达（pipe 未连/未认证）= "paper" 保守档，与金标表口径一致。

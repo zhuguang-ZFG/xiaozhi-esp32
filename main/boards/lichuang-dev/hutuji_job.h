@@ -258,6 +258,10 @@ private:
     uint32_t manual_banner_seq_ = 0;
     // 只在 state_mutex_ 下发布/读取；离开本次 error/manual 状态后清空。
     std::string manual_error_;
+    // hutuji.status 的 last_error 镜像：只在 state_mutex_ 下由 SetState 同步
+    // （进 error 拷入 last_error_，离 error 清空），StatusJson 锁内读取。
+    // 2026-09-25 事故教训：state=error 但 status 无任何原因字段，排查看不到。
+    std::string status_error_mirror_;
     float jog_step_mm_ = kJogStepMmDefault;
     bool jog_step_loaded_ = false;
     std::string url_;
