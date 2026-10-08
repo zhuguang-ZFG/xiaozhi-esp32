@@ -765,7 +765,7 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
                                       url_ == url && preview_url_ == preview_url)) {
             return JsonString("previewing");
         }
-        return JsonString("写字机正忙，请稍候再试");
+        return "{\"error\":\"写字机正忙，请稍候再试\"}";
     }
     PaperConfig paper;
     if (!Pipe::GetInstance().IsConnected() || !Pipe::GetInstance().IsReady() ||
@@ -1272,10 +1272,10 @@ std::string Job::RequestPause() {
         return "{\"error\":\"已回原点，正在完成收尾\"}";
     }
     if (pen_test_active_.load()) {
-        return JsonString("正在试笔，请稍候");
+        return "{\"error\":\"正在试笔，请稍候\"}";
     }
     if (paper_active_.load()) {
-        return JsonString("换纸中无法暂停，换纸完成后可再试");
+        return "{\"error\":\"换纸中无法暂停，换纸完成后可再试\"}";
     }
     if (paused_.exchange(true)) {
         return JsonString("已经是暂停状态");
@@ -1314,7 +1314,7 @@ std::string Job::RequestResume() {
     }
     // 与 RequestPause 对称：试笔期间两个工具给同一个解释。
     if (pen_test_active_.load()) {
-        return JsonString("正在试笔，请稍候");
+        return "{\"error\":\"正在试笔，请稍候\"}";
     }
     if (!paused_.exchange(false)) {
         return JsonString("本来就没暂停");
@@ -1338,7 +1338,7 @@ std::string Job::RequestRepeat() {
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (preview_worker_active_.load() || busy_.exchange(true)) {
-            return JsonString("写字机正忙，请稍候再试");
+            return "{\"error\":\"写字机正忙，请稍候再试\"}";
         }
         auto& pipe = Pipe::GetInstance();
         if (!pipe.IsConnected()) {
@@ -1414,7 +1414,7 @@ std::string Job::RequestPenTest() {
         // 试笔状态与 busy 一起发布，RequestAbort 在同一把锁下分流，不能看到半成品状态。
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (busy_.load() || preview_worker_active_.load()) {
-            return JsonString("写字机正忙，请稍候再试");
+            return "{\"error\":\"写字机正忙，请稍候再试\"}";
         }
         if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized()) {
             return "{\"error\":\"写字机未连接、未就绪或未授权\"}";
@@ -1538,7 +1538,7 @@ std::string Job::RequestManualControl(const std::string& action) {
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (preview_worker_active_.load() || busy_.exchange(true)) {
-            return JsonString("写字机正忙，请稍候再试");
+            return "{\"error\":\"写字机正忙，请稍候再试\"}";
         }
         std::string state;
         {
@@ -2248,40 +2248,40 @@ void Job::StartSelfHealTask() {
 void Job::SelfHealTaskEntry(void* arg) {
     auto* self = static_cast<Job*>(arg);
     self->RunSelfHeal();
-    vTaskDelete(nullptr);
+    // WithCaps 的栈/TCB 由扩展接口分配，普通删除不会替它回收。
+    vTaskDeleteWithCaps(nullptr);
 }
 
 void Job::RunSelfHeal() {
-    // 锁分开取：不嵌套 state/stream 两把锁（既有顺序 stream→state 保持不变）。
     auto give_up = [this](const char* why) {
         ESP_LOGI(TAG, "自愈重启放弃：%s", why);
         self_heal_pending_.store(false, std::memory_order_release);
     };
+    // 调用方持 stream_mutex_；与运动/OTA 发布保持 stream→state 锁序。
+    auto eligible = [this]() {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        return state_ == "error" &&
+               tls_heap_fail_count_.load(std::memory_order_relaxed) >=
+                   kTlsHeapFailSelfHealThreshold &&
+               !busy_.load() && !ota_reserved_.load() && !preview_worker_active_.load() &&
+               !abort_reset_worker_active_.load() && !abort_reset_owner_.Running() &&
+               !paper_active_.load();
+    };
     vTaskDelay(pdMS_TO_TICKS(kSelfHealGraceMs));
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (state_ != "error") {
-            give_up("状态已离开 error");
+        std::unique_lock<std::mutex> stream_lock(stream_mutex_, std::try_to_lock);
+        if (!stream_lock.owns_lock() || !eligible()) {
+            give_up("状态已恢复或新任务/OTA 已接管");
             return;
         }
     }
-    if (busy_.load() || ota_reserved_.load()) {
-        give_up("新任务或 OTA 已接管");
-        return;
-    }
-    ESP_LOGW(TAG, "TLS 堆连续耗尽，通知后 %u ms 自愈重启",
-             (unsigned)kSelfHealNotifyMs);
+    ESP_LOGW(TAG, "TLS 堆连续耗尽，通知后 %u ms 自愈重启", (unsigned)kSelfHealNotifyMs);
     Notify("设备内存不足，将在 20 秒后自动重启恢复");
     vTaskDelay(pdMS_TO_TICKS(kSelfHealNotifyMs));
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (state_ != "error") {
-            give_up("通知期内状态已变化");
-            return;
-        }
-    }
-    if (busy_.load() || ota_reserved_.load()) {
-        give_up("通知期内新任务或 OTA 已接管");
+    // 最终复核到重启持续占有发布锁；不能检查后解锁再被新运动或 OTA 插入。
+    std::unique_lock<std::mutex> stream_lock(stream_mutex_, std::try_to_lock);
+    if (!stream_lock.owns_lock() || !eligible()) {
+        give_up("通知期内状态已恢复或新任务/OTA 已接管");
         return;
     }
     ESP_LOGW(TAG, "自愈重启 esp_restart");
