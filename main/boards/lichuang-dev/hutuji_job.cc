@@ -3564,9 +3564,9 @@ bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t
         return false;  // 还在 Run/Hold：ok 没丢，是真没执行完
     }
 
-    // 在途行里最后出现的 X / Y 目标（下载文件恒为 G90 绝对坐标，protocol §5）。
-    bool have_x = false, have_y = false;
-    float tx = 0.0f, ty = 0.0f;
+    // 在途行里最后出现的 X / Y / Z 目标（下载文件恒为 G90 绝对坐标，protocol §5）。
+    bool have_x = false, have_y = false, have_z = false;
+    float tx = 0.0f, ty = 0.0f, tz = 0.0f;
     for (size_t i = to; i > from; --i) {
         const std::string_view sv = LineAt(spans[i - 1]);
         float v = 0.0f;
@@ -3578,12 +3578,16 @@ bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t
             ty = v;
             have_y = true;
         }
-        if (have_x && have_y) {
+        if (!have_z && ExtractGcodeWord(sv, 'Z', v)) {
+            tz = v;
+            have_z = true;
+        }
+        if (have_x && have_y && have_z) {
             break;
         }
     }
-    if (!have_x && !have_y) {
-        return true;  // 纯 Z / M / 模态行：Idle 本身就证明 planner 已排空
+    if (!have_x && !have_y && !have_z) {
+        return true;  // 纯模态行：无坐标目标；笔控 Z 行也必须检查到位
     }
 
     float mx = 0.0f, my = 0.0f, mz = 0.0f;
@@ -3592,6 +3596,9 @@ bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t
         return false;
     }
     if (have_y && std::fabs(my - ty) > kOkFallbackPosTolMm) {
+        return false;
+    }
+    if (have_z && std::fabs(mz - tz) > kOkFallbackPosTolMm) {
         return false;
     }
     return true;
@@ -3888,30 +3895,37 @@ bool Job::HomeAfterAbort(float hold_x, float hold_y) {
     const bool nopaper = pipe.IsNopaperMachine();
     const uint32_t home_connection = pipe.GetConnectionSequence();
     const uint32_t home_banner = pipe.GetResetBannerSequence();
-    // 受限 reset 已把 Grbl 坐标清零；坐标由调用方在 Hold 确认时快照传入
-    // （pipe 每条状态报告都覆写 MPos，函数内现读会拿到复位后的 0,0 假位置）。
-    char g92[64];
-    // Z0：复位后电机失能、弹簧已把笔物理抬回；声明 Z0 与页尾 PreparePenOrigin 同语义。
-    snprintf(g92, sizeof(g92), "G92 X%.3f Y%.3f Z0", (double)hold_x, (double)hold_y);
-    {
-        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-        if (!pipe.SendLine(g92) || !pipe.SendLine("G1G90 X0Y0F8000")) {
-            last_error_ = "归位命令发送失败";
-            return false;
-        }
-    }
-    int err = -1;
-    // 两条命令各等一个 ok：G92 的 ok 先到，G1 的后到；WaitResponse 按序消费。
-    if (pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok ||
-        pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok) {
-        last_error_ = "归位应答超时或被拒 (error:" + std::to_string(err) + ")";
+    auto fail = [&](const std::string& reason) {
+        last_error_ = reason;
+        // 超时后旧应答不能被下一任务认领；只关闭本次归位的连接。
+        pipe.ShutdownSocket(home_connection);
         return false;
+    };
+    int err = -1;
+    auto send_and_wait = [&](const char* line) {
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+            if (!pipe.SendLineForSession(line, home_connection, home_banner)) {
+                return false;
+            }
+        }
+        // 逐行发送会先清残留应答；必须消费本行结果后才可发下一行。
+        return pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) == WaitResult::Ok &&
+               pipe.IsConnected() && pipe.IsReady() && pipe.IsAuthorized() &&
+               pipe.IsSettingsVerified() && pipe.GetConnectionSequence() == home_connection &&
+               pipe.GetResetBannerSequence() == home_banner;
+    };
+    // reset 前的 Hold 快照仍是真值，禁止读取 reset 后的零坐标替代。
+    char g92[64];
+    snprintf(g92, sizeof(g92), "G92 X%.3f Y%.3f Z0", (double)hold_x, (double)hold_y);
+    if (!send_and_wait(g92)) {
+        return fail("归位坐标恢复未确认 (error:" + std::to_string(err) + ")");
+    }
+    if (!send_and_wait("G1G90 X0Y0F8000")) {
+        return fail("归位应答超时或被拒 (error:" + std::to_string(err) + ")");
     }
     if (!WaitForIdle(false, kHomeIdleTimeoutMs)) {
-        if (last_error_.empty()) {
-            last_error_ = "归位后未确认写字机 Idle";
-        }
-        return false;
+        return fail(last_error_.empty() ? "归位后未确认写字机 Idle" : last_error_);
     }
     if (nopaper && !ReleaseMotorsAfterHome(home_connection, home_banner, false)) {
         return false;
@@ -4595,18 +4609,37 @@ bool Job::StreamToGrbl() {
             ESP_LOGW(TAG, "窗口化分支意外收到 error:8（err=%d），停止并受控 reset", err);
             return fail_window_and_stop("error:8（窗口化不应发生）");
         } else {
-            // Timeout：Grbl WebUI Telnet 输出无 TX 缓冲，`ok`（loopTask）与 `?` 状态报告
-            // （clientCheckTask）同核同优先级无锁并发写同一 socket，偶发部分写被抢占会
-            // 静默吞掉一个 `ok`（既不推进也不报 error）。fail 前先用一份新状态报告兜底：
-            // 若 Grbl 已 Idle 且 MPos 到达在途批次末行 X/Y 目标，则这批在途行确已执行完，
-            // 整窗释放继续；否则仍 fail closed（限次数，避免真卡死/真丢行被无限掩盖）。
-            if (ok_fallback_count < kMaxOkFallback &&
-                ConfirmInFlightDoneByStatus(spans, lines_sent_, lines_sent_ + c_line.size())) {
+            // Timeout：只以本次新鲜 Idle 和 XYZ 到位作有限次数的丢应答兜底。
+            // 现役 Grbl 已串行化 Telnet 写；不能把所有迟到应答都当成可丢弃的 ok。
+            const bool confirmed =
+                ok_fallback_count < kMaxOkFallback &&
+                ConfirmInFlightDoneByStatus(spans, lines_sent_, lines_sent_ + c_line.size());
+            if (!pipe.IsConnected() || !pipe.IsReady() ||
+                pipe.GetConnectionSequence() != stream_connection_seq_) {
+                stream_disconnected_ = true;
+                last_error_ = "状态确认期间链路变化";
+                return false;
+            }
+            // 查询状态期间仍可能收到本窗口的 error；逐条消费，失败优先于位置兜底。
+            size_t late_oks = 0;
+            while (true) {
+                int late_error = -1;
+                const WaitResult late = pipe.TakeResponse(0, &late_error);
+                if (late == WaitResult::Timeout) {
+                    break;
+                }
+                if (late == WaitResult::Failed) {
+                    return fail_window_and_stop("error:" + std::to_string(late_error));
+                }
+                if (late == WaitResult::Deferred) {
+                    return fail_window_and_stop("error:8（窗口化不应发生）");
+                }
+                if (++late_oks > c_line.size()) {
+                    return fail_window_and_stop("在途应答数量不匹配");
+                }
+            }
+            if (confirmed) {
                 ++ok_fallback_count;
-                // 释放整窗前先排空应答队列：等待期内到达的迟到 ok 属于本批已释放的
-                // 行，留在队列里会被下一批第一行的 TakeResponse 错配（ok 与状态行
-                // 无锁并发写同一 socket，迟到 ok 是已证现象；与 abort 分支同口径）。
-                pipe.DrainResponses();
                 const size_t released = c_line.size();
                 ESP_LOGW(TAG,
                          "等 ok 超时但状态报告确认在途 %zu 行已执行完（Idle+到位），靠状态"
@@ -4622,9 +4655,8 @@ bool Job::StreamToGrbl() {
             // 日志带 c_line 队首对应行内容，否则排障时行号是错的。
             ESP_LOGE(TAG, "等 ok 超时，队首在途行 [%zu]: %.*s", lines_sent_, (int)front_sv.size(),
                      front_sv.data());
-            pipe.SendRealtime('?');
-            last_error_ = "等 ok 超时";
-            return false;
+            // 在途是否仍会执行尚不确定，与显式 error 一样先停稳再发布终态。
+            return fail_window_and_stop("等 ok 超时");
         }
     }
 
@@ -4654,6 +4686,7 @@ bool Job::StreamToGrbl() {
                  (unsigned long long)dbg_recv_sum_ms, (unsigned long)dbg_recv_max_ms,
                  (unsigned long)dbg_ui_max_ms);
     }
+    window_guard.MarkQuiesced();
     return true;
 }
 

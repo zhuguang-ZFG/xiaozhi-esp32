@@ -158,11 +158,9 @@ private:
     static void SelfHealTaskEntry(void* arg);
     void RunSelfHeal();
     /**
-     * 等 ok 超时后的兜底判定：Grbl WebUI Telnet 输出无 TX 缓冲，`ok` 与 `?` 状态
-     * 报告在同核并发写同一 socket，被抢占的部分写会静默吃掉一个 `ok`（不产生
-     * error）。此时机器其实已经把在途行走完。取一份 `?` 之后的新状态报告，若为
-     * Idle 且 MPos 已达 spans[from,to) 里最后出现的 X/Y 目标，则认定这批在途行
-     * 全部完成。Run/Hold、坐标不符或拿不到新报告一律返回 false（fail closed）。
+     * 等 ok 超时后的有限兜底：新鲜 Idle 与有限 MPos 须匹配 spans[from,to) 中
+     * 最后出现的 XYZ 目标，纯 Z 笔控也须到位。Run/Hold、坐标不符或无新报告拒绝。
+     * 调用方另检查查询期间到达的应答；error 不能随迟到 ok 清理或被位置证据覆盖。
      */
     bool ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t from, size_t to);
     /**

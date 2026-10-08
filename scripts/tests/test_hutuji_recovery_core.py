@@ -993,11 +993,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         ab_start = end
         ab_end = source.index("bool Job::ChangePaperAfterDraw()", ab_start)
         ab_body = source[ab_start:ab_end]
-        ab_homes = re.findall(r'pipe\.SendLine\("([^"]+)"\)', ab_body)
+        ab_homes = re.findall(r'send_and_wait\("([^"]+)"\)', ab_body)
+        self.assertIn("SendLineForSession", ab_body)
         self.assertEqual(ab_homes, ["G1G90 X0Y0F8000"])
-        self.assertIn("SendLine(g92)", ab_body)
-        self.assertLess(ab_body.index("SendLine(g92)"),
-                        ab_body.index('SendLine("G1G90 X0Y0F8000")'))
+        self.assertIn("send_and_wait(g92)", ab_body)
+        self.assertLess(ab_body.index("send_and_wait(g92)"),
+                        ab_body.index('send_and_wait("G1G90 X0Y0F8000")'))
         # 归位必须「ok 后再 fresh Idle」：G1 的 ok 只表示入 planner，缺了
         # WaitForIdle 就退化成靠 M30 内部 synchronize 的隐性顺序保证，abort 在
         # 归位/换纸两阶段之间没有真实决策点。
