@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <memory>
 #include <sstream>
 #include <vector>
 
@@ -285,6 +286,15 @@ void Ota::MarkCurrentVersionValid() {
 bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback) {
     ESP_LOGI(TAG, "Upgrading firmware from %s", firmware_url.c_str());
     esp_ota_handle_t update_handle = 0;
+    // SDK 在 begin 时登记操作条目；所有早退/异常都须回收，end 后解除所有权。
+    struct OtaHandleGuard {
+        esp_ota_handle_t& handle;
+        ~OtaHandleGuard() {
+            if (handle != 0) {
+                esp_ota_abort(handle);
+            }
+        }
+    } ota_handle_guard{update_handle};
     auto update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
         ESP_LOGE(TAG, "Failed to get update partition");
@@ -314,7 +324,8 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
     }
 
     constexpr size_t PAGE_SIZE = 4096;
-    char* buffer = (char*)heap_caps_malloc(PAGE_SIZE, MALLOC_CAP_INTERNAL);
+    std::unique_ptr<char, decltype(&heap_caps_free)> buffer(
+        static_cast<char*>(heap_caps_malloc(PAGE_SIZE, MALLOC_CAP_INTERNAL)), &heap_caps_free);
     if (buffer == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate buffer");
         return false;
@@ -324,10 +335,9 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
     size_t total_read = 0, recent_read = 0;
     auto last_calc_time = esp_timer_get_time();
     while (true) {
-        int ret = http->Read(buffer + buffer_offset, PAGE_SIZE - buffer_offset);
+        int ret = http->Read(buffer.get() + buffer_offset, PAGE_SIZE - buffer_offset);
         if (ret < 0) {
             ESP_LOGE(TAG, "Failed to read HTTP data: %s", esp_err_to_name(ret));
-            heap_caps_free(buffer);
             return false;
         }
 
@@ -346,15 +356,13 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         }
 
         if (!image_header_checked) {
-            image_header.append(buffer, buffer_offset);
+            image_header.append(buffer.get(), buffer_offset);
             if (image_header.size() >= sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
                 esp_app_desc_t new_app_info;
                 memcpy(&new_app_info, image_header.data() + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
 
                 if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle)) {
-                    esp_ota_abort(update_handle);
                     ESP_LOGE(TAG, "Failed to begin OTA");
-                    heap_caps_free(buffer);
                     return false;
                 }
 
@@ -366,11 +374,9 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         // Write to flash when buffer is full (4KB) or it's the last chunk
         bool is_last_chunk = (ret == 0);
         if (buffer_offset == PAGE_SIZE || (is_last_chunk && buffer_offset > 0)) {
-            auto err = esp_ota_write(update_handle, buffer, buffer_offset);
+            auto err = esp_ota_write(update_handle, buffer.get(), buffer_offset);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
-                esp_ota_abort(update_handle);
-                heap_caps_free(buffer);
                 return false;
             }
 
@@ -382,9 +388,10 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         }
     }
     http->Close();
-    heap_caps_free(buffer);
+    buffer.reset();  // 镜像校验需要内部堆，保持原路径在校验前释放4KiB缓冲。
 
     esp_err_t err = esp_ota_end(update_handle);
+    update_handle = 0;  // esp_ota_end 成功或失败都已释放条目，不重复 abort。
     if (err != ESP_OK) {
         if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
             ESP_LOGE(TAG, "Image validation failed, image is corrupted");
