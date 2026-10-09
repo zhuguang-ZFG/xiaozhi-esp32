@@ -366,8 +366,15 @@ private:
             "hutuji.confirm",
             "用户看过屏幕预览后确认出图：说「开始画/可以/就这个」时用。"
             "仅在 state 为 awaiting_confirmation 时有效；等价于用户点屏幕「开始画」按钮。",
-            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
-                return hutuji::Job::GetInstance().RequestConfirm();
+            PropertyList({Property("expected_url", kPropertyTypeString, std::string("")),
+                          Property("expected_preview_url", kPropertyTypeString, std::string(""))}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const auto& url = properties["expected_url"].value<std::string>();
+                const auto& preview = properties["expected_preview_url"].value<std::string>();
+                if (url.empty() && preview.empty()) {
+                    return hutuji::Job::GetInstance().RequestConfirm();
+                }
+                return hutuji::Job::GetInstance().RequestConfirmForPreview(url, preview);
             });
 
         mcp_server.AddTool("hutuji.abort", "中止当前绘图转发，或取消尚未确认的预览。",

@@ -391,8 +391,15 @@ private:
             "只在 hutuji.status 的 state 为 awaiting_confirmation 时有效；"
             "没有待确认预览时会返回错误，不要凭空调用。"
             "用户点屏幕上的「开始画」按钮与本工具等效。",
-            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
-                return hutuji::Job::GetInstance().RequestConfirm();
+            PropertyList({Property("expected_url", kPropertyTypeString, std::string("")),
+                          Property("expected_preview_url", kPropertyTypeString, std::string(""))}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const auto& url = properties["expected_url"].value<std::string>();
+                const auto& preview = properties["expected_preview_url"].value<std::string>();
+                if (url.empty() && preview.empty()) {
+                    return hutuji::Job::GetInstance().RequestConfirm();
+                }
+                return hutuji::Job::GetInstance().RequestConfirmForPreview(url, preview);
             });
 
         mcp_server.AddTool("hutuji.abort",

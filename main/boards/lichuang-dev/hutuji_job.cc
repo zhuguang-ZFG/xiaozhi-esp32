@@ -813,9 +813,18 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     return JsonString("previewing");
 }
 
-std::string Job::RequestConfirm() {
+std::string Job::RequestConfirm() { return RequestConfirmForPreview("", ""); }
+
+std::string Job::RequestConfirmForPreview(const std::string& expected_url,
+                                          const std::string& expected_preview_url) {
     {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        // 核对与撤销待确认在同一把锁内；被替换的预览不能由旧请求确认。
+        if ((!expected_url.empty() || !expected_preview_url.empty()) &&
+            (expected_url.empty() || expected_preview_url.empty() || expected_url != url_ ||
+             expected_preview_url != preview_url_)) {
+            return "{\"error\":\"预览已变化，请重新核对作品\"}";
+        }
         if (!busy_.load() || !awaiting_confirmation_.load()) {
             return "{\"error\":\"当前没有待确认的预览\"}";
         }
@@ -1438,7 +1447,9 @@ std::string Job::RequestPenTest() {
         abort_requested_.store(false);
         busy_.store(true);
         pen_test_active_.store(true);
+        pipe.SetTaskSessionActive(true);
         stream_connection_seq_ = pipe.GetConnectionSequence();
+        stream_banner_seq_ = pipe.GetResetBannerSequence();
         SetState("pen_test");
     }
 
@@ -1447,6 +1458,13 @@ std::string Job::RequestPenTest() {
         [](void*) {
             auto& p = Pipe::GetInstance();
             auto& job = Job::GetInstance();
+            const uint32_t connection = job.stream_connection_seq_;
+            const uint32_t banner = job.stream_banner_seq_;
+            const auto same_session = [&]() {
+                return p.IsConnected() && p.IsReady() && p.IsAuthorized() &&
+                       p.IsSettingsVerified() && p.GetConnectionSequence() == connection &&
+                       p.GetResetBannerSequence() == banner;
+            };
             bool ok = job.PreparePenOrigin();
             bool motion_attempted = false;
             int submitted = 0;
@@ -1463,14 +1481,13 @@ std::string Job::RequestPenTest() {
                     std::lock_guard<std::mutex> stream_lock(job.stream_mutex_);
                     if (job.abort_requested_.load()) {
                         ok = false;
-                    } else if (!p.IsConnected() || !p.IsReady() || !p.IsAuthorized() ||
-                               p.GetConnectionSequence() != job.stream_connection_seq_) {
+                    } else if (!same_session()) {
                         ok = false;
                     } else {
                         motion_attempted = true;
-                        if (p.SendLine("G1G90 Z5.0F1000")) {
+                        if (p.SendLineForSession("G1G90 Z5.0F1000", connection, banner)) {
                             ++submitted;
-                            if (p.SendLine("G1G90 Z0.0F10000")) {
+                            if (p.SendLineForSession("G1G90 Z0.0F10000", connection, banner)) {
                                 ++submitted;
                             } else {
                                 ok = false;
@@ -1481,7 +1498,7 @@ std::string Job::RequestPenTest() {
                     }
                 }
                 for (int i = 0; i < submitted; ++i) {
-                    if (p.TakeResponse(3000) != WaitResult::Ok) {
+                    if (p.TakeResponse(3000) != WaitResult::Ok || !same_session()) {
                         ok = false;
                     }
                 }
@@ -1489,7 +1506,9 @@ std::string Job::RequestPenTest() {
             // 已尝试运动时即使用户随后 abort，也等 Z0 收尾完成/链路失效；RequestAbort
             // 不会对试笔并发软复位，这里只等待，不再发送普通命令。
             if (motion_attempted) {
-                ok = job.WaitForIdle(false, kPenOriginIdleTimeoutMs) && ok;
+                ok =
+                    job.WaitForIdleForSession(false, kPenOriginIdleTimeoutMs, connection, banner) &&
+                    same_session() && ok;
             }
 
             bool aborted;
@@ -1498,6 +1517,7 @@ std::string Job::RequestPenTest() {
                 std::lock_guard<std::mutex> stream_lock(job.stream_mutex_);
                 aborted = job.abort_requested_.load();
                 job.SetState(aborted ? "aborted" : ok ? "done" : "error");
+                p.SetTaskSessionActive(false);
                 job.pen_test_active_.store(false);
                 job.busy_.store(false);
             }
@@ -1509,6 +1529,7 @@ std::string Job::RequestPenTest() {
         "hutuji_pentest", 3072, nullptr, 5, nullptr);
     if (created != pdTRUE) {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+        pipe.SetTaskSessionActive(false);
         pen_test_active_.store(false);
         busy_.store(false);
         SetState("idle");
@@ -2050,6 +2071,7 @@ std::string Job::StatusJson() const {
         if (!speed_reason_.empty())
             cJSON_AddStringToObject(speed, "reason", speed_reason_.c_str());
     }
+    cJSON_AddBoolToObject(root, "confirm_by_url", true);
     cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());
     cJSON_AddStringToObject(root, "state", state.c_str());
     if (state == "error" && !manual_error.empty()) {
@@ -2881,6 +2903,7 @@ void Job::Run() {
         // 禁止在旧 planner/换纸状态未知时自动发送 M5/G1 授权探针。
         pipe.SetTaskSessionActive(true);
         const uint32_t session_seq = pipe.GetConnectionSequence();
+        const uint32_t session_banner = pipe.GetResetBannerSequence();
         if (!pipe.IsConnected() || !pipe.IsReady() || pipe.GetConnectionSequence() != session_seq) {
             last_error_ = "写字机未就绪或连接正在切换";
             SetState("error");
@@ -2900,13 +2923,15 @@ void Job::Run() {
             break;
         }
         // 双读序号包住 ready/authorized 检查，防止采到刚重连但尚未探活的新 session。
-        if (pipe.GetConnectionSequence() != session_seq) {
+        if (pipe.GetConnectionSequence() != session_seq ||
+            pipe.GetResetBannerSequence() != session_banner) {
             last_error_ = "写字机连接在任务启动时发生切换";
             SetState("error");
             Notify(last_error_);
             break;
         }
         stream_connection_seq_ = session_seq;
+        stream_banner_seq_ = session_banner;
         // 授权探测已在 Pipe 建链时完成；未授权任务在这里停止，绘图载荷零字节下发。
         // 下载/校验期间就被暂停时，不能把状态改回 streaming——否则 status 谎报
         // 正在画，实际转发循环一进去就卡在暂停门上。
@@ -3389,9 +3414,16 @@ void Job::CommitPauseTimeoutCancel() {
 bool Job::PreparePenOrigin() {
     auto& pipe = Pipe::GetInstance();
     stream_disconnected_ = false;
+    const uint32_t connection = stream_connection_seq_;
+    const uint32_t banner = stream_banner_seq_;
+    const auto same_session = [&]() {
+        return pipe.IsConnected() && pipe.IsReady() && pipe.IsAuthorized() &&
+               pipe.IsSettingsVerified() && pipe.GetConnectionSequence() == connection &&
+               pipe.GetResetBannerSequence() == banner;
+    };
 
     while (!abort_requested_.load()) {
-        if (!WaitForIdle(true, kPenOriginIdleTimeoutMs)) {
+        if (!WaitForIdleForSession(true, kPenOriginIdleTimeoutMs, connection, banner)) {
             if (last_error_.empty()) {
                 last_error_ = "校准 Z0 前未确认写字机 Idle";
             } else if (last_error_ != "aborted") {
@@ -3412,14 +3444,13 @@ bool Job::PreparePenOrigin() {
             }
             if (paused_.load()) {
                 retry_after_pause = true;
-            } else if (!pipe.IsConnected() || !pipe.IsReady() ||
-                       pipe.GetConnectionSequence() != stream_connection_seq_) {
+            } else if (!same_session()) {
                 stream_disconnected_ = true;
                 last_error_ = "校准 Z0 前链路丢失";
                 return false;
             } else {
                 stream_quiescence_.store(StreamQuiescence::Active, std::memory_order_release);
-                if (!pipe.SendLine("G92 Z0")) {
+                if (!pipe.SendLineForSession("G92 Z0", connection, banner)) {
                     stream_quiescence_.store(StreamQuiescence::Failed, std::memory_order_release);
                     stream_disconnected_ = true;
                     last_error_ = "发送 Z0 校准命令失败";
@@ -3429,8 +3460,7 @@ bool Job::PreparePenOrigin() {
         }
         if (retry_after_pause) {
             if (!WaitWhilePaused()) {
-                stream_disconnected_ = !pipe.IsConnected() || !pipe.IsReady() ||
-                                       pipe.GetConnectionSequence() != stream_connection_seq_;
+                stream_disconnected_ = !same_session();
                 if (abort_requested_.load()) {
                     last_error_ = "aborted";
                 }
@@ -3469,8 +3499,7 @@ bool Job::PreparePenOrigin() {
                 wait_aborted = true;
                 break;
             }
-            if (!pipe.IsConnected() || !pipe.IsReady() ||
-                pipe.GetConnectionSequence() != stream_connection_seq_) {
+            if (!same_session()) {
                 break;
             }
             if (pipe.GetGrblState() == GrblState::Alarm) {
@@ -3508,9 +3537,14 @@ bool Job::PreparePenOrigin() {
             last_error_ = "aborted";
             return false;
         }
+        // ok可能与reset同轮到达；先复核事务身份，不能把旧应答当校准成功。
+        if (!same_session()) {
+            stream_disconnected_ = true;
+            last_error_ = "Z0 校准期间连接已变化";
+            return false;
+        }
         if (wr != WaitResult::Ok) {
-            stream_disconnected_ = !pipe.IsConnected() || !pipe.IsReady() ||
-                                   pipe.GetConnectionSequence() != stream_connection_seq_;
+            stream_disconnected_ = !same_session();
             last_error_ = wr == WaitResult::Timeout
                               ? "等待 Z0 校准应答超时"
                               : "Z0 校准被 Grbl 拒绝 (error:" + std::to_string(error_code) + ")";
@@ -3827,13 +3861,15 @@ bool Job::RecoverDisconnectedDraw() {
         return false;
     }
     const uint32_t recovered_seq = pipe.GetConnectionSequence();
+    const uint32_t recovered_banner = pipe.GetResetBannerSequence();
     if (!pipe.IsConnected() || !pipe.IsReady() || !pipe.IsAuthorized() ||
-        !pipe.IsSettingsVerified() ||
-        pipe.GetConnectionSequence() != recovered_seq) {
+        !pipe.IsSettingsVerified() || pipe.GetConnectionSequence() != recovered_seq ||
+        pipe.GetResetBannerSequence() != recovered_banner) {
         last_error_ = "断连恢复完成时连接再次切换";
         return false;
     }
     stream_connection_seq_ = recovered_seq;
+    stream_banner_seq_ = recovered_banner;
     stream_disconnected_ = false;
     Notify("写字机已恢复，正在从头重画");
     return true;

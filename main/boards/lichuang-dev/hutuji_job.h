@@ -32,6 +32,9 @@ public:
 
     /** 用户看过预览后确认：此处才创建真正的出图任务。 */
     std::string RequestConfirm();
+    /** 门户自动确认必须在同一提交锁内核对本次作品；空地址保留人工确认入口。 */
+    std::string RequestConfirmForPreview(const std::string& expected_url,
+                                         const std::string& expected_preview_url);
 
     /** 分状态 abort（protocol §4.1）。 */
     std::string RequestAbort();
@@ -392,6 +395,7 @@ private:
     bool failure_notified_ = false;
 
     uint32_t stream_connection_seq_ = 0;
+    uint32_t stream_banner_seq_ = 0;
 
     size_t lines_total_ = 0;
     size_t lines_sent_ = 0;

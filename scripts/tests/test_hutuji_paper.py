@@ -323,7 +323,7 @@ int main() {
     def test_preview_publishes_prefetch_before_fast_confirm_and_keeps_cancel(self):
         source = JOB.read_text(encoding="utf-8")
         functions = "\n".join(_function(source, name) for name in (
-            "void Job::Preview()", "std::string Job::RequestConfirm()",
+            "void Job::Preview()", "std::string Job::RequestConfirm()", "std::string Job::RequestConfirmForPreview(",
             "bool Job::AdoptPrefetch()", "void Job::CancelPrefetch()"))
         self.compile_run(r'''
 #include <atomic>
@@ -381,6 +381,7 @@ public:
     bool cancelled_at_fetch = false;
     void Preview();
     std::string RequestConfirm();
+    std::string RequestConfirmForPreview(const std::string&, const std::string&);
     bool AdoptPrefetch();
     void CancelPrefetch();
     static void TaskEntry(void*) {}
@@ -400,6 +401,14 @@ public:
 }
 int main() {
     using namespace hutuji;
+    Job mismatched;
+    mismatched.awaiting_confirmation_ = true;
+    assert(mismatched.RequestConfirmForPreview("other", "png").find("error") != std::string::npos);
+    assert(mismatched.RequestConfirmForPreview("url", "").find("error") != std::string::npos);
+    assert(created == 0 && mismatched.awaiting_confirmation_ && mismatched.busy_);
+    assert(mismatched.RequestConfirmForPreview("url", "png") == "\"started\"");
+    assert(created == 1 && !mismatched.awaiting_confirmation_);
+    created = 0;
     Job fast;
     fast.on_notify = [&] {
         // 通知发出后，真实界面可立刻触发确认；预取必须已属于同一次事务。
