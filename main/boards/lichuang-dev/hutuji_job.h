@@ -140,6 +140,8 @@ private:
     /** 等待弹簧自然回位后，以受控旁路命令把当前抬笔位声明为 Z0。 */
     bool PreparePenOrigin();
     bool WaitForIdle(bool honor_abort, uint32_t timeout_ms);
+    bool WaitForIdleForSession(bool honor_abort, uint32_t timeout_ms, uint32_t connection,
+                               uint32_t banner);
     /** 播报期间 PA 与 HTTPS 下载并发会拉垮无电池 VSYS；下载前等音频输出空闲。 */
     void WaitForAudioOutputIdle();
     /**
@@ -329,6 +331,7 @@ private:
     void RunSpeedUpdate();
     std::atomic<bool> speed_active_{false};
     uint32_t speed_connection_seq_ = 0;
+    uint32_t speed_banner_seq_ = 0;
     uint32_t speed_request_id_ = 0;
     int speed_requested_rate_ = 0;
     int speed_applied_rate_ = 0;

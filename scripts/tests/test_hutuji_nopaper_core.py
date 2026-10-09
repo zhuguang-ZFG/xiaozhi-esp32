@@ -194,7 +194,8 @@ int main() {
         for begin, end in (("bool Job::PerformAbortDrainHome()", "bool Job::WaitForAbortReset()"),
                            ("bool Job::HomeAfterAbort(", "bool Job::ChangePaperAfterDraw()")):
             body = source[source.index(begin):source.index(end)]
-            self.assertLess(body.index("WaitForIdle(false, kHomeIdleTimeoutMs)"),
+            wait = "WaitForIdleForSession(false, kHomeIdleTimeoutMs" if "Drain" in begin else "WaitForIdle(false, kHomeIdleTimeoutMs)"
+            self.assertLess(body.index(wait),
                             body.index("ReleaseMotorsAfterHome("))
 
     def test_release_commit_excludes_late_controls_and_does_not_leak_ack(self):

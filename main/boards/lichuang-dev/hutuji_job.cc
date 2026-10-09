@@ -1162,6 +1162,12 @@ bool Job::PerformAbortDrainHome() {
     const bool nopaper = pipe.IsNopaperMachine();
     const uint32_t home_connection = pipe.GetConnectionSequence();
     const uint32_t home_banner = pipe.GetResetBannerSequence();
+    // 不把重连后的Idle/应答认作本次停止归位；恢复与写入都绑定同一身份。
+    const auto same_session = [&]() {
+        return pipe.IsConnected() && pipe.IsReady() &&
+               pipe.GetConnectionSequence() == home_connection &&
+               pipe.GetResetBannerSequence() == home_banner;
+    };
     bool homed = false;
     do {
         // 顺序关键（2026-08-28 二轮 HIL 实证）：paused_ 是 S3 侧冻结闸，不解它
@@ -1174,7 +1180,7 @@ bool Job::PerformAbortDrainHome() {
                 paused_.store(false, std::memory_order_release);
             }
             SetStreamingOrPaused();
-            if (!pipe.SendRealtime('~')) {
+            if (!pipe.SendResumeForSession(home_connection, home_banner)) {
                 break;
             }
             const TickType_t hold_began = xTaskGetTickCount();
@@ -1182,10 +1188,14 @@ bool Job::PerformAbortDrainHome() {
                    xTaskGetTickCount() - hold_began < pdMS_TO_TICKS(3000)) {
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
+            if (!same_session())
+                break;
             if (pipe.GetGrblState() == GrblState::Hold) {
                 return StartAbortResetTask();  // 移交：worker 旗标归 reset 任务收尾
             }
         }
+        if (!same_session())
+            break;
         const TickType_t began = xTaskGetTickCount();
         while (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire))) {
             if (xTaskGetTickCount() - began > pdMS_TO_TICKS(kAbortDrainQuiescenceTimeoutMs)) {
@@ -1193,18 +1203,19 @@ bool Job::PerformAbortDrainHome() {
             }
             vTaskDelay(pdMS_TO_TICKS(50));
         }
-        if (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire)) ||
-            !pipe.IsConnected()) {
+        if (!same_session())
+            break;
+        if (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire))) {
             // 收口超时（如流循环卡死）：兜底移交受控 reset 路径而非悬挂任务。
             return StartAbortResetTask();
         }
-        if (!WaitForIdle(false, kAbortDrainIdleTimeoutMs)) {
+        if (!WaitForIdleForSession(false, kAbortDrainIdleTimeoutMs, home_connection, home_banner)) {
             break;
         }
         int err = -1;
         {
             std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-            if (!pipe.SendLine("G1G90 Z0.0F10000")) {
+            if (!pipe.SendLineForSession("G1G90 Z0.0F10000", home_connection, home_banner)) {
                 break;
             }
         }
@@ -1215,20 +1226,20 @@ bool Job::PerformAbortDrainHome() {
         if (pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok) {
             break;
         }
-        if (!WaitForIdle(false, kPenOriginIdleTimeoutMs)) {
+        if (!WaitForIdleForSession(false, kPenOriginIdleTimeoutMs, home_connection, home_banner)) {
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(kPenSpringReturnMs));
         {
             std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-            if (!pipe.SendLine("G1G90 X0Y0F8000")) {
+            if (!pipe.SendLineForSession("G1G90 X0Y0F8000", home_connection, home_banner)) {
                 break;
             }
         }
         if (pipe.WaitResponse(kHomeOkTimeoutMs, nullptr, &err) != WaitResult::Ok) {
             break;
         }
-        if (!WaitForIdle(false, kHomeIdleTimeoutMs)) {
+        if (!WaitForIdleForSession(false, kHomeIdleTimeoutMs, home_connection, home_banner)) {
             break;
         }
         if (nopaper && !ReleaseMotorsAfterHome(home_connection, home_banner, false)) {
@@ -1237,6 +1248,8 @@ bool Job::PerformAbortDrainHome() {
         homed = true;
         ESP_LOGI(TAG, "abort 断流归位完成（无 reset，坐标未失效）");
     } while (false);
+    if (!homed)
+        pipe.ShutdownSocket(home_connection);
     abort_home_done_.store(homed, std::memory_order_release);
     return false;
 }
@@ -1669,6 +1682,7 @@ std::string Job::RequestSpeed(int rate, const std::string& axis) {
     busy_.store(true);
     speed_active_.store(true);
     speed_connection_seq_ = pipe.GetConnectionSequence();
+    speed_banner_seq_ = pipe.GetResetBannerSequence();
     // 重连只验 banner，禁止探活命令的 ok 混进调速事务。
     pipe.SetTaskSessionActive(true);
     const BaseType_t created = xTaskCreate(SpeedTaskEntry, "hutuji_speed", 4096, this, 1, nullptr);
@@ -1703,14 +1717,16 @@ void Job::RunSpeedUpdate() {
         selected = ParseMachineSpeedAxis(speed_axis_);
     }
     const uint32_t connection = speed_connection_seq_;
+    const uint32_t banner = speed_banner_seq_;
     const auto same_session = [&]() {
         return pipe.IsConnected() && pipe.IsReady() && pipe.IsAuthorized() &&
                pipe.IsSettingsVerified() && pipe.IsNopaperMachine() &&
-               pipe.GetConnectionSequence() == connection;
+               pipe.GetConnectionSequence() == connection &&
+               pipe.GetResetBannerSequence() == banner;
     };
     // 每条普通命令单独消费应答，查询行也不留下孤儿 ok。
     const auto exchange = [&](const char* line) {
-        if (!same_session() || !pipe.SendLine(line))
+        if (!same_session() || !pipe.SendLineForSession(line, connection, banner))
             return false;
         const TickType_t sent = xTaskGetTickCount();
         while (same_session() && xTaskGetTickCount() - sent < pdMS_TO_TICKS(kSpeedWriteTimeoutMs)) {
@@ -3606,9 +3622,16 @@ bool Job::ConfirmInFlightDoneByStatus(const std::vector<LineSpan>& spans, size_t
 
 bool Job::WaitForIdle(bool honor_abort, uint32_t timeout_ms) {
     auto& pipe = Pipe::GetInstance();
+    return WaitForIdleForSession(
+        honor_abort, timeout_ms,
+        honor_abort ? stream_connection_seq_ : pipe.GetConnectionSequence(),
+        pipe.GetResetBannerSequence());
+}
+
+bool Job::WaitForIdleForSession(bool honor_abort, uint32_t timeout_ms, uint32_t connection,
+                                uint32_t banner) {
+    auto& pipe = Pipe::GetInstance();
     const TickType_t began = xTaskGetTickCount();
-    const uint32_t connection = honor_abort ? stream_connection_seq_ : pipe.GetConnectionSequence();
-    const uint32_t banner = pipe.GetResetBannerSequence();
     const auto same_session = [&]() {
         return pipe.IsConnected() && pipe.IsReady() && pipe.GetConnectionSequence() == connection &&
                pipe.GetResetBannerSequence() == banner;
@@ -3818,24 +3841,32 @@ bool Job::RecoverDisconnectedDraw() {
 
 bool Job::ReturnHomeAfterDraw() {
     auto& pipe = Pipe::GetInstance();
+    const uint32_t home_connection = stream_connection_seq_;
+    const uint32_t home_banner = pipe.GetResetBannerSequence();
+    // 身份固定到整段归位；超时只拆原连接，停止请求仍由既有abort worker收尾。
+    auto fail = [&]() {
+        if (!abort_requested_.load())
+            pipe.ShutdownSocket(home_connection);
+        return false;
+    };
     if (pipe.IsNopaperMachine()) {
         // 量产任务结束将释放 XYZ，先显式抬笔并等弹簧沉降，避免归位拖痕。
         {
             std::lock_guard<std::mutex> stream_lock(stream_mutex_);
             if (abort_requested_.load()) {
                 last_error_ = "aborted";
-                return false;
+                return fail();
             }
-            if (!pipe.SendLine("G1G90 Z0.0F10000")) {
+            if (!pipe.SendLineForSession("G1G90 Z0.0F10000", home_connection, home_banner)) {
                 last_error_ = "归位前抬笔命令发送失败";
-                return false;
+                return fail();
             }
         }
         if (pipe.WaitResponse(kHomeOkTimeoutMs) != WaitResult::Ok ||
-            !WaitForIdle(true, kPenOriginIdleTimeoutMs)) {
+            !WaitForIdleForSession(true, kPenOriginIdleTimeoutMs, home_connection, home_banner)) {
             if (last_error_.empty())
                 last_error_ = "归位前抬笔未确认";
-            return false;
+            return fail();
         }
         vTaskDelay(pdMS_TO_TICKS(kPenSpringReturnMs));
     }
@@ -3860,11 +3891,11 @@ bool Job::ReturnHomeAfterDraw() {
         std::lock_guard<std::mutex> stream_lock(stream_mutex_);
         if (abort_requested_.load()) {
             last_error_ = "aborted";
-            return false;
+            return fail();
         }
-        if (!pipe.SendLine("G1G90 X0Y0F8000")) {
+        if (!pipe.SendLineForSession("G1G90 X0Y0F8000", home_connection, home_banner)) {
             last_error_ = "归位命令发送失败";
-            return false;
+            return fail();
         }
     }
     int err = -1;
@@ -3873,18 +3904,18 @@ bool Job::ReturnHomeAfterDraw() {
         last_error_ = wr == WaitResult::Timeout
                           ? "等待归位应答超时"
                           : "归位被 Grbl 拒绝 (error:" + std::to_string(err) + ")";
-        return false;
+        return fail();
     }
     // G1 的 ok 只表示已入 planner，不代表走完；必须 fresh Idle 确认归位物理完成，
     // 才允许进入换纸——否则「归位/换纸两阶段分离」只是靠 M30 内部 synchronize 的
     // 隐性保证，abort 在两阶段之间没有真实决策点。
-    if (!WaitForIdle(true, kHomeIdleTimeoutMs)) {
+    if (!WaitForIdleForSession(true, kHomeIdleTimeoutMs, home_connection, home_banner)) {
         if (last_error_.empty()) {
             last_error_ = "归位后未确认写字机 Idle";
         } else if (last_error_ != "aborted") {
             last_error_ = "归位后未确认写字机 Idle: " + last_error_;
         }
-        return false;
+        return fail();
     }
     ESP_LOGI(TAG, "页尾归位完成（G1 X0Y0，不触发换纸）");
     return true;

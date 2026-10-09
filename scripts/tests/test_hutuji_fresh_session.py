@@ -73,8 +73,9 @@ public:
     bool WaitWhilePaused() { return !abort_requested_.load(); }
     bool QueryAndWaitFreshMachineState(uint32_t timeout_ms);
     bool WaitForIdle(bool honor_abort, uint32_t timeout_ms);
+    bool WaitForIdleForSession(bool, uint32_t, uint32_t, uint32_t);
 };
-''' + function_body(source, 'bool Job::QueryAndWaitFreshMachineState(') + '\n' + function_body(source, 'bool Job::WaitForIdle(') + r'''
+''' + function_body(source, 'bool Job::QueryAndWaitFreshMachineState(') + '\n' + function_body(source, 'bool Job::WaitForIdle(') + '\n' + function_body(source, 'bool Job::WaitForIdleForSession(') + r'''
 int main(int argc, char** argv) {
     assert(argc == 2);
     const int scenario = std::atoi(argv[1]);

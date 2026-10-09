@@ -1255,6 +1255,15 @@ bool Pipe::SendManualReset(uint32_t connection, uint32_t banner) {
     return SendRawLocked(&reset, 1);
 }
 
+bool Pipe::SendResumeForSession(uint32_t connection, uint32_t banner) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    if (!IsCommandSessionCurrent(connection, banner)) {
+        return false;
+    }
+    const char resume = '~';
+    return SendRawLocked(&resume, 1);
+}
+
 bool Pipe::SendLineLocked(const std::string& line) {
     // 逐行模式：发新行前清掉残留应答，防止上一行超时后迟到的 ok 满足本行的等待。
     // 窗口化模式必须关掉这个清空——那时队列里的应答是「在途」的合法凭据，

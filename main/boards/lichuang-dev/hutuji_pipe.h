@@ -63,6 +63,8 @@ public:
     bool SendLineForSession(const std::string& line, uint32_t connection, uint32_t banner);
     /** 用户手动复位：同一写锁内验证原会话后发送固定 Ctrl-X。 */
     bool SendManualReset(uint32_t connection, uint32_t banner);
+    /** 停止归位退出Hold：只恢复原会话，不能把旧任务的~发给重连后的设备。 */
+    bool SendResumeForSession(uint32_t connection, uint32_t banner);
     /** 已归位任务专用：单写者锁内复核同一连接/横幅及新鲜 Idle，仅发送固定 $MD。 */
     bool SendMotorDisableAtIdle(uint32_t connection, uint32_t banner, uint32_t previous_status);
 

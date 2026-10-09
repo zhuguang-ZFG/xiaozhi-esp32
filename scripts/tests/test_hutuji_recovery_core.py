@@ -980,12 +980,12 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         start = source.index("bool Job::ReturnHomeAfterDraw()")
         end = source.index("bool Job::HomeAfterAbort(", start)
         body = source[start:end]
-        homes = re.findall(r'pipe\.SendLine\("([^"]+)"\)', body)
+        homes = re.findall(r'pipe\.SendLineForSession\("([^"]+)"', body)
         self.assertEqual(homes, ["G1G90 Z0.0F10000", "G1G90 X0Y0F8000"])
         self.assertIn("if (pipe.IsNopaperMachine())", body)
         self.assertLess(body.index('"G1G90 Z0.0F10000"'),
-                        body.index("WaitForIdle(true, kPenOriginIdleTimeoutMs)"))
-        self.assertLess(body.index("WaitForIdle(true, kPenOriginIdleTimeoutMs)"),
+                        body.index("WaitForIdleForSession(true, kPenOriginIdleTimeoutMs"))
+        self.assertLess(body.index("WaitForIdleForSession(true, kPenOriginIdleTimeoutMs"),
                         body.index('"G1G90 X0Y0F8000"'))
         # 2026-08-28 用户决策「停止后也要自己回原点」：abort 归位同样必须是 G1
         # （G0 X0Y0 会触发换纸），且必须先 G92 复原 Hold 快照坐标再归位——复位后
@@ -1003,7 +1003,7 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         # WaitForIdle 就退化成靠 M30 内部 synchronize 的隐性顺序保证，abort 在
         # 归位/换纸两阶段之间没有真实决策点。
         ok_wait = body.index("pipe.WaitResponse(")
-        idle_wait = body.index("WaitForIdle(true, kHomeIdleTimeoutMs)")
+        idle_wait = body.index("WaitForIdleForSession(true, kHomeIdleTimeoutMs")
         self.assertLess(ok_wait, idle_wait)
         self.assertTrue(homes[0].startswith("G1"), homes)
 
@@ -3902,14 +3902,19 @@ class AbortHomeAfterStopTest(unittest.TestCase):
         # 排空路径实时字符只许 `~`（Hold 退出）；禁 `!`（feed hold）与 0x18 reset
         import re as _re
         realtime = _re.findall(r"SendRealtime\('(.?)'\)", drain)
-        self.assertEqual(realtime, ["~"])
+        self.assertEqual(realtime, [])
+        self.assertIn("SendResumeForSession(home_connection, home_banner)", drain)
+        pipe_cc = (ROOT / "main/boards/lichuang-dev/hutuji_pipe.cc").read_text(encoding="utf-8")
+        resume = pipe_cc[pipe_cc.index("bool Pipe::SendResumeForSession("):pipe_cc.index("bool Pipe::SendLineLocked(")]
+        self.assertIn("const char resume = '~';", resume)
+        self.assertLess(resume.index("IsCommandSessionCurrent"), resume.index("SendRawLocked"))
         self.assertIn('"G1G90 Z0.0F10000"', drain)
         self.assertIn('"G1G90 X0Y0F8000"', drain)
         # 拖痕实证钉死（2026-08-28 用户报告）：Z0 抬笔与归位行之间必须有
         # fresh Idle + 弹簧沉降，否则笔未抬离纸面 XY 已起步（拖痕）。
         z_idx = drain.index('"G1G90 Z0.0F10000"')
         home_idx = drain.index('"G1G90 X0Y0F8000"')
-        idle_idx = drain.index("WaitForIdle(false, kPenOriginIdleTimeoutMs)")
+        idle_idx = drain.index("WaitForIdleForSession(false, kPenOriginIdleTimeoutMs")
         spring_idx = drain.index("kPenSpringReturnMs")
         self.assertLess(z_idx, idle_idx)
         self.assertLess(idle_idx, spring_idx)

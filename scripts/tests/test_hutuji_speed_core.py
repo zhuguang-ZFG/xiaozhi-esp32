@@ -139,10 +139,13 @@ public:
     bool IsSettingsVerified() const { return true; }
     bool IsNopaperMachine() const { return true; }
     unsigned GetConnectionSequence() const { return connection; }
+    unsigned GetResetBannerSequence() const { return 9; }
     unsigned GetStatusReportSequence() const { return status; }
     GrblState GetGrblState() const { return idle ? GrblState::Idle : GrblState::Run; }
     bool SendRealtime(char c) { assert(c == '?'); ++status; return true; }
-    bool SendLine(const char* raw) {
+    bool SendLineForSession(const char* raw, unsigned expected, unsigned banner) {
+        assert(expected == 7 && banner == 9);
+        if (!connected || connection != expected) return false;
         std::string line(raw);
         lines.push_back(line);
         int setting = std::stoi(line.substr(1));
@@ -170,6 +173,7 @@ public:
     std::string speed_axis_ = "xy", speed_state_ = "pending", speed_reason_;
     int speed_requested_rate_ = 0, speed_applied_rate_ = 0;
     unsigned speed_connection_seq_ = 7;
+    unsigned speed_banner_seq_ = 9;
     std::atomic<bool> speed_active_{true}, busy_{true};
     MachineSpeedSnapshot speed_readback_;
     void StartPerformanceHold() {}
