@@ -294,16 +294,14 @@ void Pipe::PipeTask() {
 }
 
 Pipe::PeerCheck Pipe::VerifyGrblPeer(int sock, int timeout_ms) {
-    // 只读、不发任何字节：banner 由对端 Telnet accept 路径主动送出
-    // （report_init_message → TelnetServer.cpp:217，ENABLE_TELNET_WELCOME_MSG 已开），
-    // 不需要我们先发 `$I`（那要等 Grbl 主循环，换纸期会阻塞）。
-    // banner 字节在此被消费掉、不再送达主循环 —— 但主循环连上后会主动发 `$I`，
-    // 靠 `[VER:` 应答（ProcessLine :391）置 ready_，不依赖这条 banner。
-    // banner 尾部残段（如 " for help]"）落入主循环也不匹配任何分支，无害。
+    // 旧机仅消费连接banner；工厂配对机另发只读$I，完整消费终止应答后才发布连接。
+    // MAC行不是事务完成标记，否则分包ok会误入随后正式授权/指纹探测。
     const auto identity = LoadFactoryIdentity();
     if (identity.present && !identity.valid)
         return PeerCheck::Invalid;
     bool identity_requested = false;
+    bool matched = false;
+    size_t received = 0;
     std::string probe;
     int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
 
@@ -323,27 +321,51 @@ Pipe::PeerCheck Pipe::VerifyGrblPeer(int sock, int timeout_ms) {
         if (n == 0) {
             // Grbl MAX_TLNT_CLIENTS=1。旧半开连接占槽时，server 会 accept 后立即
             // close 新连接；不能把它误判成「缓存 IP 被别的设备顶替」。
-            return probe.empty() ? PeerCheck::ClosedBeforeBanner : PeerCheck::Invalid;
+            return received == 0 ? PeerCheck::ClosedBeforeBanner : PeerCheck::Invalid;
         }
         if (n < 0) {
             break;
         }
         probe.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
-        if (probe.find(kGrblBanner) != std::string::npos) {
-            if (!identity.present)
-                return PeerCheck::Valid;
-            // 只读$I获取MAC，不向错配机器发授权/运动；忙机无回复时宁可等待。
+        received += static_cast<size_t>(n);
+        // $I有多条报告，按单行512B和整次4KiB分别限额，避免正常长报告被误拒。
+        if (received > 4096)
+            return PeerCheck::Invalid;
+        if (!identity.present && probe.find(kGrblBanner) != std::string::npos)
+            return PeerCheck::Valid;
+        bool banner_seen = false;
+        size_t end;
+        while ((end = probe.find('\n')) != std::string::npos) {
+            if (end > kRxLineMax)
+                return PeerCheck::Invalid;
+            std::string line = probe.substr(0, end);
+            probe.erase(0, end + 1);
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
             if (!identity_requested) {
-                const char query[] = "$I\n";
-                if (send(sock, query, 3, MSG_DONTWAIT) != 3)
-                    return PeerCheck::Invalid;
-                identity_requested = true;
+                banner_seen = banner_seen || line.rfind(kGrblBanner, 0) == 0;
+                continue;
             }
-            if (FactoryPeerMatches(identity, probe))
-                return PeerCheck::Valid;
+            if (line.rfind("error", 0) == 0 || line.rfind("ALARM:", 0) == 0 ||
+                line.rfind(kGrblBanner, 0) == 0)
+                return PeerCheck::Invalid;
+            if (line == "ok")
+                return matched ? PeerCheck::Valid : PeerCheck::Invalid;
+            if (line.rfind("[MSG:Mode=STA:SSID=", 0) == 0) {
+                if (!FactoryPeerMatches(identity, line + "\n"))
+                    return PeerCheck::Invalid;
+                matched = true;
+            }
         }
-        if (probe.size() > kRxLineMax) {
-            break;  // 一直在说话但不是 Grbl（例如某些设备的登录提示）
+        if (probe.size() > kRxLineMax)
+            return PeerCheck::Invalid;
+        if (banner_seen && !identity_requested) {
+            // 当前批次字节来自发送前，不能将其中的ok作为新查询应答。
+            probe.clear();
+            const char query[] = "$I\n";
+            if (send(sock, query, 3, MSG_DONTWAIT) != 3)
+                return PeerCheck::Invalid;
+            identity_requested = true;
         }
     }
     return PeerCheck::Invalid;
@@ -1369,8 +1391,8 @@ bool Pipe::SendAbortReset(uint32_t expected_connection_sequence, uint32_t previo
         HasFreshStoppedStatus(previous_status_sequence, expected_connection_sequence);
     // 无换纸机型永不换纸（§10.4.15），paper 新鲜度前提对它无意义且该机 Hold 态下
     // [ESP901] 不可答——豁免 fresh_paper，否则无换纸机的错误恢复永远进不了 reset。
-    const bool fresh_paper = nopaper_machine_.load() ||
-                             paper_status_seq_.load() != previous_paper_status_sequence;
+    const bool fresh_paper =
+        nopaper_machine_.load() || paper_status_seq_.load() != previous_paper_status_sequence;
     const bool banner_unchanged = reset_banner_seq_.load() == previous_banner_sequence;
     if (!same_session || !banner_unchanged) {
         abort_reset_token_.Cancel();
