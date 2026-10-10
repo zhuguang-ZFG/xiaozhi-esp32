@@ -12,6 +12,7 @@
 
 #include "application.h"
 #include "board.h"
+#include "factory_identity.h"
 #include "lwip/sockets.h"
 #include "plotter_provision.h"
 
@@ -299,6 +300,10 @@ Pipe::PeerCheck Pipe::VerifyGrblPeer(int sock, int timeout_ms) {
     // banner 字节在此被消费掉、不再送达主循环 —— 但主循环连上后会主动发 `$I`，
     // 靠 `[VER:` 应答（ProcessLine :391）置 ready_，不依赖这条 banner。
     // banner 尾部残段（如 " for help]"）落入主循环也不匹配任何分支，无害。
+    const auto identity = LoadFactoryIdentity();
+    if (identity.present && !identity.valid)
+        return PeerCheck::Invalid;
+    bool identity_requested = false;
     std::string probe;
     int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
 
@@ -325,7 +330,17 @@ Pipe::PeerCheck Pipe::VerifyGrblPeer(int sock, int timeout_ms) {
         }
         probe.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
         if (probe.find(kGrblBanner) != std::string::npos) {
-            return PeerCheck::Valid;
+            if (!identity.present)
+                return PeerCheck::Valid;
+            // 只读$I获取MAC，不向错配机器发授权/运动；忙机无回复时宁可等待。
+            if (!identity_requested) {
+                const char query[] = "$I\n";
+                if (send(sock, query, 3, MSG_DONTWAIT) != 3)
+                    return PeerCheck::Invalid;
+                identity_requested = true;
+            }
+            if (FactoryPeerMatches(identity, probe))
+                return PeerCheck::Valid;
         }
         if (probe.size() > kRxLineMax) {
             break;  // 一直在说话但不是 Grbl（例如某些设备的登录提示）

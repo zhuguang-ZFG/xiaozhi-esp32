@@ -1,4 +1,5 @@
 #include "plotter_provision.h"
+#include "factory_identity.h"
 
 #include <cstring>
 
@@ -161,7 +162,15 @@ bool PlotterProvision::IsFactoryApVisible() {
     //     自证 Visible:Yes），故并行开混杂模式嗅探 beacon/probe response 兜底：
     //     AP 每 ~100ms 发 beacon、directed probe 必换 response，收到一帧即铁证。
     //     嗅探不经过扫描结果集，与 WifiStation 零交互。
+    const auto identity = LoadFactoryIdentity();
+    if (identity.present && !identity.valid)
+        return false;
     sniff_match_.store(false);
+    uint64_t expected_bssid = 0;
+    if (identity.present) {
+        for (auto byte : identity.bssid) expected_bssid = (expected_bssid << 8) | byte;
+    }
+    sniff_expected_bssid_.store(expected_bssid);
     const wifi_promiscuous_filter_t filter = {.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT};
     esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous_rx_cb(&PlotterProvision::SniffRxCallback);
@@ -186,7 +195,8 @@ bool PlotterProvision::IsFactoryApVisible() {
             while (num-- > 0 && esp_wifi_scan_get_ap_record(&record) == ESP_OK) {
                 if (strcmp(reinterpret_cast<const char*>(record.ssid), provision::kPlotterApSsid) ==
                     0) {
-                    found = true;
+                    found = found || !identity.present ||
+                            std::memcmp(record.bssid, identity.bssid.data(), 6) == 0;
                 }
             }
             ESP_LOGI(TAG, "出厂热点扫描完成，结果集 %u 命中=%d，嗅探=%d（第 %d 轮）",
@@ -213,12 +223,16 @@ void PlotterProvision::SniffRxCallback(void* buf, wifi_promiscuous_pkt_type_t ty
     }
     const auto* pkt = static_cast<const wifi_promiscuous_pkt_t*>(buf);
     if (provision::ProbeFrameMatchesSsid(pkt->payload, pkt->rx_ctrl.sig_len,
-                                         provision::kPlotterApSsid)) {
+                                         provision::kPlotterApSsid,
+                                         GetInstance().sniff_expected_bssid_.load())) {
         GetInstance().sniff_match_.store(true);
     }
 }
 
 bool PlotterProvision::JumpToFactoryAp() {
+    const auto identity = LoadFactoryIdentity();
+    if (identity.present && !identity.valid)
+        return false;
     jump_events_ = xEventGroupCreate();
     if (jump_events_ == nullptr) {
         return false;
@@ -251,6 +265,10 @@ bool PlotterProvision::JumpToFactoryAp() {
                  sizeof(cfg.sta.ssid) - 1);
     std::strncpy(reinterpret_cast<char*>(cfg.sta.password), provision::kPlotterApPassword,
                  sizeof(cfg.sta.password) - 1);
+    if (identity.present) {
+        cfg.sta.bssid_set = true;
+        std::memcpy(cfg.sta.bssid, identity.bssid.data(), 6);
+    }
     cfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
     if (esp_wifi_set_config(WIFI_IF_STA, &cfg) != ESP_OK) {
         ESP_LOGW(TAG, "跳配配置写入失败");

@@ -78,6 +78,7 @@ private:
     std::atomic<bool> task_active_{false};
     std::atomic<bool> busy_{false};
     std::atomic<bool> pending_manual_{false};
+    std::atomic<uint64_t> sniff_expected_bssid_{0};
     std::atomic<bool> sniff_match_{false};  // 嗅探通道：空口收到出厂 AP 帧即置位
     esp_timer_handle_t patrol_timer_ = nullptr;
     esp_timer_handle_t retry_timer_ = nullptr;

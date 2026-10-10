@@ -234,7 +234,7 @@ class PlotterProvisionCoreTest(unittest.TestCase):
                 assert(ValidateHomeCredentials(std::string(32, 'a'), "secret123") == CredentialError::None);
                 assert(ValidateHomeCredentials(std::string(33, 'a'), "secret123") == CredentialError::SsidTooLong);
                 // 中文 SSID（UTF-8 多字节）与不可打印字符都过不了 Grbl isPrintable
-                assert(ValidateHomeCredentials("\xE5\xAE\xB6\xE9\x87\x8C", "secret123") == CredentialError::SsidNotPrintable);
+                assert(ValidateHomeCredentials("\xE5\xAE\xB6\xE9\x87\x8C", "secret123") == CredentialError::None);
                 assert(ValidateHomeCredentials("a\tb", "secret123") == CredentialError::SsidNotPrintable);
 
                 assert(ValidateHomeCredentials("HomeWiFi", "") == CredentialError::None);  // 开放网络
@@ -363,6 +363,9 @@ class PlotterProvisionCoreTest(unittest.TestCase):
                     // 前缀不等价：长度必须也相等
                     assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL"));
                     assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP2"));
+                    f[16] = 2; f[21] = 3;
+                    assert(ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP", 0x020000000003ULL));
+                    assert(!ProbeFrameMatchesSsid(f.data(), f.size(), "GRBL_ESP", 0x020000000004ULL));
                 }
                 // SSID IE 不在链首也找得到
                 {

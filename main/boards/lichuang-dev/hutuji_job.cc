@@ -1,5 +1,6 @@
 #include "hutuji_job.h"
 
+#include "factory_identity.h"
 #include "hutuji_pipe.h"
 #include "hutuji_speed_core.h"
 
@@ -2070,6 +2071,12 @@ std::string Job::StatusJson() const {
         }
         if (!speed_reason_.empty())
             cJSON_AddStringToObject(speed, "reason", speed_reason_.c_str());
+    }
+    const auto factory = LoadFactoryIdentity();
+    cJSON_AddBoolToObject(root, "factory_paired", factory.present && factory.valid);
+    if (factory.present && factory.valid) {
+        cJSON_AddStringToObject(root, "serial_number", factory.sn.c_str());
+        cJSON_AddStringToObject(root, "paired_grbl_mac", factory.grbl.c_str());
     }
     cJSON_AddBoolToObject(root, "confirm_by_url", true);
     cJSON_AddBoolToObject(root, "repeat_available", buffer_replayable_.load());

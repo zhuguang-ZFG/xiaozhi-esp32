@@ -13,8 +13,7 @@
  *   _handle_web_command :442-487），故分类必须看体，不能只看状态码。
  * - ESP444 RESTART 的 setSystemMode 立即 ESP.restart()（WebSettings.cpp:412-421），
  *   应答可能永远发不出来，传输失败按「已发出」处理，靠重启后的既有发现验证。
- * - 设置校验边界：SSID 1..32 且逐字节可打印（isSSIDValid → Arduino isPrintable，
- *   C locale 下即 0x20..0x7E；中文 SSID 的 UTF-8 字节 >=0x80 会被拒）；
+ * - 设置校验边界：SSID 1..32字节且为合法UTF-8；控制字符与损坏编码被拒；
  *   密码 0（开放网络）或 8..64（WifiConfig.h:69-74 + isPasswordValid :160-171）。
  */
 
@@ -23,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include "utf8_ssid.h"
 
 namespace hutuji {
 namespace provision {
@@ -63,10 +63,8 @@ inline CredentialError ValidateHomeCredentials(const std::string& ssid,
     if (ssid.size() > 32) {
         return CredentialError::SsidTooLong;
     }
-    for (const unsigned char ch : ssid) {
-        if (ch < 0x20 || ch > 0x7E) {
-            return CredentialError::SsidNotPrintable;
-        }
+    if (!ValidUtf8Ssid(ssid.data(), ssid.size())) {
+        return CredentialError::SsidNotPrintable;
     }
     if (!password.empty() && (password.size() < 8 || password.size() > 64)) {
         return CredentialError::PasswordLengthInvalid;
@@ -187,7 +185,8 @@ inline bool IsRestartOutcomeAcceptable(EspCmdResult result) {
  * 扫描的结果集本身也可能漏收。混杂模式嗅探 beacon/probe response 不经过扫描
  * 结果集，收到一帧即为在场铁证。混杂回调跑在 wifi 任务上下文，只调本函数。
  */
-inline bool ProbeFrameMatchesSsid(const uint8_t* payload, size_t len, const char* target) {
+inline bool ProbeFrameMatchesSsid(const uint8_t* payload, size_t len, const char* target,
+                                 uint64_t expected_bssid = 0) {
     if (payload == nullptr || target == nullptr || len < 38) {
         return false;
     }
@@ -197,6 +196,11 @@ inline bool ProbeFrameMatchesSsid(const uint8_t* payload, size_t len, const char
     }
     if ((payload[1] & 0x03) != 0) {  // toDS/fromDS 置位的帧头布局不同，不认
         return false;
+    }
+    if (expected_bssid != 0) {
+        uint64_t actual = 0;
+        for (size_t i = 0; i < 6; ++i) actual = (actual << 8) | payload[16 + i];
+        if (actual != expected_bssid) return false;
     }
     const size_t target_len = std::strlen(target);
     if (target_len > 32) {
@@ -225,7 +229,7 @@ enum class ProvisionFailure {
     CommandRejected,        // 配置命令被写字机拒绝
     NotOnlineAfterRestart,  // 重启后既有发现窗口内没接管到写字机
     HomeWifiRestoreFailed,  // 回切户网未在时限内恢复
-    InvalidCredentials,     // 户网凭据过不了写字机侧校验（如中文 SSID）
+    InvalidCredentials,     // 户网凭据过不了写字机侧校验（如损坏UTF-8或控制字符）
 };
 
 /** 用户面中文话术；技术诊断串不进屏（与 DescribeTransferFailure 同约定）。 */
