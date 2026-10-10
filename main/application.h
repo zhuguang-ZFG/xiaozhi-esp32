@@ -114,7 +114,8 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
-    bool UpgradeFirmware(const std::string& url, const std::string& version = "");
+    bool UpgradeFirmware(const std::string& url, const std::string& version = "",
+                         const std::string& expected_sha256 = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
     void RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback);

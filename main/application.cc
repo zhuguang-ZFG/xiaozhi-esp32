@@ -1143,7 +1143,8 @@ void Application::Reboot() {
     esp_restart();
 }
 
-bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
+bool Application::UpgradeFirmware(const std::string& url, const std::string& version,
+                                  const std::string& expected_sha256) {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
 
@@ -1170,13 +1171,16 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     audio_service_.Stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    bool upgrade_success = Ota::Upgrade(upgrade_url, [this, display](int progress, size_t speed) {
-        char buffer[32];
-        snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
-        Schedule([display, message = std::string(buffer)]() {
-            display->SetChatMessage("system", message.c_str());
-        });
-    });
+    bool upgrade_success = Ota::Upgrade(
+        upgrade_url,
+        [this, display](int progress, size_t speed) {
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
+            Schedule([display, message = std::string(buffer)]() {
+                display->SetChatMessage("system", message.c_str());
+            });
+        },
+        expected_sha256, version);
 
     if (!upgrade_success) {
         // Upgrade failed, restart audio service and continue running

@@ -3,16 +3,18 @@
 #include "settings.h"
 #include "assets/lang_config.h"
 
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <cJSON.h>
-#include <esp_log.h>
-#include <esp_partition.h>
-#include <esp_ota_ops.h>
 #include <esp_app_format.h>
 #include <esp_efuse.h>
 #include <esp_efuse_table.h>
 #include <esp_heap_caps.h>
+#include <esp_log.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <cJSON.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <psa/crypto.h>
+#include "ota_validation.h"
 #ifdef SOC_HMAC_SUPPORTED
 #include <esp_hmac.h>
 #endif
@@ -283,7 +285,20 @@ void Ota::MarkCurrentVersionValid() {
     }
 }
 
-bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback) {
+bool Ota::Upgrade(const std::string& firmware_url,
+                  std::function<void(int progress, size_t speed)> callback,
+                  const std::string& expected_sha256, const std::string& expected_version) {
+    if (!expected_sha256.empty() && !ValidFirmwareSha256(expected_sha256))
+        return false;
+    psa_hash_operation_t sha_operation = PSA_HASH_OPERATION_INIT;
+    struct HashGuard {
+        psa_hash_operation_t& operation;
+        ~HashGuard() { psa_hash_abort(&operation); }
+    } hash_guard{sha_operation};
+    if (!expected_sha256.empty() &&
+        (psa_crypto_init() != PSA_SUCCESS ||
+         psa_hash_setup(&sha_operation, PSA_ALG_SHA_256) != PSA_SUCCESS))
+        return false;
     ESP_LOGI(TAG, "Upgrading firmware from %s", firmware_url.c_str());
     esp_ota_handle_t update_handle = 0;
     // SDK 在 begin 时登记操作条目；所有早退/异常都须回收，end 后解除所有权。
@@ -306,7 +321,11 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
     std::string image_header;
 
     auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr)
+        return false;
     auto http = network->CreateHttp(0);
+    if (http == nullptr)
+        return false;
     if (!http->Open("GET", firmware_url)) {
         ESP_LOGE(TAG, "Failed to open HTTP connection");
         return false;
@@ -318,7 +337,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
     }
 
     size_t content_length = http->GetBodyLength();
-    if (content_length == 0) {
+    if (content_length == 0 || content_length > update_partition->size) {
         ESP_LOGE(TAG, "Failed to get content length");
         return false;
     }
@@ -341,6 +360,17 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
             return false;
         }
 
+        if (static_cast<size_t>(ret) > PAGE_SIZE - buffer_offset ||
+            static_cast<size_t>(ret) > content_length - total_read)
+            return false;
+        if (ret > 0 && !expected_sha256.empty() &&
+            psa_hash_update(&sha_operation,
+                            reinterpret_cast<const uint8_t*>(buffer.get() + buffer_offset),
+                            ret) != PSA_SUCCESS)
+            return false;
+        if (!image_header_checked && ret > 0) {
+            image_header.append(buffer.get() + buffer_offset, ret);
+        }
         // Calculate speed and progress every second
         recent_read += ret;
         total_read += ret;
@@ -356,10 +386,14 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         }
 
         if (!image_header_checked) {
-            image_header.append(buffer.get(), buffer_offset);
             if (image_header.size() >= sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
                 esp_app_desc_t new_app_info;
                 memcpy(&new_app_info, image_header.data() + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
+
+                if (!expected_version.empty() &&
+                    (memchr(new_app_info.version, 0, sizeof(new_app_info.version)) == nullptr ||
+                     expected_version != new_app_info.version))
+                    return false;
 
                 if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle)) {
                     ESP_LOGE(TAG, "Failed to begin OTA");
@@ -374,6 +408,8 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         // Write to flash when buffer is full (4KB) or it's the last chunk
         bool is_last_chunk = (ret == 0);
         if (buffer_offset == PAGE_SIZE || (is_last_chunk && buffer_offset > 0)) {
+            if (!image_header_checked)
+                return false;
             auto err = esp_ota_write(update_handle, buffer.get(), buffer_offset);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
@@ -389,7 +425,26 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
     }
     http->Close();
     buffer.reset();  // 镜像校验需要内部堆，保持原路径在校验前释放4KiB缓冲。
-
+    if (!image_header_checked || total_read != content_length)
+        return false;
+    if (!expected_sha256.empty()) {
+        uint8_t digest[32] = {};
+        size_t digest_length = 0;
+        if (psa_hash_finish(&sha_operation, digest, sizeof(digest), &digest_length) !=
+                PSA_SUCCESS ||
+            digest_length != sizeof(digest))
+            return false;
+        char hex[65] = {};
+        for (size_t i = 0; i < sizeof(digest); ++i)
+            snprintf(hex + i * 2, 3, "%02x", digest[i]);
+        std::string expected = expected_sha256;
+        std::transform(expected.begin(), expected.end(), expected.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (expected != hex) {
+            ESP_LOGE(TAG, "镜像SHA-256不符，拒绝切换启动分区");
+            return false;
+        }
+    }
     esp_err_t err = esp_ota_end(update_handle);
     update_handle = 0;  // esp_ota_end 成功或失败都已释放条目，不重复 abort。
     if (err != ESP_OK) {

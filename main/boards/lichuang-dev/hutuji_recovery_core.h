@@ -1048,11 +1048,15 @@ inline bool ParsePaperStatusFields(const std::string& line, PaperPresentState& p
         motor = MotorEnState::On;
     } else if (line.find("MotorEn=Off") != std::string::npos) {
         motor = MotorEnState::Off;
+    } else if (line.find("MotorEn=Unknown") != std::string::npos) {
+        motor = MotorEnState::Unknown;
     }
     if (line.find("PanelHold=On") != std::string::npos) {
         panel = PanelHoldState::On;
     } else if (line.find("PanelHold=Off") != std::string::npos) {
         panel = PanelHoldState::Off;
+    } else if (line.find("PanelHold=Unknown") != std::string::npos) {
+        panel = PanelHoldState::Unknown;
     }
     return true;
 }

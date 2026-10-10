@@ -101,7 +101,8 @@ inline std::string UrlEncode(const std::string& value) {
  */
 inline std::array<std::string, 4> BuildCommandSequence(const std::string& ssid,
                                                        const std::string& password) {
-    return {"[ESP100]" + ssid, "[ESP101]" + password, "[ESP110]STA", "[ESP444]RESTART"};
+    return {"[ESP100]" + ssid, password.empty() ? "[ESP101=]" : "[ESP101]" + password,
+            "[ESP110]STA", "[ESP444]RESTART"};
 }
 
 /** 命令 URL：固定打写字机出厂 AP 的 WebUI 命令面。 */

@@ -473,6 +473,8 @@ void PlotterProvision::ProvisionTask(bool manual) {
 
     // 2) 读回户网凭据（当前连接 SSID 对应的表项），先过写字机侧校验边界。
     {
+        home_ssid_.clear();
+        home_password_.clear();
         const std::string current = WifiManager::GetInstance().GetSsid();
         for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
             if (item.ssid == current) {

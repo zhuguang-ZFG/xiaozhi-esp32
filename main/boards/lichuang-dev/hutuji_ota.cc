@@ -6,6 +6,7 @@
 #include "display.h"
 #include "http.h"
 #include "mcp_server.h"
+#include "ota_validation.h"
 #include "settings.h"
 #include "system_info.h"
 
@@ -345,18 +346,17 @@ void RegisterTools(McpServer& mcp_server) {
     mcp_server.AddTool(
         "hutuji.ota_start",
         "开始从已签发的 HTTPS 地址升级本机固件。"
-        "参数 url/version/board 必填，sha256 可选。"
+        "参数 url/version/board/sha256 必填。"
         "仅 idle 且 board 匹配、URL host 在允许列表时受理；出图中会返回 reason=busy。"
         "成功受理后设备进入升级并可能重启；失败则恢复运行并回 status.ota.state=failed。",
-        PropertyList({Property("url", kPropertyTypeString), Property("version", kPropertyTypeString),
-                      Property("board", kPropertyTypeString),
-                      Property("sha256", kPropertyTypeString, std::string(""))}),
+        PropertyList(
+            {Property("url", kPropertyTypeString), Property("version", kPropertyTypeString),
+             Property("board", kPropertyTypeString), Property("sha256", kPropertyTypeString)}),
         [](const PropertyList& properties) -> ReturnValue {
             const std::string& url = properties["url"].value<std::string>();
             const std::string& version = properties["version"].value<std::string>();
             const std::string& board = properties["board"].value<std::string>();
             const std::string& sha256 = properties["sha256"].value<std::string>();
-            (void)sha256;  // 本批 Ota::Upgrade 无 sha 校验；门户已核包，参数仅契约对齐
 
             auto& app = Application::GetInstance();
             // 下载失败路径曾漏清 DeviceState=Upgrading；若 ota 已 failed 则先拉回 Idle 再判。
@@ -388,6 +388,17 @@ void RegisterTools(McpServer& mcp_server) {
             if (version.empty()) {
                 return MakeReasonJson("check_failed");
             }
+            if (!ValidFirmwareSha256(sha256)) {
+                return MakeReasonJson("check_failed");
+            }
+            std::array<uint32_t, 3> current_parts{}, target_parts{};
+            if (!ParseHutujiVersion(CurrentFirmwareVersion(), current_parts) ||
+                !ParseHutujiVersion(version, target_parts)) {
+                return MakeReasonJson("check_failed");
+            }
+            if (!IsStrictlyNewerHutujiVersion(CurrentFirmwareVersion(), version)) {
+                return MakeReasonJson("up_to_date");
+            }
 
             auto& job = Job::GetInstance();
             if (!job.TryReserveOta())
@@ -395,13 +406,14 @@ void RegisterTools(McpServer& mcp_server) {
             try {
                 job.SetOtaStatus("upgrading", 0, "");
                 job.SetOtaUpdateAvailable(true);
-                app.Schedule([url, version]() {
+                app.Schedule([url, version, sha256]() {
                     auto& current_job = Job::GetInstance();
                     bool ok = false;
                     try {
                         // 调度前已占用；执行点再确认所有权，不能仅信任旧的空闲快照。
-                        if (current_job.OtaReservationActive())
-                            ok = Application::GetInstance().UpgradeFirmware(url, version);
+                        if (current_job.OtaReservationActive() &&
+                            IsStrictlyNewerHutujiVersion(CurrentFirmwareVersion(), version))
+                            ok = Application::GetInstance().UpgradeFirmware(url, version, sha256);
                     } catch (...) {
                         ESP_LOGE(kTag, "ota_start upgrade exception");
                     }

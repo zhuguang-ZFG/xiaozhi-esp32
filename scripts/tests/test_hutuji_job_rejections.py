@@ -101,7 +101,11 @@ int main(int argc, char** argv) {
         job.pen_test_active_=scenario==3 || scenario==4;
         job.paper_active_=scenario==5;
         job.paused_=scenario==6;
-        result=(scenario==4 || scenario==7) ? job.RequestResume() : job.RequestPause();
+        if(scenario>=8){
+            job.state_=scenario<10?"awaiting_confirmation":"previewing";
+            job.awaiting_confirmation_=scenario<10;
+        }
+        result=(scenario==4 || scenario==7 || scenario==9 || scenario==11) ? job.RequestResume() : job.RequestPause();
         assert(Pipe::GetInstance().sends==0);
     }
     if (scenario==1) assert(result=="\"previewing\"");
@@ -132,6 +136,10 @@ int main(int argc, char** argv) {
     def test_paper_change_rejects_pause(self): self.run_case(5)
     def test_already_paused_is_success(self): self.run_case(6)
     def test_already_resumed_is_success(self): self.run_case(7)
+    def test_awaiting_rejects_pause(self): self.run_case(8)
+    def test_awaiting_rejects_resume(self): self.run_case(9)
+    def test_previewing_rejects_pause(self): self.run_case(10)
+    def test_previewing_rejects_resume(self): self.run_case(11)
 
 
 if __name__ == "__main__":

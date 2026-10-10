@@ -1300,6 +1300,12 @@ std::string Job::RequestPause() {
     if (paper_active_.load()) {
         return "{\"error\":\"换纸中无法暂停，换纸完成后可再试\"}";
     }
+    {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        if (awaiting_confirmation_.load() || (state_ != "streaming" && state_ != "paused")) {
+            return "{\"error\":\"当前没在出图\"}";
+        }
+    }
     if (paused_.exchange(true)) {
         return JsonString("已经是暂停状态");
     }
@@ -1338,6 +1344,12 @@ std::string Job::RequestResume() {
     // 与 RequestPause 对称：试笔期间两个工具给同一个解释。
     if (pen_test_active_.load()) {
         return "{\"error\":\"正在试笔，请稍候\"}";
+    }
+    {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        if (awaiting_confirmation_.load() || (state_ != "streaming" && state_ != "paused")) {
+            return "{\"error\":\"当前没在出图\"}";
+        }
     }
     if (!paused_.exchange(false)) {
         return JsonString("本来就没暂停");
@@ -2151,8 +2163,13 @@ std::string Job::StatusJson() const {
     cJSON_AddStringToObject(root, "last_line", pipe.GetLastLine().c_str());
     // P1-1：遥测三字段 + Changing 态随 status 上云（值来自最近一次 [ESP901] 应答解析）。
     cJSON_AddStringToObject(root, "paper", PaperPresentStateName(pipe.GetPaperPresentState()));
-    cJSON_AddStringToObject(root, "motor_en", MotorEnStateName(pipe.GetMotorEnState()));
-    cJSON_AddStringToObject(root, "panel_hold", PanelHoldStateName(pipe.GetPanelHoldState()));
+    // nopaper没有电机/压纸传感回读；不从Run或历史ESP901推断实时失能状态。
+    cJSON_AddStringToObject(
+        root, "motor_en",
+        pipe.IsNopaperMachine() ? "unknown" : MotorEnStateName(pipe.GetMotorEnState()));
+    cJSON_AddStringToObject(
+        root, "panel_hold",
+        pipe.IsNopaperMachine() ? "unknown" : PanelHoldStateName(pipe.GetPanelHoldState()));
     cJSON_AddStringToObject(root, "paper_changing",
                             pipe.GetPaperChangingState() == PaperChangingState::On    ? "on"
                             : pipe.GetPaperChangingState() == PaperChangingState::Off ? "off"

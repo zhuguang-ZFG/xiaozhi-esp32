@@ -35,6 +35,7 @@ def compile_run(program):
 
 PROGRAM = r'''
 #include <cassert>
+#include "main/ota_validation.h"
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -89,7 +90,8 @@ struct Application {
     int GetDeviceState() { return state; }
     void SetDeviceState(int s) { state=s; }
     void Schedule(std::function<void()> f) { if (fail_schedule) throw std::runtime_error("schedule"); queue.push_back(f); }
-    bool UpgradeFirmware(std::string, std::string) {
+    bool UpgradeFirmware(std::string, std::string, std::string sha) {
+        assert(sha==std::string(64,'a'));
         ++upgrades;
         saw_active_job = Job::GetInstance().state_ == "streaming";
         return false;
@@ -105,6 +107,8 @@ CheckResult RunOtaCheck(bool) { return {}; }
 std::string MakeCheckJson(bool,std::string,std::string,std::string,std::string) { return "{}"; }
 std::string MakeReasonJson(std::string s) { return s; }
 bool HostAllowed(const std::string&) { return true; }
+std::string current_version="hutuji.1.0.38";
+std::string CurrentFirmwareVersion(){return current_version;}
 bool JobIsIdleForOta() { return Job::GetInstance().state_ == "idle"; }
 @@METHODS@@
 @@REGISTER@@
@@ -113,11 +117,19 @@ bool JobIsIdleForOta() { return Job::GetInstance().state_ == "idle"; }
 int main() {
     McpServer server;
     RegisterTools(server);
-    PropertyList args{{"url",1,"https://example.invalid/fw.bin"}, {"version",1,"2"},
-                      {"board",1,BOARD_NAME}, {"sha256",1,""}};
+    PropertyList args{{"url",1,"https://example.invalid/fw.bin"}, {"version",1,"hutuji.1.0.39"},
+                      {"board",1,BOARD_NAME}, {"sha256",1,std::string(64,'a')}};
     auto& app = Application::GetInstance();
     auto& job = Job::GetInstance();
     auto start = [&] { return server.callbacks.at("hutuji.ota_start")(args); };
+    for(const char* v:{"hutuji.1.0.38","hutuji.1.0.37","garbage","hutuji.1.0.39.x","hutuji.1.0.039"}){
+        args.fields.at("version").data=v;
+        assert(start()==(std::string(v)=="hutuji.1.0.38" || std::string(v)=="hutuji.1.0.37" ? "up_to_date" : "check_failed") && app.queue.empty());
+    }
+    args.fields.at("version").data="hutuji.1.0.39";
+    args.fields.at("sha256").data=std::string(64,'z');
+    assert(start()=="check_failed" && app.queue.empty());
+    args.fields.at("sha256").data=std::string(64,'a');
     assert(start() == "{\"ok\":true}");
     assert(start() == "busy" && app.queue.size() == 1);
     assert(job.busy_ && job.OtaReservationActive());
@@ -149,6 +161,11 @@ int main() {
     job.ReleaseOtaReservation();
     app.queue.front()();
     assert(app.upgrades == 1); // 执行点所有权已失效，不可刷写。
+    app.queue.clear();
+    assert(start()=="{\"ok\":true}");
+    current_version="hutuji.1.0.39";
+    app.queue.front()();
+    assert(app.upgrades==1 && !job.OtaReservationActive());
 }
 '''
 
