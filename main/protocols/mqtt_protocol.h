@@ -41,6 +41,9 @@ private:
     EventGroupHandle_t event_group_handle_;
 
     std::string publish_topic_;
+    // OpenAudioChannel 正在等待 hello 响应；MQTT 回调线程据此丢弃迟到 hello，
+    // 避免超时放弃后的迟到响应污染下一次开启（2026-08-22 HIL 坐实）。
+    std::atomic<bool> hello_pending_{false};
 
     mutable std::mutex channel_mutex_;
     std::mutex crypto_mutex_;

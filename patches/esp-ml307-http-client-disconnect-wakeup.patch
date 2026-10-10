@@ -1,0 +1,17 @@
+--- a/managed_components/78__esp-ml307/src/http_client.cc
++++ b/managed_components/78__esp-ml307/src/http_client.cc
+@@ -291,6 +291,14 @@
+     } else {
+         // 数据完整或还未开始接收响应体，正常结束
+         eof_ = true;
++    }
++
++    // 2026-09-06 hutuji 修复（R4）：头部未收齐就断连时，必须唤醒 GetStatusCode 的
++    // xEventGroupWaitBits(HEADERS_RECEIVED|ERROR) —— 它不听 cv_，此前断连后白等满
++    // timeout（60s）才报「Wait for HTTP headers receive timeout」（预览卡死现场实测）。
++    // 本组件在 managed_components/，重拉取会覆盖本改动；升级 78__esp-ml307 时须携带此补丁。
++    if (!headers_received_) {
++        xEventGroupSetBits(event_group_handle_, EC801E_HTTP_EVENT_ERROR);
+     }
+ 
+     cv_.notify_all();  // 通知所有等待的读取操作
