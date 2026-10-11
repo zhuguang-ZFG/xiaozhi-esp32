@@ -162,6 +162,8 @@ int main(int argc,char**argv){
     if(scenario==0)assert(p.commands.size()==(test_mode==4?1u:3u));
 }
 '''
+STUB = STUB.replace("D:/Users/xiaozhi-esp32/", Path(__file__).resolve().parents[2].as_posix() + "/")
+
 def program():
     root=Path(os.environ.get('XIAOZHI_ROOT',Path(__file__).resolve().parents[2]))
     base=root/'main/boards/lichuang-dev'
