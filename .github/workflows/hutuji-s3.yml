@@ -11,9 +11,14 @@ jobs:
   host:
     runs-on: ubuntu-24.04
     env:
-      CXX: g++
+      CXX: /usr/bin/g++
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: DaveGamble/cJSON
+          ref: v1.7.19
+          path: managed_components/espressif__cjson/cJSON
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
