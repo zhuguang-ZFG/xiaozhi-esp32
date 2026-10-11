@@ -23,7 +23,7 @@ class JobRejectionTest(unittest.TestCase):
         cls.exe = cpp.with_suffix(".exe" if os.name == "nt" else "")
         source = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
         methods = "\n".join(function(source, "std::string Job::" + name + "(")
-                            for name in ("StartDraw", "RequestPause", "RequestResume"))
+                            for name in ("StartDraw", "RequestAbort", "RequestPause", "RequestResume"))
         headers = Path(os.environ.get("XIAOZHI_HEADERS_ROOT", ROOT))
         core = (headers / "main/boards/lichuang-dev/hutuji_recovery_core.h").read_text(encoding="utf-8")
         duplicate = function(core, "inline constexpr bool IsDuplicatePreviewReentry(")
@@ -42,7 +42,16 @@ struct Pipe {
     bool IsConnected() { return true; }
     bool IsReady() { return true; }
     int sends=0;
+    unsigned connection=7, banner=4;
     bool SendRealtime(char) { ++sends; return true; }
+    bool SendFeedHoldForSession(unsigned expected_connection,unsigned expected_banner) {
+        if (connection!=expected_connection || banner!=expected_banner) return false;
+        ++sends;return true;
+    }
+    bool SendResumeForSession(unsigned expected_connection,unsigned expected_banner) {
+        if (connection!=expected_connection || banner!=expected_banner) return false;
+        ++sends;return true;
+    }
 };
 namespace hutuji {
     bool NopaperRejectsMultiPage(bool nopaper, size_t n) { return nopaper && n>1; }
@@ -77,12 +86,18 @@ struct Job {
         repeat_mode_{false}, abort_home_done_{false}, buffer_replayable_{false}, prefetch_cancel_{false},
         pen_test_active_{false};
     bool finishing_at_home_=false;
+    unsigned stream_connection_seq_=7,stream_banner_seq_=4;
+    int abort_workers=0;
+    void ClearPreview() {}
+    void Notify(const std::string&) {}
+    bool StartAbortDrainHomeTask() { ++abort_workers; return true; }
     bool GetPaperConfig(PaperConfig&) { return true; }
     bool ResetAbortResetState() { return true; }
     void CancelPrefetch() {}
     void SetState(const char* s) { state_=s; }
     static void PreviewTaskEntry(void*) {}
     std::string StartDraw(const std::string&,const std::string&,const std::string&);
+    std::string RequestAbort();
     std::string RequestPause();
     std::string RequestResume();
 };
@@ -92,6 +107,29 @@ int main(int argc, char** argv) {
     const int scenario=std::atoi(argv[1]);
     Job job;
     std::string result;
+    if (scenario>=14 && scenario<18) {
+        const bool was_paused=(scenario%2)==1;
+        job.paused_=was_paused;
+        job.state_=was_paused ? "paused" : "streaming";
+        const auto before_state=job.state_;
+        assert(job.RequestAbort()==JsonString("ok"));
+        assert(job.abort_requested_ && job.abort_workers==1 && job.busy_);
+        const auto stop_epoch=job.stream_control_epoch_.load();
+        result=scenario<16 ? job.RequestPause() : job.RequestResume();
+        assert(result.find("\"error\":")!=std::string::npos);
+        assert(Pipe::GetInstance().sends==0);
+        assert(job.paused_==was_paused && job.state_==before_state);
+        assert(job.stream_control_epoch_==stop_epoch && job.abort_requested_ && job.busy_);
+        assert(job.RequestAbort()==JsonString("停止处理中") && job.abort_workers==1);
+        return 0;
+    }
+    if (scenario==18) {
+        assert(job.RequestPause()==JsonString("ok"));
+        assert(job.paused_ && job.state_=="paused" && Pipe::GetInstance().sends==1);
+        assert(job.RequestResume()==JsonString("ok"));
+        assert(!job.paused_ && job.state_=="streaming" && Pipe::GetInstance().sends==2);
+        return 0;
+    }
     if (scenario<3) {
         job.state_=scenario==0 ? "streaming" : "awaiting_confirmation";
         result=job.StartDraw(scenario==1 ? "old.gcode" : "new.gcode",
@@ -101,11 +139,16 @@ int main(int argc, char** argv) {
         job.pen_test_active_=scenario==3 || scenario==4;
         job.paper_active_=scenario==5;
         job.paused_=scenario==6;
-        if(scenario>=8){
+        if(scenario>=12){
+            Pipe::GetInstance().connection=8;
+            job.paused_=scenario==13;
+            job.state_=scenario==13 ? "paused" : "streaming";
+        }
+        if(scenario>=8 && scenario<12){
             job.state_=scenario<10?"awaiting_confirmation":"previewing";
             job.awaiting_confirmation_=scenario<10;
         }
-        result=(scenario==4 || scenario==7 || scenario==9 || scenario==11) ? job.RequestResume() : job.RequestPause();
+        result=(scenario==4 || scenario==7 || scenario==9 || scenario==11 || scenario==13) ? job.RequestResume() : job.RequestPause();
         assert(Pipe::GetInstance().sends==0);
     }
     if (scenario==1) assert(result=="\"previewing\"");
@@ -140,6 +183,13 @@ int main(int argc, char** argv) {
     def test_awaiting_rejects_resume(self): self.run_case(9)
     def test_previewing_rejects_pause(self): self.run_case(10)
     def test_previewing_rejects_resume(self): self.run_case(11)
+    def test_new_session_rejects_pause(self): self.run_case(12)
+    def test_new_session_rejects_resume(self): self.run_case(13)
+    def test_stop_rejects_late_pause_while_streaming(self): self.run_case(14)
+    def test_stop_rejects_late_pause_while_paused(self): self.run_case(15)
+    def test_stop_rejects_late_resume_while_streaming(self): self.run_case(16)
+    def test_stop_rejects_late_resume_while_paused(self): self.run_case(17)
+    def test_pause_resume_round_trip_before_stop(self): self.run_case(18)
 
 
 if __name__ == "__main__":

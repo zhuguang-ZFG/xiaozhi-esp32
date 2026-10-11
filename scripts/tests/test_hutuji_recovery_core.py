@@ -2074,24 +2074,6 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn("if (err == 90)", body)
         self.assertIn("纸张用完或未放好，请整理好纸张后再试", body)
 
-    def test_busy_done_repeat_wording(self):
-        """R21-F14：busy 裸英文 token 不得存在；repeat 有起始播报；done 话术带
-        「再来一次」引导（出图成功 buffer 留存，重画真实可用）。"""
-        source = (
-            ROOT / "main/boards/lichuang-dev/hutuji_job.cc"
-        ).read_text(encoding="utf-8")
-        self.assertNotIn('JsonString("busy")', source)
-        # 五个入口都保留中文拒绝原因，并用 error 对象让调用方正确判败。
-        self.assertNotIn('JsonString("写字机正忙，请稍候再试")', source)
-        self.assertEqual(source.count('写字机正忙，请稍候再试'), 5)
-        speed = source.split("std::string Job::RequestSpeed(", 1)[1].split(
-            "void Job::SpeedTaskEntry", 1
-        )[0]
-        self.assertIn('写字机正忙，请稍候再试', speed)
-        self.assertNotIn('WaitResponse', speed)
-        self.assertIn('SpeedTaskEntry', speed)
-        self.assertIn('Notify("出图完成，可以说「再来一次」直接重画")', source)
-        self.assertIn('Notify("开始重画")', source)
 
     def test_reconnect_wait_has_heartbeat(self):
         """R21-F06/F12：断连恢复重连等待（最长 120s）必须有 30s 进展播报；

@@ -161,8 +161,11 @@ void Pipe::PipeTask() {
             std::lock_guard<std::mutex> lock(write_mutex_);
             // 撤销旧 token 与新 session 发布在线性化点内完成。
             abort_reset_token_.Cancel();
-            connection_seq_.fetch_add(1);
-            connected_.store(true);
+            {
+                std::lock_guard<std::mutex> socket_lock(sock_mutex_);
+                connection_seq_.fetch_add(1);
+                connected_.store(true);
+            }
             if (!task_session_active_.load()) {
                 SendRawLocked("$I\n", 3);
             }
@@ -610,6 +613,11 @@ void Pipe::CancelAbortReset() {
 }
 
 bool Pipe::SendRawLocked(const char* data, size_t len, bool feed_hold_priority) {
+    return SendRawLockedForSession(data, len, feed_hold_priority, 0, 0);
+}
+
+bool Pipe::SendRawLockedForSession(const char* data, size_t len, bool feed_hold_priority,
+                                   uint32_t expected_connection, uint32_t expected_banner) {
     size_t sent = 0;
     int send_errno = 0;
     int last_result = -1;
@@ -643,6 +651,10 @@ bool Pipe::SendRawLocked(const char* data, size_t len, bool feed_hold_priority) 
         {
             const uint32_t lock_began = static_cast<uint32_t>(xTaskGetTickCount());
             std::lock_guard<std::mutex> lock(sock_mutex_);
+            if (expected_connection != 0 &&
+                !IsCommandSessionCurrent(expected_connection, expected_banner)) {
+                return false;
+            }
             const uint32_t call_began = static_cast<uint32_t>(xTaskGetTickCount());
             diag_sock_ticks += call_began - lock_began;
             if (sock_ < 0) {
@@ -804,9 +816,13 @@ void Pipe::ProcessLine(const std::string& line, uint32_t receive_epoch) {
 
     if (line.rfind("Grbl ", 0) == 0) {
         std::lock_guard<std::mutex> write_lock(write_mutex_);
-        const uint32_t banner_generation = reset_banner_seq_.fetch_add(1) + 1U;
-        ready_.store(false);
-        authorized_.store(false);
+        uint32_t banner_generation;
+        {
+            std::lock_guard<std::mutex> socket_lock(sock_mutex_);
+            banner_generation = reset_banner_seq_.fetch_add(1) + 1U;
+            ready_.store(false);
+            authorized_.store(false);
+        }
         ResetSettingsFingerprintState();
         const bool recover_abort =
             abort_reset_token_.Consume(connection_seq_.load(), banner_generation, receive_epoch);
@@ -1299,6 +1315,21 @@ bool Pipe::SendResumeForSession(uint32_t connection, uint32_t banner) {
     }
     const char resume = '~';
     return SendRawLocked(&resume, 1);
+}
+
+bool Pipe::SendFeedHoldForSession(uint32_t connection, uint32_t banner) {
+    if (!IsCommandSessionCurrent(connection, banner)) {
+        return false;
+    }
+    // 普通行在 write_mutex_ 下可能背压；实时暂停继续走原抢占快路。
+    feed_hold_waiters_.fetch_add(1, std::memory_order_acq_rel);
+    const char hold = '!';
+    const bool sent = SendRawLockedForSession(&hold, 1, true, connection, banner);
+    feed_hold_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+    if (!sent && IsCommandSessionCurrent(connection, banner)) {
+        ShutdownSocket(connection);
+    }
+    return sent;
 }
 
 bool Pipe::SendLineLocked(const std::string& line) {

@@ -1171,16 +1171,22 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     audio_service_.Stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    bool upgrade_success = Ota::Upgrade(
-        upgrade_url,
-        [this, display](int progress, size_t speed) {
-            char buffer[32];
-            snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
-            Schedule([display, message = std::string(buffer)]() {
-                display->SetChatMessage("system", message.c_str());
-            });
-        },
-        expected_sha256, version);
+    bool upgrade_success = false;
+    try {
+        upgrade_success = Ota::Upgrade(
+            upgrade_url,
+            [this, display](int progress, size_t speed) {
+                char buffer[32];
+                snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
+                Schedule([display, message = std::string(buffer)]() {
+                    display->SetChatMessage("system", message.c_str());
+                });
+            },
+            expected_sha256, version);
+    } catch (...) {
+        ESP_LOGE(TAG, "Firmware upgrade exception");
+        upgrade_success = false;
+    }
 
     if (!upgrade_success) {
         // Upgrade failed, restart audio service and continue running

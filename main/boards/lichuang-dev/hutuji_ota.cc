@@ -160,6 +160,26 @@ bool ExtractHttpsHost(const std::string& url, std::string& host_out) {
     if (url.size() < 8 || url.compare(0, 8, kPrefix) != 0) {
         return false;
     }
+    // authority中的用户信息和反斜杠会让字符串前缀与HTTP实际目标产生歧义。
+    const size_t authority_end = url.find_first_of("/?#", 8);
+    const std::string authority =
+        url.substr(8, authority_end == std::string::npos ? std::string::npos : authority_end - 8);
+    if (authority.find_first_of("@\\") != std::string::npos ||
+        std::any_of(authority.begin(), authority.end(),
+                    [](unsigned char c) { return c <= 0x20 || c >= 0x7f; })) {
+        return false;
+    }
+    const size_t colon = authority.find(':');
+    if (colon != std::string::npos) {
+        const std::string port = authority.substr(colon + 1);
+        if (port.empty() || port.size() > 5 ||
+            !std::all_of(port.begin(), port.end(),
+                         [](unsigned char c) { return c >= '0' && c <= '9'; }))
+            return false;
+        const int number = std::stoi(port);
+        if (number < 1 || number > 65535)
+            return false;
+    }
     size_t host_start = 8;
     size_t host_end = url.find_first_of("/:?#", host_start);
     if (host_end == std::string::npos) {
@@ -198,6 +218,36 @@ bool HostAllowed(const std::string& url) {
         }
     }
     return false;
+}
+
+bool FirmwareUrlMatchesBoard(const std::string& url, const std::string& version) {
+    const std::string expected =
+        std::string("/firmware/s3/") + BOARD_NAME + "/" + version + "/xiaozhi.bin";
+    const size_t path_start = url.find_first_of("/?#", 8);  // 跳过HTTPS协议前缀。
+    if (path_start == std::string::npos || url[path_start] != '/' ||
+        url.find('#', path_start) != std::string::npos) {
+        return false;
+    }
+    const size_t query_start = url.find('?', path_start);
+    const size_t path_length =
+        (query_start == std::string::npos ? url.size() : query_start) - path_start;
+    if (url.compare(path_start, path_length, expected) != 0) {
+        return false;
+    }
+    if (query_start == std::string::npos) {
+        return true;
+    }
+    // Portal的下载能力地址可附短期签名；只接受现有exp/sig两字段的规范形状。
+    const size_t exp_start = query_start + 5;
+    const size_t sig_mark = url.find("&sig=", exp_start);
+    if (url.compare(query_start, 5, "?exp=") != 0 || sig_mark == std::string::npos ||
+        sig_mark == exp_start || sig_mark - exp_start > 16 ||
+        !std::all_of(url.begin() + exp_start, url.begin() + sig_mark,
+                     [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+        return false;
+    }
+    const std::string signature = url.substr(sig_mark + 5);
+    return ValidFirmwareSha256(signature);
 }
 
 bool JobIsIdleForOta() {
@@ -387,6 +437,9 @@ void RegisterTools(McpServer& mcp_server) {
             }
             if (version.empty()) {
                 return MakeReasonJson("check_failed");
+            }
+            if (!FirmwareUrlMatchesBoard(url, version)) {
+                return MakeReasonJson("board_mismatch");
             }
             if (!ValidFirmwareSha256(sha256)) {
                 return MakeReasonJson("check_failed");

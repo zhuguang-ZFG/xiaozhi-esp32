@@ -22,6 +22,8 @@ PROGRAM=r'''
 #include <mutex>
 #include <string>
 #include <vector>
+#include <future>
+#include <chrono>
 #include "@@CORE@@"
 #include "@@SPEED@@"
 using namespace hutuji;
@@ -49,6 +51,7 @@ struct Pipe {
     WriterMutex write_mutex_;
     std::atomic<bool> connected_{true},ready_{true},authorized_{true},settings_verified_{true},task_session_active_{true},drain_on_send_{true};
     std::atomic<uint32_t> connection_seq_{7},reset_banner_seq_{9};
+    std::atomic<uint32_t> feed_hold_waiters_{0};
     uint32_t status_seq=0;
     int old_writes=0,new_writes=0,shutdowns=0;
     MachineSpeedSnapshot speed{{10000,10000,1200},{0,0,0}};
@@ -80,10 +83,18 @@ struct Pipe {
         }
         return true;
     }
+    bool SendRawLockedForSession(const char* data,size_t size,bool priority,uint32_t connection,uint32_t banner){
+        assert(priority);
+        if(test_mode==4 && scenario==6)++connection_seq_;
+        if(test_mode==4 && scenario==7)++reset_banner_seq_;
+        if(!IsCommandSessionCurrent(connection,banner))return false;
+        return SendRawLocked(data,size);
+    }
     bool SendLine(const std::string&);
     bool SendLineLocked(const std::string&);
     bool SendLineForSession(const std::string&,uint32_t,uint32_t);
     bool SendResumeForSession(uint32_t,uint32_t);
+    bool SendFeedHoldForSession(uint32_t,uint32_t);
     bool IsCommandSessionCurrent(uint32_t,uint32_t) const;
 };
 void vTaskDelay(uint32_t ms){
@@ -134,7 +145,18 @@ struct Job {
 
 int main(int argc,char**argv){
     test_mode=std::stoi(argv[1]);scenario=std::stoi(argv[2]);Job job;auto& pipe=Pipe::GetInstance();
-    if(test_mode==3){
+    if(test_mode==4){
+        const bool result=pipe.SendFeedHoldForSession(7,9);
+        assert(result==(scenario==0));
+        assert(pipe.commands.size()==(scenario==0?1u:0u));
+        assert(pipe.new_writes==0 && pipe.feed_hold_waiters_==0);
+        if(result)assert(pipe.commands[0]=="!");
+    }else if(test_mode==5){
+        pipe.write_mutex_.value.lock();
+        auto pending=std::async(std::launch::async,[&]{return pipe.SendFeedHoldForSession(7,9);});
+        assert(pending.wait_for(std::chrono::milliseconds(100))==std::future_status::ready);
+        assert(pending.get());pipe.write_mutex_.value.unlock();
+    }else if(test_mode==3){
         const bool result=pipe.SendResumeForSession(7,9);
         assert(result==(scenario==0));
         assert(pipe.commands.size()==(scenario==0?1u:0u));
@@ -169,6 +191,7 @@ class TransactionSessionTest(unittest.TestCase):
         job=(base/"hutuji_job.cc").read_text(encoding="utf-8")
         names=["bool Pipe::SendLine(","bool Pipe::SendLineLocked(","bool Pipe::IsCommandSessionCurrent(","bool Pipe::SendLineForSession("]
         if "bool Pipe::SendResumeForSession(" in pipe:names.append("bool Pipe::SendResumeForSession(")
+        if "bool Pipe::SendFeedHoldForSession(" in pipe:names.append("bool Pipe::SendFeedHoldForSession(")
         methods="\n".join(function(pipe,name) for name in names)
         methods=methods.replace("std::lock_guard<std::mutex> lock(write_mutex_);","std::lock_guard<WriterMutex> lock(write_mutex_);")
         names=["bool Job::WaitForIdle(","bool Job::ReturnHomeAfterDraw(","bool Job::PerformAbortDrainHome(","void Job::RunSpeedUpdate("]
@@ -195,5 +218,7 @@ for case,label in enumerate(("success","writer_reconnect","writer_reset","queued
     setattr(TransactionSessionTest,"test_speed_"+label,case_method(2,case))
 for case,label in ((0,"success"),(6,"reconnect"),(7,"reset")):
     setattr(TransactionSessionTest,"test_resume_"+label,case_method(3,case))
+    setattr(TransactionSessionTest,"test_feed_hold_"+label,case_method(4,case))
+setattr(TransactionSessionTest,"test_feed_hold_preempts_busy_writer",case_method(5,0))
 
 if __name__=="__main__":unittest.main()

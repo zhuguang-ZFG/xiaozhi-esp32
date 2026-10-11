@@ -35,6 +35,8 @@ def compile_run(program):
 
 PROGRAM = r'''
 #include <cassert>
+#include <algorithm>
+#include <sstream>
 #include "main/ota_validation.h"
 #include <atomic>
 #include <mutex>
@@ -106,7 +108,11 @@ struct CheckResult { bool update_available=false; std::string current,latest,not
 CheckResult RunOtaCheck(bool) { return {}; }
 std::string MakeCheckJson(bool,std::string,std::string,std::string,std::string) { return "{}"; }
 std::string MakeReasonJson(std::string s) { return s; }
-bool HostAllowed(const std::string&) { return true; }
+struct Settings{Settings(const char*,bool){}std::string GetString(const char*){return "";}};
+const char* kNvsNs="ota";
+const char* kNvsAllowedHosts="hosts";
+const char* kDefaultAllowedHost="hutuji.donglicao.com";
+@@HOST_GUARD@@
 std::string current_version="hutuji.1.0.38";
 std::string CurrentFirmwareVersion(){return current_version;}
 bool JobIsIdleForOta() { return Job::GetInstance().state_ == "idle"; }
@@ -117,19 +123,32 @@ bool JobIsIdleForOta() { return Job::GetInstance().state_ == "idle"; }
 int main() {
     McpServer server;
     RegisterTools(server);
-    PropertyList args{{"url",1,"https://example.invalid/fw.bin"}, {"version",1,"hutuji.1.0.39"},
+    PropertyList args{{"url",1,"https://hutuji.donglicao.com/firmware/s3/test-board/hutuji.1.0.39/xiaozhi.bin"}, {"version",1,"hutuji.1.0.39"},
                       {"board",1,BOARD_NAME}, {"sha256",1,std::string(64,'a')}};
     auto& app = Application::GetInstance();
     auto& job = Job::GetInstance();
     auto start = [&] { return server.callbacks.at("hutuji.ota_start")(args); };
     for(const char* v:{"hutuji.1.0.38","hutuji.1.0.37","garbage","hutuji.1.0.39.x","hutuji.1.0.039"}){
         args.fields.at("version").data=v;
+        args.fields.at("url").data=std::string("https://hutuji.donglicao.com/firmware/s3/test-board/")+v+"/xiaozhi.bin";
         assert(start()==(std::string(v)=="hutuji.1.0.38" || std::string(v)=="hutuji.1.0.37" ? "up_to_date" : "check_failed") && app.queue.empty());
     }
     args.fields.at("version").data="hutuji.1.0.39";
+    args.fields.at("url").data="https://hutuji.donglicao.com/firmware/s3/other-board/hutuji.1.0.39/xiaozhi.bin";
+    assert(start() == "board_mismatch" && app.queue.empty());
+    args.fields.at("url").data="https://hutuji.donglicao.com/firmware/s3/test-board/hutuji.1.0.39/xiaozhi.bin?redirect=other-board";
+    assert(start() == "board_mismatch" && app.queue.empty());
+    args.fields.at("url").data="https://hutuji.donglicao.com?ignored/firmware/s3/test-board/hutuji.1.0.39/xiaozhi.bin";
+    assert(start() == "board_mismatch" && app.queue.empty());
+    args.fields.at("url").data="https://hutuji.donglicao.com/firmware/s3/test-board/hutuji.1.0.39/xiaozhi.bin";
+    assert(FirmwareUrlMatchesBoard(args.fields.at("url").data+"?exp=1791650000&sig="+std::string(64,'a'),"hutuji.1.0.39"));
     args.fields.at("sha256").data=std::string(64,'z');
     assert(start()=="check_failed" && app.queue.empty());
     args.fields.at("sha256").data=std::string(64,'a');
+    const auto valid_url=args.fields.at("url").data;
+    args.fields.at("url").data="https://hutuji.donglicao.com:443@other.invalid/firmware/s3/test-board/hutuji.1.0.39/xiaozhi.bin";
+    assert(start()=="check_failed" && app.queue.empty());
+    args.fields.at("url").data=valid_url+"?exp=1791650000&sig="+std::string(64,'a');
     assert(start() == "{\"ok\":true}");
     assert(start() == "busy" && app.queue.size() == 1);
     assert(job.busy_ && job.OtaReservationActive());
@@ -177,7 +196,9 @@ class OtaReservationTest(unittest.TestCase):
         ota = (base / "hutuji_ota.cc").read_text(encoding="utf-8")
         methods = "\n".join(function(job, name) for name in (
             "bool Job::TryReserveOta(", "bool Job::OtaReservationActive(", "void Job::ReleaseOtaReservation("))
-        program = PROGRAM.replace("@@METHODS@@", methods).replace("@@REGISTER@@", function(ota, "void RegisterTools("))
+        url_guard = function(ota, "bool FirmwareUrlMatchesBoard(")
+        host_guard = function(ota, "bool ExtractHttpsHost(") + function(ota, "bool HostAllowed(")
+        program = PROGRAM.replace("@@HOST_GUARD@@", host_guard).replace("@@METHODS@@", methods).replace("@@REGISTER@@", url_guard + "\n" + function(ota, "void RegisterTools("))
         compile_run(program)
 
     def test_motion_controls_use_same_ota_owner(self):

@@ -1306,6 +1306,10 @@ std::string Job::RequestPause() {
             return "{\"error\":\"当前没在出图\"}";
         }
     }
+    // 停止归位期间仍保留绘图状态，但控制权已交给收尾 worker。
+    if (abort_requested_.load()) {
+        return "{\"error\":\"写字机正忙，请稍候再试\"}";
+    }
     if (paused_.exchange(true)) {
         return JsonString("已经是暂停状态");
     }
@@ -1315,7 +1319,7 @@ std::string Job::RequestPause() {
         std::memory_order_release);
     // `!` 进给保持：Grbl 减速停住，planner 内容保留，`~` 可原地续跑。
     // 发送失败时回滚本地状态，不能把断链说成已暂停。
-    if (!Pipe::GetInstance().SendRealtime('!')) {
+    if (!Pipe::GetInstance().SendFeedHoldForSession(stream_connection_seq_, stream_banner_seq_)) {
         paused_.store(false);
         stream_control_epoch_.store(
             NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
@@ -1351,10 +1355,13 @@ std::string Job::RequestResume() {
             return "{\"error\":\"当前没在出图\"}";
         }
     }
+    if (abort_requested_.load()) {
+        return "{\"error\":\"写字机正忙，请稍候再试\"}";
+    }
     if (!paused_.exchange(false)) {
         return JsonString("本来就没暂停");
     }
-    if (!Pipe::GetInstance().SendRealtime('~')) {
+    if (!Pipe::GetInstance().SendResumeForSession(stream_connection_seq_, stream_banner_seq_)) {
         paused_.store(true);
         // 恢复失败的 paused 回滚与 pause/abort 提交同样推进纪元，拒绝旧候选行。
         stream_control_epoch_.store(

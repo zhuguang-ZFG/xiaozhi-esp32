@@ -65,6 +65,8 @@ public:
     bool SendManualReset(uint32_t connection, uint32_t banner);
     /** 停止归位退出Hold：只恢复原会话，不能把旧任务的~发给重连后的设备。 */
     bool SendResumeForSession(uint32_t connection, uint32_t banner);
+    /** 当前绘图会话暂停：只向任务绑定的连接发送!，拒绝重连后的新会话。 */
+    bool SendFeedHoldForSession(uint32_t connection, uint32_t banner);
     /** 已归位任务专用：单写者锁内复核同一连接/横幅及新鲜 Idle，仅发送固定 $MD。 */
     bool SendMotorDisableAtIdle(uint32_t connection, uint32_t banner, uint32_t previous_status);
 
@@ -238,6 +240,8 @@ private:
     void CloseSocketLocked();  // write_mutex_ 已持有
     // feed_hold_priority=true 仅供单字节 `!`；它不占 write_mutex_，可在普通发送重试间隙抢占。
     bool SendRawLocked(const char* data, size_t len, bool feed_hold_priority = false);
+    bool SendRawLockedForSession(const char* data, size_t len, bool feed_hold_priority,
+                                 uint32_t expected_connection, uint32_t expected_banner);
     bool SendLineLocked(const std::string& line);
     bool IsCommandSessionCurrent(uint32_t connection, uint32_t banner) const;
     bool SendFeedHold();
