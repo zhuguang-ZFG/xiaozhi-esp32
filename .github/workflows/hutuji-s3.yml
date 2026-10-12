@@ -31,6 +31,7 @@ jobs:
           for patch in patches/esp-ml307-*.patch; do
             git apply --recount -p1 "$patch"
           done
+          printf '%s\n' 5443836acc5bb9478d9d93c8178cd52a0a53be13470e006656d751e96cf33f9c > managed_components/78__esp-ml307/.component_hash
           python scripts/gen_lang.py --language zh-CN --output main/assets/lang_config.h
       - uses: actions/setup-python@v5
         with:
@@ -62,6 +63,7 @@ jobs:
           for patch in patches/esp-ml307-*.patch; do
             git apply --recount -p1 "$patch"
           done
+          printf '%s\n' 5443836acc5bb9478d9d93c8178cd52a0a53be13470e006656d751e96cf33f9c > managed_components/78__esp-ml307/.component_hash
           python scripts/gen_lang.py --language zh-CN --output main/assets/lang_config.h
       - name: 构建交付板型
         shell: bash
