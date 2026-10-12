@@ -101,11 +101,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          repository: DaveGamble/cJSON
-          ref: v1.7.19
-          path: managed_components/espressif__cjson/cJSON
+      # 固件依赖由 IDF 下载完整组件与校验元数据；裸 cJSON 检出仅供宿主测试。
       - uses: actions/checkout@v4
         with:
           repository: 78/esp-ml307
@@ -152,11 +148,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          repository: DaveGamble/cJSON
-          ref: v1.7.19
-          path: managed_components/espressif__cjson/cJSON
+      # 固件依赖由 IDF 下载完整组件与校验元数据；裸 cJSON 检出仅供宿主测试。
       - uses: actions/checkout@v4
         with:
           repository: 78/esp-ml307
