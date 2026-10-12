@@ -121,9 +121,9 @@ jobs:
         shell: bash
         run: |
           source $IDF_PATH/export.sh
-          # esp-p4-function-ev-board 的 BSP 5.2.3 仍约束 esp_video ~2.0；仅该板在
-          # CI 工作副本临时降版，产品板继续使用仓内锁定的 2.3.*。
-          if [[ "${{ matrix.board }}" == "esp-p4-function-ev-board" ]]; then
+          # 所有 ESP32-P4 变体都会启用 BSP 5.2.3，而该 BSP 约束 esp_video ~2.0；
+          # 只在 CI 工作副本按 target 临时降版，S3/C3 产品板继续使用仓内 2.3.*。
+          if [[ "${{ matrix.target }}" == "esp32p4" ]]; then
             sed -i 's/version: 2\.3\.\*/version: 2.0.*/' main/idf_component.yml
             grep -F 'version: 2.0.*' main/idf_component.yml
           fi
