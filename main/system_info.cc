@@ -9,6 +9,7 @@
 #include <esp_app_desc.h>
 #include <esp_ota_ops.h>
 #include <esp_pm.h>
+
 #if CONFIG_IDF_TARGET_ESP32P4 && !CONFIG_XIAOZHI_NETWORK_ETHERNET
 #include "esp_wifi_remote.h"
 #endif
@@ -147,11 +148,28 @@ void SystemInfo::PrintTaskList() {
     ESP_LOGI(TAG, "Task list: \n%s", buffer);
 }
 
-void SystemInfo::PrintHeapStats() {
-    int free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    int min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG, "free sram: %u minimal sram: %u", free_sram, min_free_sram);
+void SystemInfo::LogHeapNow(const char* phase) {
+    // 取证口径（2026-09-06 预览卡死定位）：internal 三项 + DMA 两项 + PSRAM 三项。
+    // DMA 两项是真闸门：TLS 读记录时 AES-DMA 需要 ≤1600B 的 MALLOC_CAP_DMA|INTERNAL
+    // 对齐块（esp_aes_dma_core.c），INTERNAL 的 largest 含非 DMA 区段，单看它会误判「余量够」。
+    // PSRAM 决定 mbedtls EXTERNAL_MEM_ALLOC 的 IN/OUT 缓冲是否回落内部 RAM。
+    ESP_LOGI(TAG, "heap[%s] sram f%d m%d L%d dma f%d L%d psram f%d m%d L%d",
+             phase,
+             heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             heap_caps_get_free_size(MALLOC_CAP_DMA),
+             heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+             heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 }
+
+void SystemInfo::PrintHeapStats() {
+    LogHeapNow("tick");
+}
+
+
 
 void SystemInfo::PrintPmLocks() {
     esp_pm_dump_locks(stdout);

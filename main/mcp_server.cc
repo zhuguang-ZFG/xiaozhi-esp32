@@ -312,6 +312,14 @@ void McpServer::AddTool(const std::string& name, const std::string& description,
     AddTool(new McpTool(name, description, properties, callback));
 }
 
+void McpServer::AddBackgroundTool(const std::string& name, const std::string& description,
+                                  const PropertyList& properties,
+                                  std::function<ReturnValue(const PropertyList&)> callback) {
+    auto* tool = new McpTool(name, description, properties, std::move(callback));
+    tool->set_background(true);
+    AddTool(tool);
+}
+
 void McpServer::AddUserOnlyTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback) {
     auto tool = new McpTool(name, description, properties, callback);
     tool->set_user_only(true);
@@ -441,11 +449,16 @@ void McpServer::ReplyResult(int id, const std::string& result) {
 }
 
 void McpServer::ReplyError(int id, const std::string& message) {
+    // 工具名和异常文本可能包含引号/换行，必须按 JSON 字符串编码。
+    cJSON* value = cJSON_CreateString(message.c_str());
+    char* encoded = value != nullptr ? cJSON_PrintUnformatted(value) : nullptr;
     std::string payload = "{\"jsonrpc\":\"2.0\",\"id\":";
     payload += std::to_string(id);
-    payload += ",\"error\":{\"message\":\"";
-    payload += message;
-    payload += "\"}}";
+    payload += ",\"error\":{\"message\":";
+    payload += encoded != nullptr ? encoded : "\"工具执行失败\"";
+    payload += "}}";
+    cJSON_free(encoded);
+    cJSON_Delete(value);
     Application::GetInstance().SendMcpMessage(payload);
 }
 
@@ -547,14 +560,60 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
         return;
     }
 
-    // Use main thread to call the tool
-    auto& app = Application::GetInstance();
-    app.Schedule([this, id, tool_iter, arguments = std::move(arguments)]() {
+    DispatchToolCall(id, *tool_iter, std::move(arguments));
+}
+
+void McpServer::DispatchToolCall(int id, McpTool* tool, PropertyList arguments) {
+    auto call = [this, id, tool, arguments = std::move(arguments)]() {
         try {
-            ReplyResult(id, (*tool_iter)->Call(arguments));
+            ReplyResult(id, tool->Call(arguments));
         } catch (const std::exception& e) {
             ESP_LOGE(TAG, "tools/call: %s", e.what());
             ReplyError(id, e.what());
+        } catch (...) {
+            ReplyError(id, "工具执行失败，请稍后重试");
         }
-    });
+    };
+    if (!tool->background()) {
+        Application::GetInstance().Schedule(std::move(call));
+        return;
+    }
+    if (!ScheduleBackground(std::move(call))) {
+        ReplyError(id, "工具暂时忙，请稍候再试");
+    }
+}
+
+bool McpServer::ScheduleBackground(std::function<void()> call) {
+    // 有界单槽，防止屏幕与云端重复请求为每次网络等待再分配一份任务栈。
+    if (background_tool_active_.exchange(true)) {
+        return false;
+    }
+    BackgroundCall* task = nullptr;
+    try {
+        task = new BackgroundCall{this, std::move(call)};
+    } catch (const std::exception&) {
+        background_tool_active_.store(false);
+        return false;
+    }
+    // 6144B 覆盖工具参数、结果 JSON 与阻塞校验；释放任务载荷后再回收 FreeRTOS 栈。
+    if (xTaskCreate(BackgroundToolTaskEntry, "mcp_blocking", 6144, task, 1, nullptr) != pdTRUE) {
+        delete task;
+        background_tool_active_.store(false);
+        return false;
+    }
+    return true;
+}
+
+void McpServer::BackgroundToolTaskEntry(void* arg) {
+    auto* task = static_cast<BackgroundCall*>(arg);
+    auto* server = task->server;
+    try {
+        task->call();
+    } catch (...) {
+        // 额外调用方异常也必须释放槽，后续点击才能恢复。
+        ESP_LOGE(TAG, "后台操作异常");
+    }
+    delete task;
+    server->background_tool_active_.store(false);
+    vTaskDelete(nullptr);
 }

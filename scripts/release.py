@@ -143,8 +143,8 @@ def _collect_variants(
     """Traverse all boards under main/boards, collect variant information.
 
     Return example:
-        [{"board": "bread-compact-ml307", "name": "bread-compact-ml307", "full_name": "bread-compact-ml307"}, ...]
-        [{"board": "waveshare/esp32-p4-nano", "name": "esp32-p4-nano-10.1-a", "full_name": "waveshare-esp32-p4-nano-10.1-a"}, ...]
+        [{"board": "bread-compact-ml307", "name": "bread-compact-ml307", "full_name": "bread-compact-ml307", "target": "esp32s3"}, ...]
+        [{"board": "waveshare/esp32-p4-nano", "name": "esp32-p4-nano-10.1-a", "full_name": "waveshare-esp32-p4-nano-10.1-a", "target": "esp32p4"}, ...]
     """
     variants: list[dict[str, str]] = []
     errors: list[str] = []
@@ -158,6 +158,8 @@ def _collect_variants(
         try:
             with cfg_path.open(encoding='utf-8') as f:
                 cfg = json.load(f)
+
+            target = cfg["target"]
 
             manufacturer = _get_manufacturer(cfg)
 
@@ -188,9 +190,10 @@ def _collect_variants(
                 name = build["name"]
                 full_name = f"{manufacturer}-{name}" if manufacturer else name
                 variants.append({
-                    "board": board, 
+                    "board": board,
                     "name": name,
-                    "full_name": full_name
+                    "full_name": full_name,
+                    "target": target,
                 })
 
         except Exception as e:
