@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 
 #include <cstring>
+#include <memory>
 
 namespace hutuji {
 namespace {
@@ -39,13 +40,11 @@ bool IsPlausibleCode(const std::string& code) {
     return true;
 }
 
-void RelayTask(void* arg) {
-    auto* payload = static_cast<RelayPayload*>(arg);
+void RunRelay(void* arg) {
+    std::unique_ptr<RelayPayload> payload(static_cast<RelayPayload*>(arg));
     auto network = Board::GetInstance().GetNetwork();
     if (network == nullptr) {
         ESP_LOGW(kTag, "no network, skip relay");
-        delete payload;
-        vTaskDelete(nullptr);
         return;
     }
     cJSON* root = cJSON_CreateObject();
@@ -54,16 +53,12 @@ void RelayTask(void* arg) {
     char* body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (body == nullptr) {
-        delete payload;
-        vTaskDelete(nullptr);
         return;
     }
     auto http = network->CreateHttp(3);
     if (http == nullptr) {
         ESP_LOGW(kTag, "CreateHttp failed, skip relay");
         cJSON_free(body);
-        delete payload;
-        vTaskDelete(nullptr);
         return;
     }
     http->SetHeader("Content-Type", "application/json");
@@ -77,7 +72,11 @@ void RelayTask(void* arg) {
         ESP_LOGI(kTag, "relay mac=%s status=%d", SystemInfo::GetMacAddress().c_str(), status);
         http->Close();
     }
-    delete payload;
+}
+
+void RelayTask(void* arg) {
+    // 自删不会展开 C++ 栈；先正常返回，确保 HTTP 与请求载荷完成析构。
+    RunRelay(arg);
     vTaskDelete(nullptr);
 }
 

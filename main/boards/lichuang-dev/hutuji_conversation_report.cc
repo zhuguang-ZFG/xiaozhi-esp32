@@ -68,6 +68,10 @@ bool PushTurn(const char* role, const char* content, const std::string& session_
     size_t len = content ? std::strlen(content) : 0;
     if (len > kMaxContent) {
         len = kMaxContent;
+        // 下一个字节若仍属同一码点，退到首字节前，保持整个批次 JSON 可解码。
+        while (len > 0 && (static_cast<unsigned char>(content[len]) & 0xC0) == 0x80) {
+            --len;
+        }
     }
     if (len > 0 && content != nullptr) {
         std::memcpy(slot.content, content, len);

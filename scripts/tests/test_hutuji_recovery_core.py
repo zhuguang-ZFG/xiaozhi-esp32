@@ -3378,7 +3378,8 @@ class HutujiRecoveryCoreTest(unittest.TestCase):
         self.assertIn('http->Open("POST", kRelayUrl)', relay)
         # 一次性异步任务：不阻塞激活循环；失败路径都要释放 payload 并自删。
         self.assertIn("xTaskCreate(RelayTask", relay)
-        self.assertGreaterEqual(relay.count("vTaskDelete(nullptr)"), 4)
+        self.assertEqual(relay.count("vTaskDelete(nullptr)"), 1)
+        self.assertIn("RunRelay(arg);", relay)
         # 脱敏：日志调用不得直接格式化激活码或请求体变量。
         for line in relay.splitlines():
             if "ESP_LOG" in line:
