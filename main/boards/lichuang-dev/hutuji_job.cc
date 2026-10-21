@@ -876,47 +876,40 @@ std::string Job::RequestConfirmForPreview(const std::string& expected_url,
 }
 
 std::string Job::RequestAbort() {
-    bool pen_test_active = false;
-    bool paper_active = false;
-    {
-        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-        if (!busy_.load()) {
-            return JsonString("ok");
-        }
-        if (ota_reserved_.load()) {
-            return "{\"error\":\"正在升级固件，请等待设备重启\"}";
-        }
-        if (paper_update_active_.load()) {
-            return "{\"error\":\"正在保存纸张设置，请稍候查询结果\"}";
-        }
-        if (speed_active_.load()) {
-            return "{\"error\":\"正在调整速度，请稍候查询结果\"}";
-        }
-        if (finishing_at_home_) {
-            return JsonString("已回原点，正在完成收尾");
-        }
-        if (awaiting_confirmation_.exchange(false)) {
-            ClearPreview();
-            prefetch_cancel_.store(true);
-            abort_requested_.store(false);
-            busy_.store(false, std::memory_order_release);
-            SetState("aborted");
-            return JsonString("预览已取消");
-        }
-        // 停止包含排空、抬笔、归位与释放；重复请求必须复用同一收尾事务。
-        // 只看 busy 会在旧 worker 仍归位时再创建 worker，令两边争抢 ok。
-        if (abort_requested_.load()) {
-            return JsonString("停止处理中");
-        }
-        abort_requested_.store(true);
-        prefetch_cancel_.store(true);
-        stream_control_epoch_.store(
-            NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
-            std::memory_order_release);
-        pen_test_active = pen_test_active_.load();
-        paper_active = paper_active_.load();
+    // 取消标记与 worker 占位须同时对收尾可见，创建失败也须在解锁前回滚。
+    std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+    if (!busy_.load()) {
+        return JsonString("ok");
     }
-    if (pen_test_active) {
+    if (ota_reserved_.load()) {
+        return "{\"error\":\"正在升级固件，请等待设备重启\"}";
+    }
+    if (paper_update_active_.load()) {
+        return "{\"error\":\"正在保存纸张设置，请稍候查询结果\"}";
+    }
+    if (speed_active_.load()) {
+        return "{\"error\":\"正在调整速度，请稍候查询结果\"}";
+    }
+    if (finishing_at_home_) {
+        return JsonString("已回原点，正在完成收尾");
+    }
+    if (awaiting_confirmation_.exchange(false)) {
+        ClearPreview();
+        prefetch_cancel_.store(true);
+        abort_requested_.store(false);
+        busy_.store(false, std::memory_order_release);
+        SetState("aborted");
+        return JsonString("预览已取消");
+    }
+    if (abort_requested_.load()) {
+        return JsonString("停止处理中");
+    }
+    abort_requested_.store(true);
+    prefetch_cancel_.store(true);
+    stream_control_epoch_.store(
+        NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+        std::memory_order_release);
+    if (pen_test_active_.load()) {
         return JsonString("试笔即将停止");
     }
     std::string state;
@@ -924,46 +917,22 @@ std::string Job::RequestAbort() {
         std::lock_guard<std::mutex> lock(state_mutex_);
         state = state_;
     }
-    // 预览下载中取消：机械从未动过，绝不能发 `!`/0x18 打扰 Grbl。
-    // 预览任务自己轮询 abort_requested_ 后撤图并释放 busy_。
     if (state == "previewing") {
         return JsonString("预览取消中");
     }
     if (state == "downloading" || state == "verifying") {
         return JsonString("ok");
     }
-    if (paper_active) {
+    if (paper_active_.load()) {
         Notify("写字机正在换纸，无法即停；换纸完成后任务将停止");
         return JsonString("换纸中无法即停，完成后即停");
     }
-    {
-        // owner 抢占与 Run 的 busy_ 释放共用 stream_mutex_，避免任务收尾后迟到创建 reset。
-        std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-        if (finishing_at_home_) {
-            return JsonString("已回原点，正在完成收尾");
-        }
-        if (!busy_.load()) {
-            return JsonString("ok");
-        }
-        if (pen_test_active_.load()) {
-            return JsonString("试笔即将停止");
-        }
-        if (paper_active_.load()) {
-            Notify("写字机正在换纸，无法即停；换纸完成后任务将停止");
-            return JsonString("换纸中无法即停，完成后即停");
-        }
-        // 2026-08-28 用户决策「停止后也要自己回原点」+ 当日 HIL 实证三连：
-        // ①reset 清坐标致归位空操作；②Hold 不消费行命令；③abort 后 [ESP901]
-        // 无应答 2/2 把 socket 打崩。故非换纸 abort 一律走断流排空归位：
-        // 不 `!` 不 reset；Hold 态在任务内先 `~` 退出（排空残余在途段）再走
-        // 同一序列；reset 只留错误恢复/暂停超时/[ESP901] 三连死的最后兜底。
-        if (!StartAbortDrainHomeTask()) {
-            abort_requested_.store(false);
-            stream_control_epoch_.store(
-                NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
-                std::memory_order_release);
-            return "{\"error\":\"无法创建 abort 归位任务\"}";
-        }
+    if (!StartAbortDrainHomeTask()) {
+        abort_requested_.store(false);
+        stream_control_epoch_.store(
+            NextStreamControlEpoch(stream_control_epoch_.load(std::memory_order_relaxed)),
+            std::memory_order_release);
+        return "{\"error\":\"无法创建 abort 归位任务\"}";
     }
     return JsonString("ok");
 }

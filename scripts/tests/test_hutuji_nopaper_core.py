@@ -217,7 +217,7 @@ int main() {
         self.assertNotIn("$SLP", body)
         self.assertNotIn("$1=", body)
 
-    def test_repeated_abort_reuses_the_actual_worker_until_job_cleanup(self):
+    def _compile_abort_harness(self, main, stem):
         compiler = find_compiler()
         if compiler is None:
             self.skipTest("无 host C++ 编译器")
@@ -226,46 +226,139 @@ int main() {
                          source.index("bool Job::StartAbortResetTask()")]
         start_begin = source.index("bool Job::StartAbortDrainHomeTask()")
         start = source[start_begin:source.index("bool Job::PerformAbortDrainHome()", start_begin)]
-        # 编译产品的真实入口和任务创建函数；只替换 RTOS 调度与 UI，保持 worker 未执行，
-        # 模拟用户在归位期间连点停止，以及 worker 已结束但 Job 尚未释放 busy 的窗口。
+        wait = source[source.index("bool Job::WaitForAbortReset()"):
+                      source.index("std::string Job::RequestPause()")]
+        run = source[source.index("void Job::Run() {"):
+                     source.index("Http* Job::AcquireFetchClient()")]
+        tail = "void Job::RunTail(bool ok) {\n" + run[run.index("    bool reset_ok = true;"):]
+        # 解锁钩子在旧窗口内执行真实 Run 尾段。
+        product = (request + start + wait + tail).replace("std::mutex", "HookMutex")
         self._compile_and_run(compiler, r'''
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
+#include "main/boards/lichuang-dev/hutuji_recovery_core.h"
+using hutuji::AbortResetOwnerPhase;
+using hutuji::NextStreamControlEpoch;
 using BaseType_t = int;
+using TickType_t = uint32_t;
 constexpr int pdPASS = 1;
-int create_calls = 0;
+constexpr uint32_t kResetRecoveryTimeoutMs = 30000;
+#define pdMS_TO_TICKS(ms) (ms)
+#define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
+struct HookMutex {
+    std::mutex mutex;
+    std::function<void()> on_unlock;
+    void lock() { mutex.lock(); }
+    bool try_lock() { return mutex.try_lock(); }
+    void unlock() {
+        mutex.unlock();
+        if (auto hook = std::exchange(on_unlock, {})) hook();
+    }
+};
+int create_calls = 0, wait_calls = 0, home_calls = 0, delete_calls = 0;
 bool creation_succeeds = true;
 void (*pending)(void*) = nullptr;
 int xTaskCreate(void (*entry)(void*), const char*, int, void*, int, void*) {
     ++create_calls;
-    if (creation_succeeds) pending = entry;
+    if (creation_succeeds) {
+        assert(pending == nullptr);
+        pending = entry;
+    }
     return creation_succeeds ? pdPASS : 0;
 }
-void vTaskDelete(void*) {}
+void RunQueuedWorker();
+TickType_t ticks = 0;
+TickType_t xTaskGetTickCount() { return ticks; }
+void vTaskDelay(TickType_t delay) {
+    ticks += delay;
+    ++wait_calls;
+    RunQueuedWorker();
+}
+void vTaskDelete(void*) { ++delete_calls; }
 std::string JsonString(const char* text) { return text; }
-uint32_t NextStreamControlEpoch(uint32_t value) { return value + 1; }
+enum class GrblState { Idle };
+struct Pipe {
+    static Pipe& GetInstance() { static Pipe instance; return instance; }
+    bool IsConnected() { return true; }
+    GrblState GetGrblState() { return GrblState::Idle; }
+    void SetExpectBlockingPeer(bool) {}
+    void SetTaskSessionActive(bool) {}
+    void ShutdownSocket(uint32_t) { assert(false && "unexpected wait timeout"); }
+};
+struct Display { void SetStatus(const char*) {} };
+struct Board {
+    static Board& GetInstance() { static Board instance; return instance; }
+    Display* GetDisplay() { return nullptr; }
+};
 struct Job {
-    std::mutex stream_mutex_, state_mutex_;
+    HookMutex stream_mutex_, state_mutex_;
     std::atomic<bool> busy_{true}, speed_active_{false}, awaiting_confirmation_{false};
     std::atomic<bool> paper_update_active_{false}, ota_reserved_{false};
     std::atomic<bool> prefetch_cancel_{false}, abort_requested_{false};
     std::atomic<bool> pen_test_active_{false}, paper_active_{false};
-    std::atomic<bool> abort_reset_worker_active_{false};
-    std::atomic<uint32_t> stream_control_epoch_{0};
+    std::atomic<bool> abort_reset_worker_active_{false}, abort_home_done_{false};
+    std::atomic<bool> paused_{false}, repeat_mode_{false}, buffer_replayable_{false};
+    std::atomic<uint32_t> stream_control_epoch_{0}, abort_reset_session_{0};
+    hutuji::AbortResetOwner abort_reset_owner_;
     bool finishing_at_home_ = false;
-    std::string state_ = "streaming";
+    char* buffer_ = nullptr;
+    int preview_clears = 0;
+    std::string state_ = "streaming", last_error_;
     static Job& GetInstance() { static Job instance; return instance; }
-    void ClearPreview() {}
+    void ClearPreview() { ++preview_clears; }
     void Notify(const char*) {}
     void SetState(const char* text) { state_ = text; }
-    bool PerformAbortDrainHome() { return false; }
+    void ReleaseBuffer() {}
+    void ReleaseFetchClient() {}
+    bool PerformAbortDrainHome() {
+        ++home_calls;
+        abort_home_done_.store(true);
+        return false;
+    }
     std::string RequestAbort();
     bool StartAbortDrainHomeTask();
+    bool WaitForAbortReset();
+    bool ResetAbortResetState();
+    void RunTail(bool ok);
 };
-''' + request + start + r'''
+struct Snapshot {
+    bool requested, worker, busy, aborted;
+    int creates;
+    uint32_t epoch;
+};
+Snapshot Observe(const char* stage) {
+    auto& job = Job::GetInstance();
+    Snapshot snap{job.abort_requested_.load(), job.abort_reset_worker_active_.load(),
+                  job.busy_.load(), job.state_ == "aborted", create_calls,
+                  job.stream_control_epoch_.load()};
+    std::fprintf(stderr,
+                 "%s: abort=%d worker=%d busy=%d state=%s creates=%d epoch=%u waits=%d homes=%d\n",
+                 stage, snap.requested, snap.worker, snap.busy, job.state_.c_str(),
+                 snap.creates, static_cast<unsigned>(snap.epoch), wait_calls, home_calls);
+    return snap;
+}
+void RunQueuedWorker() {
+    auto& job = Job::GetInstance();
+    const auto before = Observe("before-queued-worker");
+    assert(before.worker && before.busy && !before.aborted);
+    assert(job.stream_mutex_.try_lock());
+    job.stream_mutex_.unlock();
+    assert(pending != nullptr);
+    std::exchange(pending, nullptr)(nullptr);
+    const auto after = Observe("after-queued-worker");
+    assert(!after.worker && after.busy && !after.aborted);
+}
+''' + product + main, stem)
+
+    def test_repeated_abort_reuses_the_actual_worker_until_job_cleanup(self):
+        self._compile_abort_harness(r'''
 int main() {
     auto& job = Job::GetInstance();
     job.ota_reserved_.store(true);
@@ -284,7 +377,7 @@ int main() {
     assert(job.stream_control_epoch_.load() == epoch);
     assert(job.StartAbortDrainHomeTask());
     assert(create_calls == 1);  // 任务创建面也拒重复占有者。
-    pending(nullptr);
+    RunQueuedWorker();
     assert(!job.abort_reset_worker_active_.load());
     job.RequestAbort();
     assert(create_calls == 1);  // 已归位，Job 尚未清 busy 也不再启动。
@@ -301,10 +394,127 @@ int main() {
     creation_succeeds = true;
     job.RequestAbort();
     assert(create_calls == 3 && job.abort_reset_worker_active_.load());
-    pending(nullptr);
+    job.RunTail(false);
+    assert(wait_calls == 1 && home_calls == 2 && delete_calls == 2);
+    assert(pending == nullptr && !job.abort_reset_worker_active_.load());
+    assert(job.state_ == "aborted" && !job.busy_.load());
     return 0;
 }
 ''', "abort_worker_idempotence")
+
+    def test_abort_publication_reserves_worker_before_run_cleanup(self):
+        self._compile_abort_harness(r'''
+int main() {
+    auto& job = Job::GetInstance();
+    Snapshot first{};
+    bool run_completed = false;
+    job.stream_mutex_.on_unlock = [&] {
+        first = Observe("first-post-publication-unlock");
+        assert(!job.abort_reset_owner_.Started());
+        assert(home_calls == 0 && wait_calls == 0 && delete_calls == 0);
+        job.last_error_ = "aborted";
+        job.RunTail(false);
+        run_completed = true;
+        Observe("after-run-tail");
+    };
+    const auto reply = job.RequestAbort();
+    Observe("after-request");
+    assert(run_completed);
+    assert(first.requested && first.worker && first.creates == 1 &&
+           "abort publication unlocked before reserving its cleanup worker");
+    assert(first.busy && !first.aborted && first.epoch == 1);
+    assert(reply == "ok");
+    assert(wait_calls == 1 && home_calls == 1 && delete_calls == 1);
+    assert(pending == nullptr && !job.abort_reset_worker_active_.load());
+    assert(job.abort_home_done_.load());
+    assert(job.state_ == "aborted" && !job.busy_.load());
+    return 0;
+}
+''', "abort_publication_cleanup")
+
+    def test_abort_creation_failure_rolls_back_before_run_can_observe_cancel(self):
+        self._compile_abort_harness(r'''
+int main() {
+    auto& job = Job::GetInstance();
+    creation_succeeds = false;
+    Snapshot first{};
+    bool saw_unlock = false, run_completed = false;
+    job.stream_mutex_.on_unlock = [&] {
+        saw_unlock = true;
+        first = Observe("first-unlock-with-create-failure");
+        if (job.abort_requested_.load()) {
+            job.RunTail(false);
+            run_completed = true;
+            Observe("after-run-tail");
+        }
+    };
+    const auto reply = job.RequestAbort();
+    Observe("after-failed-request");
+    assert(saw_unlock);
+    assert(!first.requested && first.creates == 1 &&
+           "failed worker creation exposed abort before rollback");
+    assert(!first.worker && first.busy && !first.aborted && first.epoch == 2);
+    assert(!run_completed && wait_calls == 0 && home_calls == 0);
+    assert(reply.find("error") != std::string::npos);
+    assert(pending == nullptr && job.busy_.load() && job.state_ == "streaming");
+    assert(!job.abort_requested_.load() && !job.abort_reset_worker_active_.load());
+    creation_succeeds = true;
+    assert(job.RequestAbort() == "ok");
+    assert(create_calls == 2 && job.abort_reset_worker_active_.load());
+    job.RunTail(false);
+    assert(wait_calls == 1 && home_calls == 1 && delete_calls == 1);
+    assert(job.state_ == "aborted" && !job.busy_.load());
+    return 0;
+}
+''', "abort_creation_failure_cleanup")
+
+    def test_abort_non_worker_modes_preserve_their_exclusions(self):
+        self._compile_abort_harness(r'''
+int main() {
+    struct Mode {
+        const char* state;
+        bool awaiting, paper, pen;
+        const char* reply;
+    };
+    const Mode modes[] = {
+        {"previewing", false, false, false, "预览取消中"},
+        {"awaiting_confirmation", true, false, false, "预览已取消"},
+        {"downloading", false, false, false, "ok"},
+        {"verifying", false, false, false, "ok"},
+        {"paper_change", false, true, false, "换纸中无法即停，完成后即停"},
+        {"pen_test", false, false, true, "试笔即将停止"},
+    };
+    auto& job = Job::GetInstance();
+    for (const auto& mode : modes) {
+        job.state_ = mode.state;
+        job.busy_.store(true);
+        job.abort_requested_.store(false);
+        job.prefetch_cancel_.store(false);
+        job.stream_control_epoch_.store(0);
+        job.awaiting_confirmation_.store(mode.awaiting);
+        job.paper_active_.store(mode.paper);
+        job.pen_test_active_.store(mode.pen);
+        Snapshot first{};
+        bool saw_unlock = false;
+        job.stream_mutex_.on_unlock = [&] {
+            saw_unlock = true;
+            first = Observe(mode.state);
+        };
+        assert(job.RequestAbort() == mode.reply);
+        assert(saw_unlock && !first.worker && first.creates == 0);
+        assert(first.requested == !mode.awaiting && first.busy == !mode.awaiting);
+        assert(first.aborted == mode.awaiting);
+        assert(first.epoch == (mode.awaiting ? 0u : 1u));
+        assert(create_calls == 0 && wait_calls == 0 && home_calls == 0);
+        assert(pending == nullptr && !job.abort_reset_worker_active_.load());
+        assert(job.prefetch_cancel_.load() && !job.awaiting_confirmation_.load());
+        assert(job.busy_.load() == !mode.awaiting);
+        assert(job.state_ == (mode.awaiting ? "aborted" : mode.state));
+    }
+    assert(job.preview_clears == 1);
+    return 0;
+}
+''', "abort_non_worker_modes")
 
     def test_abort_terminal_is_published_after_the_worker_settles(self):
         source = (ROOT / "main/boards/lichuang-dev/hutuji_job.cc").read_text(encoding="utf-8")
