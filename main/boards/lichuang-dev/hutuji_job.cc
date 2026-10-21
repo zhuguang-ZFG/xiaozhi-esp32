@@ -1407,7 +1407,8 @@ std::string Job::RequestRepeat() {
         abort_home_done_.store(false);
         abort_drain_phase_.store(AbortDrainPhase::Idle);
         last_error_.clear();
-        SetState(replay ? "streaming" : "downloading");
+        // 尚未创建绘图任务：取消由此入口收口，不提前派生运动归位 worker。
+        SetState("downloading");
     }
 
     // 与 RequestConfirm 同因：空闲期残留 TLS keep-alive 会挤掉 8192 栈分配。
@@ -1418,6 +1419,15 @@ std::string Job::RequestRepeat() {
     if (!busy_.load()) {
         return JsonString("ok");
     }
+    if (abort_requested_.exchange(false)) {
+        repeat_mode_.store(false);
+        buffer_replayable_.store(false);
+        ReleaseBuffer();
+        SetState("aborted");
+        busy_.store(false, std::memory_order_release);
+        return JsonString("重画已取消");
+    }
+    SetState(replay ? "streaming" : "downloading");
     // 重画也可能持续数分钟，必须与确认出图使用相同的音频让行优先级。
     BaseType_t ok = xTaskCreate(TaskEntry, "hutuji_draw", 8192, this, 1, nullptr);
     if (ok != pdTRUE) {
@@ -1515,18 +1525,22 @@ std::string Job::RequestPenTest() {
             }
 
             bool aborted;
+            bool stopped;
             {
                 // 状态与 busy 一起撤销，杜绝 abort 在收尾缝隙误走普通绘图的 0x18 路径。
                 std::lock_guard<std::mutex> stream_lock(job.stream_mutex_);
                 aborted = job.abort_requested_.load();
-                job.SetState(aborted ? "aborted" : ok ? "done" : "error");
+                // 已尝试运动后取消不能覆盖应答或 fresh Idle 失败。
+                stopped = aborted && (!motion_attempted || ok);
+                job.SetState(stopped ? "aborted" : ok ? "done" : "error");
                 p.SetTaskSessionActive(false);
                 job.pen_test_active_.store(false);
                 job.busy_.store(false);
             }
-            job.Notify(aborted ? "笔测试已停止"
-                       : ok    ? "笔测试完成：请确认笔头完成一次触纸再抬起"
-                               : "笔测试失败：写字机没正常应答");
+            job.Notify(stopped ? "笔测试已停止"
+                       : aborted ? "笔测试停止未确认，请检查写字机"
+                       : ok ? "笔测试完成：请确认笔头完成一次触纸再抬起"
+                            : "笔测试失败：写字机没正常应答");
             vTaskDelete(nullptr);
         },
         "hutuji_pentest", 3072, nullptr, 5, nullptr);
