@@ -61,6 +61,47 @@ bool IsCompactHutujiScreen() {
 #endif
 }
 
+// 量产主题限定在 Freenove 横屏，其他板型沿用各自的显示方案。
+bool IsProductionHutujiScreen() {
+#if CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
+    return IsCompactHutujiScreen();
+#else
+    return false;
+#endif
+}
+
+void StyleProductionButton(lv_obj_t* button, LvglTheme* theme, lv_color_t background,
+                           lv_color_t foreground) {
+    if (!IsProductionHutujiScreen()) {
+        return;
+    }
+    // 语义亮色上统一用深字；不依赖默认主题的禁用滤镜，避免灰白按钮抢过主操作。
+    if (lv_color_eq(background, theme->danger_color()) ||
+        lv_color_eq(background, theme->warning_color()) ||
+        lv_color_eq(background, theme->success_color())) {
+        foreground = theme->accent_text_color();
+    }
+    lv_obj_set_style_radius(button, 12, 0);
+    lv_obj_set_style_shadow_width(button, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_shadow_width(button, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button, lv_color_mix(foreground, background, 40), 0);
+    lv_obj_set_style_bg_color(button, background, 0);
+    lv_obj_set_style_bg_color(button, lv_color_mix(lv_color_white(), background, 36),
+                              LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x202C3B), LV_STATE_DISABLED);
+    lv_obj_set_style_border_color(button, lv_color_hex(0x314155), LV_STATE_DISABLED);
+    lv_obj_set_style_color_filter_opa(button, LV_OPA_TRANSP, LV_STATE_DISABLED);
+    lv_obj_set_style_recolor_opa(button, LV_OPA_TRANSP, LV_STATE_DISABLED);
+    lv_obj_set_style_transform_width(button, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_height(button, 0, LV_STATE_PRESSED);
+    auto* label = lv_obj_get_child(button, 0);
+    if (label != nullptr) {
+        lv_obj_set_style_text_color(label, foreground, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(0x9CACC1), LV_STATE_DISABLED);
+    }
+}
+
 void QrPixelCallback(esp_qrcode_handle_t qrcode, void* user_data) {
     auto* modules = static_cast<std::vector<uint8_t>*>(user_data);
     const int qr_size = esp_qrcode_get_size(qrcode);
@@ -137,7 +178,14 @@ void LcdDisplay::InitializeLcdThemes() {
     auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_material_symbols_30_4);
     auto emoji_font = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
 
-#if CONFIG_HUTUJI_KAWAII_FACE
+#if CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
+    // 量产语义色在主题入口定义，眼睛和按钮始终使用同一个accent。
+    const auto light_accent = lv_color_hex(0x0F8F8A);
+    const auto dark_accent = lv_color_hex(0x45D7F5);
+    const auto dark_success = lv_color_hex(0x69D9AC);
+    const auto dark_warning = lv_color_hex(0xFFC66B);
+    const auto dark_danger = lv_color_hex(0xFF7888);
+#elif CONFIG_HUTUJI_KAWAII_FACE
     // Eilik 桌宠脸：活泼淡青眼/钮同源（2026-09-06 用户圈选目视认定更好看）。
     // 覆盖下方 GROBOT 的 π 中段蓝紫——那套给按钮偏冷静，和淡青虹膜打架。
     const auto light_accent = lv_color_hex(0x0F8F8A);
@@ -205,6 +253,21 @@ void LcdDisplay::InitializeLcdThemes() {
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
     dark_theme->set_emoji_font(emoji_font);
+
+#if CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
+    // 量产深色科技主题：墨蓝分层、青蓝主操作，安全语义色保持独立。
+    dark_theme->set_background_color(lv_color_hex(0x0B111C));
+    dark_theme->set_text_color(lv_color_hex(0xE6EEF7));
+    dark_theme->set_chat_background_color(lv_color_hex(0x0F1825));
+    dark_theme->set_surface_color(lv_color_hex(0x121D2C));
+    dark_theme->set_assistant_bubble_color(lv_color_hex(0x1B2A3D));
+    dark_theme->set_user_bubble_color(lv_color_hex(0x183B4D));
+    dark_theme->set_system_bubble_color(lv_color_hex(0x121D2C));
+    dark_theme->set_system_text_color(lv_color_hex(0x9CACC1));
+    dark_theme->set_muted_text_color(lv_color_hex(0x9CACC1));
+    dark_theme->set_border_color(lv_color_hex(0x2C4056));
+    dark_theme->set_accent_text_color(lv_color_hex(0x071521));
+#endif
 
     auto& theme_manager = LvglThemeManager::GetInstance();
     theme_manager.RegisterTheme("light", light_theme);
@@ -480,6 +543,16 @@ void LcdDisplay::EnsureProvisioningQrUi() {
     lv_obj_set_style_text_color(provisioning_qr_hint_, theme->text_color(), 0);
     lv_obj_set_style_text_align(provisioning_qr_hint_, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(provisioning_qr_hint_, LV_LABEL_LONG_WRAP);
+    if (IsProductionHutujiScreen()) {
+        // 160px 二维码与实际28px行高各占固定区域；长热点提示不能挤掉二维码静区。
+        lv_obj_set_layout(provisioning_qr_root_, LV_LAYOUT_NONE);
+        lv_obj_set_align(provisioning_qr_code_, LV_ALIGN_TOP_MID);
+        lv_obj_set_pos(provisioning_qr_code_, 0, 8);
+        lv_obj_set_align(provisioning_qr_hint_, LV_ALIGN_BOTTOM_MID);
+        lv_obj_set_pos(provisioning_qr_hint_, 0, -4);
+        lv_obj_set_height(provisioning_qr_hint_, 64);
+        lv_label_set_long_mode(provisioning_qr_hint_, LV_LABEL_LONG_DOT);
+    }
 
     // 「关闭」退出配网（无凭据新机按上游流程弹回配网：没网什么都做不了，弹回
     // 是诚实行为）。绝对定位左上角、脱离 flex 流：QR 200px + 多行 hint + 56px
@@ -533,7 +606,18 @@ void LcdDisplay::ShowProvisioningQr(const std::string& payload, const std::strin
     } else {
         lv_image_set_src(provisioning_qr_code_, provisioning_qr_image_->image_dsc());
         lv_obj_remove_flag(provisioning_qr_code_, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(provisioning_qr_hint_, hint.c_str());
+        std::string display_hint = hint;
+        if (IsProductionHutujiScreen()) {
+            const auto first_line = hint.substr(0, hint.find('\n'));
+            if (payload.rfind("https://hutuji.donglicao.com/draw-upload/wifi?", 0) == 0) {
+                const auto hotspot =
+                    first_line.rfind("Scan: ", 0) == 0 ? first_line.substr(6) : first_line;
+                display_hint = "配网码：一键配网扫码\n热点：" + hotspot;
+            } else if (payload.rfind("https://hutuji.donglicao.com/draw-upload/bind?", 0) == 0) {
+                display_hint = first_line + "\n请用小程序绑定设备扫码";
+            }
+        }
+        lv_label_set_text(provisioning_qr_hint_, display_hint.c_str());
         const auto* descriptor = provisioning_qr_image_->image_dsc();
         ESP_LOGI(TAG, "Provisioning QR ready: %ux%u", static_cast<unsigned>(descriptor->header.w),
                  static_cast<unsigned>(descriptor->header.h));
@@ -669,6 +753,7 @@ void LcdDisplay::EnsureDrawPreviewUi() {
         lv_label_set_text(label, text);
         lv_obj_set_style_text_color(label, text_color, 0);
         lv_obj_center(label);
+        StyleProductionButton(btn, theme, color, text_color);
         return btn;
     };
 
@@ -679,6 +764,24 @@ void LcdDisplay::EnsureDrawPreviewUi() {
     draw_preview_cancel_btn_ =
         make_button(Lang::Strings::DRAW_PREVIEW_CANCEL, theme->assistant_bubble_color(),
                     theme->text_color(), cancel_width);
+
+    if (IsProductionHutujiScreen()) {
+        lv_obj_set_style_bg_color(draw_preview_root_, theme->background_color(), 0);
+        lv_obj_set_style_bg_color(draw_preview_card_, theme->background_color(), 0);
+        lv_obj_set_style_text_color(draw_preview_hint_, theme->muted_text_color(), 0);
+        // 20px中文字体实际行高28px，旧flex高度预算会把底栏推出屏幕6px。
+        lv_obj_set_layout(draw_preview_card_, LV_LAYOUT_NONE);
+        lv_obj_set_style_pad_all(draw_preview_card_, 0, 0);
+        lv_obj_set_size(draw_preview_hint_, LV_HOR_RES - 16, 28);
+        lv_obj_set_pos(draw_preview_hint_, 8, 4);
+        lv_obj_set_size(button_row, LV_HOR_RES - 16, 56);
+        lv_obj_set_pos(button_row, 8, LV_VER_RES - 60);
+        lv_obj_set_width(draw_preview_confirm_btn_, (LV_HOR_RES - 24) * 2 / 3);
+        lv_obj_set_width(draw_preview_cancel_btn_, (LV_HOR_RES - 24) / 3);
+        lv_obj_set_style_border_width(draw_preview_image_, 1, 0);
+        lv_obj_set_style_border_color(draw_preview_image_, theme->border_color(), 0);
+        lv_obj_set_style_bg_color(draw_preview_image_, lv_color_white(), 0);
+    }
 
     // 回调在 LVGL 任务里跑，只做转发：Job 侧建任务/发通知都不阻塞。
     lv_obj_add_event_cb(
@@ -714,6 +817,10 @@ void LcdDisplay::ShowDrawPreviewLoading() {
         lv_image_set_src(draw_preview_image_, nullptr);
         const lv_coord_t button_height = LV_VER_RES * 20 / 100 < 56 ? 56 : LV_VER_RES * 20 / 100;
         lv_obj_set_size(draw_preview_image_, LV_HOR_RES - 8, LV_VER_RES - button_height - 28);
+        if (IsProductionHutujiScreen()) {
+            lv_obj_set_size(draw_preview_image_, LV_HOR_RES - 16, LV_VER_RES - 104);
+            lv_obj_align(draw_preview_image_, LV_ALIGN_TOP_MID, 0, 36);
+        }
     }
     draw_preview_cached_.reset();
     if (draw_preview_hint_ != nullptr) {
@@ -721,6 +828,9 @@ void LcdDisplay::ShowDrawPreviewLoading() {
     }
     if (draw_preview_confirm_btn_ != nullptr) {
         lv_obj_add_state(draw_preview_confirm_btn_, LV_STATE_DISABLED);
+        if (IsProductionHutujiScreen()) {
+            lv_obj_add_state(lv_obj_get_child(draw_preview_confirm_btn_, 0), LV_STATE_DISABLED);
+        }
     }
     draw_preview_on_confirm_ = nullptr;
     draw_preview_on_cancel_ = nullptr;
@@ -778,11 +888,21 @@ void LcdDisplay::ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::st
                         (img_dsc->header.h * zoom) / 256);
     }
 
+    if (IsProductionHutujiScreen()) {
+        // CONTAIN由实际图片宽高等比缩放，避免对象尺寸和缩放倍率重复计算。
+        lv_image_set_inner_align(draw_preview_image_, LV_IMAGE_ALIGN_CONTAIN);
+        lv_obj_set_size(draw_preview_image_, LV_HOR_RES - 16, LV_VER_RES - 104);
+        lv_obj_align(draw_preview_image_, LV_ALIGN_TOP_MID, 0, 36);
+    }
+
     // 图落地后收起长提示，把像素让给图；空串仍占一行布局时改为短确认句。
     lv_label_set_text(draw_preview_hint_, hint.empty() ? Lang::Strings::DRAW_PREVIEW_HINT : hint.c_str());
     // 占位卡阶段确认键禁用；图落地后才允许确认。
     if (draw_preview_confirm_btn_ != nullptr) {
         lv_obj_clear_state(draw_preview_confirm_btn_, LV_STATE_DISABLED);
+        if (IsProductionHutujiScreen()) {
+            lv_obj_remove_state(lv_obj_get_child(draw_preview_confirm_btn_, 0), LV_STATE_DISABLED);
+        }
     }
     draw_preview_on_confirm_ = std::move(on_confirm);
     draw_preview_on_cancel_ = std::move(on_cancel);
@@ -976,6 +1096,21 @@ void LcdDisplay::EnsureMachineControlUi() {
             x += widths[i] + 4;
         }
     }
+    if (IsProductionHutujiScreen()) {
+        const lv_coord_t widths[] = {72, LV_HOR_RES - 188, 92};
+        lv_obj_t* buttons[] = {wifi_config_btn_, voice_talk_btn_, machine_control_trigger_btn_};
+        lv_coord_t x = 8;
+        for (int i = 0; i < 3; ++i) {
+            auto* btn = buttons[i];
+            lv_obj_set_size(btn, widths[i], 56);
+            lv_obj_set_pos(btn, x, LV_VER_RES - 60);
+            StyleProductionButton(
+                btn, theme,
+                btn == voice_talk_btn_ ? theme->accent_color() : theme->assistant_bubble_color(),
+                btn == voice_talk_btn_ ? theme->accent_text_color() : theme->text_color());
+            x += widths[i] + 4;
+        }
+    }
     // 开机打印三钮恢复后的实际几何：命中归因依赖真实落点（08-26 距离分析
     // 只能拿默认矩形凑——按钮真实位在 NVS、日志里没有）。trig/wifi 用
     // LV_SIZE_CONTENT 定宽，首帧布局前 get_width 是未决值（同文件 2271 行
@@ -1008,7 +1143,9 @@ void LcdDisplay::EnsureMachineControlUi() {
     // 任何依赖「面板滚动到达满铺按钮之外内容」的方案在 480x320 上不可交付。改为固定
     // 高 + 主操作区/手动区互斥切页，每页都塞得进视口，彻底不靠滚动到达任何按钮。
     const lv_coord_t panel_width = compact ? LV_HOR_RES : LV_HOR_RES - theme->spacing(16);
-    const lv_coord_t content_width = compact ? panel_width - 4 : panel_width - theme->spacing(8);
+    const lv_coord_t content_width = IsProductionHutujiScreen() ? panel_width - 16
+                                     : compact                  ? panel_width - 4
+                                                                : panel_width - theme->spacing(8);
     const lv_coord_t half_width = (content_width - (compact ? 4 : theme->spacing(4))) / 2;
     lv_obj_t* panel = lv_obj_create(machine_control_root_);
     lv_obj_set_width(panel, panel_width);
@@ -1034,6 +1171,12 @@ void LcdDisplay::EnsureMachineControlUi() {
     // 面板不滚动：分页保证每页都装得下，滚动条与滚动方向一并去掉，避免留下
     // 「看起来能滑」的假象（2026-08-20 用户实测「也不能滑动」即源于此）。
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (IsProductionHutujiScreen()) {
+        lv_obj_set_style_pad_left(panel, 8, 0);
+        lv_obj_set_style_pad_right(panel, 8, 0);
+        lv_obj_set_style_bg_color(panel, theme->background_color(), 0);
+    }
 
     auto make_row = [&](lv_obj_t* parent) {
         lv_obj_t* row = lv_obj_create(parent);
@@ -1070,6 +1213,7 @@ void LcdDisplay::EnsureMachineControlUi() {
         if (label_out != nullptr) {
             *label_out = label;
         }
+        StyleProductionButton(btn, theme, color, text_color);
         return btn;
     };
 
@@ -1145,16 +1289,20 @@ void LcdDisplay::EnsureMachineControlUi() {
     machine_repeat_btn_ =
         make_button(secondary_row, Lang::Strings::MACHINE_REPEAT, theme->accent_color(),
                     theme->accent_text_color(), half_width, safe_button_height);
-    machine_pen_test_btn_ =
-        make_button(secondary_row, Lang::Strings::MACHINE_PEN_TEST, lv_color_hex(0x5F7180),
-                    lv_color_white(), half_width, safe_button_height);
+    machine_pen_test_btn_ = make_button(
+        secondary_row, Lang::Strings::MACHINE_PEN_TEST,
+        IsProductionHutujiScreen() ? theme->assistant_bubble_color() : lv_color_hex(0x5F7180),
+        theme->text_color(), half_width, safe_button_height);
 
     // 停止：危险动作独占末行，红色实心作语义警示，不与主操作行争视觉重心。
     machine_abort_btn_ =
         make_button(machine_main_section_, Lang::Strings::MACHINE_STOP, theme->danger_color(),
                     lv_color_white(), content_width, safe_button_height);
 
-    if (compact) {
+    if (IsProductionHutujiScreen()) {
+        // 58px 标题与三行56px操作合计234px；停止独占底行，避免与继续误触。
+        lv_obj_set_style_pad_row(machine_main_section_, 4, 0);
+    } else if (compact) {
         // 两行覆盖全部任务动作，停止始终可见；第三行在 240px 高屏上放不下。
         lv_obj_set_style_pad_row(machine_main_section_, 4, 0);
         lv_obj_set_parent(machine_abort_btn_, primary_row);
@@ -1224,7 +1372,11 @@ void LcdDisplay::EnsureMachineControlUi() {
                            lv_color_t text_color, lv_coord_t width, const char* action) {
         lv_obj_t* btn = make_button(parent, text, color, text_color, width, safe_button_height);
         // 描边把点动方键从纸面底色里抬出来；无描边时 bubble 贴表面只剩白字。
-        lv_obj_set_style_border_width(btn, 2, 0);
+        if (IsProductionHutujiScreen()) {
+            lv_obj_set_style_border_width(btn, 1, 0);
+        } else {
+            lv_obj_set_style_border_width(btn, 2, 0);
+        }
         lv_obj_set_style_border_color(btn, theme->border_color(), 0);
         lv_obj_set_style_border_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_user_data(btn, const_cast<char*>(action));
@@ -1421,7 +1573,9 @@ void LcdDisplay::EnsureMachineControlUi() {
     lv_label_set_long_mode(machine_notice_label_, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_width(machine_notice_label_, panel_width - theme->spacing(8));
     lv_obj_set_style_text_align(machine_notice_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(machine_notice_label_, lv_color_white(), 0);
+    lv_obj_set_style_text_color(
+        machine_notice_label_,
+        IsProductionHutujiScreen() ? theme->accent_text_color() : lv_color_white(), 0);
     lv_obj_set_style_bg_color(machine_notice_label_, theme->danger_color(), 0);
     lv_obj_set_style_bg_opa(machine_notice_label_, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(machine_notice_label_, 12, 0);
@@ -1806,6 +1960,10 @@ void LcdDisplay::ApplyMachineControlState() {
         } else {
             lv_obj_add_state(button, LV_STATE_DISABLED);
         }
+        // LVGL子标签不继承父对象状态，显式同步才能使用量产禁用字色。
+        if (IsProductionHutujiScreen() && lv_obj_get_child_count(button) > 0) {
+            lv_obj_set_state(lv_obj_get_child(button, 0), LV_STATE_DISABLED, !enabled);
+        }
     };
     set_enabled(machine_pause_btn_, streaming);
     set_enabled(machine_resume_btn_, paused);
@@ -1858,6 +2016,11 @@ void LcdDisplay::ApplyMachineControlState() {
         lv_label_set_text(machine_state_label_, state_text);
         lv_obj_set_style_text_color(machine_state_label_, state_color, 0);
         lv_obj_set_style_bg_color(machine_state_label_, theme->assistant_bubble_color(), 0);
+        if (IsProductionHutujiScreen()) {
+            lv_obj_set_style_bg_color(machine_state_label_,
+                                      lv_color_mix(state_color, theme->background_color(), 24), 0);
+            lv_obj_set_style_radius(machine_state_label_, 8, 0);
+        }
     }
 #if CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 || CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 || \
     CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
@@ -2276,6 +2439,19 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     lv_obj_clear_flag(grobot_stage_, LV_OBJ_FLAG_SCROLL_CHAIN);
 #endif
 
+    if (IsProductionHutujiScreen()) {
+        grobot_stage_ = lv_obj_create(screen);
+        lv_obj_set_size(grobot_stage_, LV_HOR_RES - 16, 140);
+        lv_obj_set_pos(grobot_stage_, 8, 34);
+        lv_obj_set_style_radius(grobot_stage_, 16, 0);
+        lv_obj_set_style_bg_color(grobot_stage_, lv_color_black(), 0);
+        lv_obj_set_style_border_width(grobot_stage_, 1, 0);
+        lv_obj_set_style_border_color(grobot_stage_, theme->border_color(), 0);
+        lv_obj_set_style_pad_all(grobot_stage_, 0, 0);
+        lv_obj_remove_flag(grobot_stage_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(grobot_stage_, LV_OBJ_FLAG_CLICKABLE);
+    }
+
     emoji_box_ = lv_obj_create(screen);
     lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
@@ -2312,6 +2488,10 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
         // 顶栏 28px、字幕 30px、入口 56px 各自留位，不再遮住嘴和眼睛。
         lv_obj_set_size(emoji_box_, LV_HOR_RES - 8, LV_VER_RES - 128);
         lv_obj_align(emoji_box_, LV_ALIGN_TOP_MID, 0, 28);
+    }
+    if (IsProductionHutujiScreen()) {
+        lv_obj_set_size(emoji_box_, LV_HOR_RES - 32, 104);
+        lv_obj_align(emoji_box_, LV_ALIGN_TOP_MID, 0, 36);
     }
     // 兑现上方「状态栏继续独立叠在最前层」：WeChat 分支的创建顺序是栏在前、脸在后，
     // 460x300 整屏脸会把顶栏/状态胶囊压到不可见（普通分支栏在脸后创建，天然在上，
@@ -2381,6 +2561,16 @@ void LcdDisplay::CreateGrobotSubtitleBar(lv_obj_t* screen, LvglTheme* theme) {
         lv_label_set_long_mode(grobot_subtitle_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
         lv_obj_set_style_anim_duration(grobot_subtitle_label_,
                                        lv_anim_speed_clamped(35, 1000, 60000), 0);
+    }
+    if (IsProductionHutujiScreen()) {
+        lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES - 24, 30);
+        lv_obj_align(grobot_subtitle_bar_, LV_ALIGN_BOTTOM_MID, 0, -66);
+        lv_obj_set_style_radius(grobot_subtitle_bar_, 10, 0);
+        lv_obj_set_style_border_width(grobot_subtitle_bar_, 0, 0);
+        lv_obj_set_style_bg_color(grobot_subtitle_bar_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(grobot_subtitle_bar_, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(grobot_subtitle_label_, theme->muted_text_color(), 0);
+        lv_obj_set_width(grobot_subtitle_label_, LV_HOR_RES - 40);
     }
     lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
 }
@@ -2614,6 +2804,16 @@ void LcdDisplay::SetupUI() {
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
 
+    if (IsProductionHutujiScreen()) {
+        for (auto* label : {status_label_, notification_label_}) {
+            lv_obj_set_width(label, LV_HOR_RES * 52 / 100);
+            lv_obj_set_style_radius(label, 8, 0);
+            lv_obj_set_style_pad_top(label, 2, 0);
+            lv_obj_set_style_pad_bottom(label, 2, 0);
+            lv_obj_set_style_border_width(label, 0, 0);
+            lv_obj_set_style_bg_opa(label, LV_OPA_COVER, 0);
+        }
+    }
     InitializeEmotionUi(screen, lvgl_theme, large_icon_font);
     EnsureMachineControlUi();
     // QR root 已在创建时挂到 lv_layer_top()（433 行），SetupUI 时无需再抬。
@@ -3150,6 +3350,16 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+    if (IsProductionHutujiScreen()) {
+        for (auto* label : {status_label_, notification_label_}) {
+            lv_obj_set_width(label, LV_HOR_RES * 52 / 100);
+            lv_obj_set_style_radius(label, 8, 0);
+            lv_obj_set_style_pad_top(label, 2, 0);
+            lv_obj_set_style_pad_bottom(label, 2, 0);
+            lv_obj_set_style_border_width(label, 0, 0);
+            lv_obj_set_style_bg_opa(label, LV_OPA_COVER, 0);
+        }
+    }
     EnsureMachineControlUi();
     // QR root 已在创建时挂到 lv_layer_top()（433 行），SetupUI 时无需再抬。
 }

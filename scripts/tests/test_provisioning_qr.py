@@ -61,9 +61,12 @@ typedef int esp_err_t;
                     base64.urlsafe_b64encode(public).rstrip(b"=").decode(),
                     base64.urlsafe_b64encode(bytes(range(16))).rstrip(b"=").decode(), "ABC123"]
         production = DISPLAY_SOURCE.read_text(encoding="utf-8")
-        signatures = ["void QrPixelCallback(", "std::unique_ptr<LvglImage> BuildProvisioningQrImage(",
+        signatures = ["bool IsCompactHutujiScreen(", "bool IsProductionHutujiScreen(", "void QrPixelCallback(", "std::unique_ptr<LvglImage> BuildProvisioningQrImage(",
                       "void LcdDisplay::ShowProvisioningQr(", "void LcdDisplay::HideProvisioningQr("]
         code = PREAMBLE + "\n".join(function_source(production, s) for s in signatures)
+        cls.production_probe = temp / "production-probe.cpp"
+        cls.production_code = "#define CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD 1\n" + code
+
         code += "\nhutuji::BindIdentitySession session{" + ",".join(map(json.dumps, identity)) + "};\n" + CHECKS
         (temp / "probe.cpp").write_text(code, encoding="utf-8")
         cls.executable = temp / ("probe.exe" if os.name == "nt" else "probe")
@@ -96,6 +99,30 @@ typedef int esp_err_t;
     def test_failed_encoding_keeps_notice_and_exit_visible(self):
         self.check("overlay")
 
+    def test_production_qr_hint_identifies_wifi_and_binding(self):
+        temp = Path(self.directory.name)
+        code = self.production_code + r"""
+int main() {
+    LcdDisplay ui;
+    ui.ShowProvisioningQr("https://hutuji.donglicao.com/draw-upload/wifi?s=test", "Scan: test-device\nOpen: http://192.168.4.1");
+    assert(ui.hint.text == "配网码：一键配网扫码\n热点：test-device");
+    ui.ShowProvisioningQr("https://hutuji.donglicao.com/draw-upload/bind?c=ABC123", "绑定码 ABC123\n10 分钟内手机扫码并完成绑定");
+    assert(ui.hint.text == "绑定码 ABC123\n请用小程序绑定设备扫码");
+    ui.HideProvisioningQr();
+    assert(live_images == 0);
+}
+"""
+        self.production_probe.write_text(code, encoding="utf-8")
+        compiler = find_compiler()
+        executable = temp / ("production-probe.exe" if os.name == "nt" else "production-probe")
+        self.run_command([str(compiler), "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                          "-I", str(temp), "-I", str(ROOT / "components/hutuji_qrcode/include"),
+                          "-I", str(ROOT / "main/boards/lichuang-dev"), str(self.production_probe),
+                          *[str(temp / (name + ".o")) for name in ("qrcodegen", "esp_qrcode_main", "esp_qrcode_wrapper")],
+                          "-o", str(executable)])
+        self.run_command([str(executable)])
+
+
 
 PREAMBLE = r'''
 #include "qrcode.h"
@@ -112,6 +139,8 @@ bool fail_allocation = false;
 int live_images = 0;
 constexpr int MALLOC_CAP_SPIRAM = 1;
 constexpr int LV_COLOR_FORMAT_RGB565 = 1;
+constexpr int LV_HOR_RES = 320;
+constexpr int LV_VER_RES = 240;
 constexpr unsigned LV_OBJ_FLAG_HIDDEN = 1;
 template<class... T> void log_stub(T&&...) {}
 #define ESP_LOGE(...) log_stub(__VA_ARGS__)
