@@ -71,6 +71,7 @@ using BaseType_t=int;
 constexpr int pdTRUE=1, MALLOC_CAP_SPIRAM=1, MALLOC_CAP_8BIT=2;
 BaseType_t xTaskCreateWithCaps(void (*)(void*), const char*, unsigned, void*, int, void*, int) { return pdTRUE; }
 enum class StreamQuiescence { Idle };
+enum class AbortDrainPhase { Idle };
 @@DUPLICATE@@
 struct Job {
     std::mutex stream_mutex_, state_mutex_;
@@ -79,6 +80,7 @@ struct Job {
     int article_index_=0;
     std::atomic<unsigned> article_total_{0}, article_page_{0}, stream_control_epoch_{0};
     std::atomic<int> tls_heap_fail_count_{0};
+    std::atomic<AbortDrainPhase> abort_drain_phase_{AbortDrainPhase::Idle};
     std::atomic<StreamQuiescence> stream_quiescence_{StreamQuiescence::Idle};
     std::atomic<bool> busy_{true}, preview_worker_active_{false}, ota_reserved_{false},
         paper_update_active_{false}, speed_active_{false}, abort_hold_confirmed_{false},

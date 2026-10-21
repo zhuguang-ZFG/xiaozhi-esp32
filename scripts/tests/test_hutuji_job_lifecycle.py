@@ -139,6 +139,7 @@ struct Pipe{
     void SetTaskSessionActive(bool value){active=value;}void SetExpectBlockingPeer(bool){}
 };
 struct Job{
+    std::atomic<AbortDrainPhase> abort_drain_phase_{AbortDrainPhase::Idle};
     std::mutex stream_mutex_,state_mutex_;
     std::atomic<bool> busy_{false},preview_worker_active_{false},buffer_replayable_{true},
         abort_hold_confirmed_{false},abort_requested_{false},paused_{false},paper_active_{false},

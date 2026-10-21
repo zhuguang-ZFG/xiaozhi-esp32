@@ -787,6 +787,7 @@ std::string Job::StartDraw(const std::string& url, const std::string& preview_ur
     paper_active_.store(false);
     repeat_mode_.store(false);
     abort_home_done_.store(false);
+    abort_drain_phase_.store(AbortDrainPhase::Idle);
     buffer_replayable_.store(false);
     url_ = url;
     preview_url_ = preview_url;
@@ -1115,6 +1116,8 @@ bool Job::StartAbortDrainHomeTask() {
     if (abort_reset_worker_active_.exchange(true, std::memory_order_acq_rel)) {
         return true;
     }
+    abort_home_done_.store(false, std::memory_order_release);
+    abort_drain_phase_.store(AbortDrainPhase::Running, std::memory_order_release);
     BaseType_t created = xTaskCreate(
         [](void*) {
             auto& job = Job::GetInstance();
@@ -1126,6 +1129,7 @@ bool Job::StartAbortDrainHomeTask() {
         },
         "hutuji_abort_drain", 4096, nullptr, 6, nullptr);
     if (created != pdPASS) {
+        abort_drain_phase_.store(AbortDrainPhase::Idle, std::memory_order_release);
         abort_reset_worker_active_.store(false, std::memory_order_release);
         return false;
     }
@@ -1146,6 +1150,12 @@ bool Job::PerformAbortDrainHome() {
         return pipe.IsConnected() && pipe.IsReady() &&
                pipe.GetConnectionSequence() == home_connection &&
                pipe.GetResetBannerSequence() == home_banner;
+    };
+    const auto transfer_reset = [&]() {
+        const bool transferred = StartAbortResetTask();
+        abort_drain_phase_.store(transferred ? AbortDrainPhase::Transferred : AbortDrainPhase::Failed,
+                                 std::memory_order_release);
+        return transferred;
     };
     bool homed = false;
     do {
@@ -1170,7 +1180,7 @@ bool Job::PerformAbortDrainHome() {
             if (!same_session())
                 break;
             if (pipe.GetGrblState() == GrblState::Hold) {
-                return StartAbortResetTask();  // 移交：worker 旗标归 reset 任务收尾
+                return transfer_reset();  // 移交：worker 旗标归 reset 任务收尾
             }
         }
         if (!same_session())
@@ -1186,7 +1196,7 @@ bool Job::PerformAbortDrainHome() {
             break;
         if (!CanResetAfterStream(stream_quiescence_.load(std::memory_order_acquire))) {
             // 收口超时（如流循环卡死）：兜底移交受控 reset 路径而非悬挂任务。
-            return StartAbortResetTask();
+            return transfer_reset();
         }
         if (!WaitForIdleForSession(false, kAbortDrainIdleTimeoutMs, home_connection, home_banner)) {
             break;
@@ -1230,6 +1240,8 @@ bool Job::PerformAbortDrainHome() {
     if (!homed)
         pipe.ShutdownSocket(home_connection);
     abort_home_done_.store(homed, std::memory_order_release);
+    abort_drain_phase_.store(homed ? AbortDrainPhase::Succeeded : AbortDrainPhase::Failed,
+                             std::memory_order_release);
     return false;
 }
 
@@ -1392,6 +1404,8 @@ std::string Job::RequestRepeat() {
         paused_.store(false);
         paper_active_.store(false);
         repeat_mode_.store(replay);
+        abort_home_done_.store(false);
+        abort_drain_phase_.store(AbortDrainPhase::Idle);
         last_error_.clear();
         SetState(replay ? "streaming" : "downloading");
     }
@@ -2849,7 +2863,6 @@ void Job::Run() {
     // 推进 article_index_ 继续下一轮。循环内一切 break 保持原语义＝整单终止。
     while (true) {
         if (abort_requested_.load()) {
-            SetState("aborted");
             break;
         }
         // 重画：buffer_ 里已是上次校验通过的内容，跳过下载与 CRC
@@ -2869,11 +2882,7 @@ void Job::Run() {
                     d->SetStatus("马上开画");
             }
             if (!adopted && !DownloadToPsram(url_)) {
-                if (abort_requested_.load()) {
-                    SetState("aborted");
-                    if (auto* d = Board::GetInstance().GetDisplay())
-                        d->SetStatus("已取消");
-                } else {
+                if (!abort_requested_.load()) {
                     SetState("error");
                     ESP_LOGW(TAG, "下载失败: %s", last_error_.c_str());
                     // R21-F03：last_error_ 是技术诊断串（HTTP/CRC32/PSRAM），用户面
@@ -2884,7 +2893,6 @@ void Job::Run() {
             }
             if (!adopted) {
                 if (abort_requested_.load()) {
-                    SetState("aborted");
                     break;
                 }
                 SetState("verifying");
@@ -3095,6 +3103,9 @@ void Job::Run() {
         if (abort_reset_owner_.Started() && !abort_reset_owner_.Succeeded()) {
             reset_ok = false;
         }
+        if (abort_drain_phase_.load(std::memory_order_acquire) == AbortDrainPhase::Failed) {
+            reset_ok = false;
+        }
         if (!ResetAbortResetState()) {
             stream_lock.unlock();
             continue;
@@ -3110,7 +3121,11 @@ void Job::Run() {
             reset_ok = true;
         }
         if (!reset_ok) {
-            last_error_ = "abort reset 恢复失败";
+            if (abort_drain_phase_.load(std::memory_order_acquire) == AbortDrainPhase::Failed) {
+                last_error_ = "停止归位未确认，请检查写字机";
+            } else {
+                last_error_ = "abort reset 恢复失败";
+            }
             SetState("error");
             ok = false;
         }

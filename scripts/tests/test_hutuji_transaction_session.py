@@ -128,6 +128,7 @@ struct Job {
 
     std::mutex stream_mutex_;
     std::atomic<bool> abort_requested_{false},paused_{false},abort_home_done_{false};
+    std::atomic<AbortDrainPhase> abort_drain_phase_{AbortDrainPhase::Idle};
     std::atomic<StreamQuiescence> stream_quiescence_{StreamQuiescence::Quiesced};
     uint32_t stream_connection_seq_=7;
     bool stream_disconnected_=false;

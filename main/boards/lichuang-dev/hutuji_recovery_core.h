@@ -749,6 +749,9 @@ private:
     std::atomic<AbortResetOwnerPhase> phase_{AbortResetOwnerPhase::Idle};
 };
 
+// 断流 worker 的返回值只说明是否移交；物理结果必须单独发布给任务收尾。
+enum class AbortDrainPhase : uint8_t { Idle, Running, Succeeded, Failed, Transferred };
+
 enum class StreamQuiescence : uint8_t {
     Idle = 0,
     Active,

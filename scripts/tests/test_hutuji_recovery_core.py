@@ -3909,7 +3909,9 @@ class AbortHomeAfterStopTest(unittest.TestCase):
         self.assertLess(drain.index("paused_.store(false"),
                         drain.index("CanResetAfterStream"))
         # quiescence 超时必须兜底移交 reset 任务，不得静默悬挂
-        self.assertIn("return StartAbortResetTask();", drain)
+        self.assertIn("const bool transferred = StartAbortResetTask();", drain)
+        self.assertEqual(drain.count("return transfer_reset();"), 2)
+        self.assertIn("AbortDrainPhase::Transferred", drain)
         self.assertIn('"已停止并回原点"', job_cc)
         self.assertIn("abort_reset_owner_.Started() && !waited", job_cc)
         # StartDraw 复位标记

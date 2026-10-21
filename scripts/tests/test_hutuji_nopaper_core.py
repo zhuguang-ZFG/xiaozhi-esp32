@@ -244,6 +244,7 @@ int main() {
 #include <utility>
 #include "main/boards/lichuang-dev/hutuji_recovery_core.h"
 using hutuji::AbortResetOwnerPhase;
+using hutuji::AbortDrainPhase;
 using hutuji::NextStreamControlEpoch;
 using BaseType_t = int;
 using TickType_t = uint32_t;
@@ -307,6 +308,7 @@ struct Job {
     std::atomic<bool> paused_{false}, repeat_mode_{false}, buffer_replayable_{false};
     std::atomic<uint32_t> stream_control_epoch_{0}, abort_reset_session_{0};
     hutuji::AbortResetOwner abort_reset_owner_;
+    std::atomic<AbortDrainPhase> abort_drain_phase_{AbortDrainPhase::Idle};
     bool finishing_at_home_ = false;
     char* buffer_ = nullptr;
     int preview_clears = 0;
@@ -320,6 +322,7 @@ struct Job {
     bool PerformAbortDrainHome() {
         ++home_calls;
         abort_home_done_.store(true);
+        abort_drain_phase_.store(AbortDrainPhase::Succeeded);
         return false;
     }
     std::string RequestAbort();

@@ -368,6 +368,7 @@ private:
     std::atomic<bool> abort_hold_confirmed_{false};
     // abort 归位完成标记（2026-08-28）：供 Run 尾部分流「已停止」/「已停止并回原点」。
     std::atomic<bool> abort_home_done_{false};
+    std::atomic<AbortDrainPhase> abort_drain_phase_{AbortDrainPhase::Idle};
     // character-counting 收到 error 后，Grbl RX 内后续行仍会继续执行。流线程先 `!`
     // 并退窗，Run 随后同步走受控 reset；reset 完成前不能发布 error 或释放 busy_。
     std::atomic<bool> stream_error_stop_required_{false};
