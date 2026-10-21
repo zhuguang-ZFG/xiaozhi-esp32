@@ -102,9 +102,14 @@ size_t PopBatch(PendingTurn* out, size_t max_out) {
     if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
         return 0;
     }
-    size_t n = g_count < max_out ? g_count : max_out;
-    for (size_t i = 0; i < n; ++i) {
-        out[i] = g_queue[(g_head + i) % kQueueCap];
+    size_t n = 0;
+    // 请求根只携一个 session_id；遇到下一会话必须留队，防止错误归属。
+    while (n < g_count && n < max_out) {
+        const auto& turn = g_queue[(g_head + n) % kQueueCap];
+        if (std::strcmp(turn.session_id, g_queue[g_head].session_id) != 0) {
+            break;
+        }
+        out[n++] = turn;
     }
     g_head = (g_head + n) % kQueueCap;
     g_count -= n;
