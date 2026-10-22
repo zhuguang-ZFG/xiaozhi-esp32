@@ -1,5 +1,5 @@
 diff --git a/managed_components/78__esp-ml307/src/esp/esp_ssl.cc b/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
-index 1e365ab..4884f1a 100644
+index 1e365ab..d78a4c3 100644
 --- a/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
 +++ b/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
 @@ -6,6 +6,7 @@
@@ -10,7 +10,7 @@ index 1e365ab..4884f1a 100644
  #include <unistd.h>
  
  static const char *TAG = "EspSsl";
-@@ -17,7 +18,7 @@ EspSsl::EspSsl() {
+@@ -17,13 +18,17 @@ EspSsl::EspSsl() {
  EspSsl::~EspSsl() {
      Disconnect();
  
@@ -19,7 +19,42 @@ index 1e365ab..4884f1a 100644
          vEventGroupDelete(event_group_);
          event_group_ = nullptr;
      }
-@@ -96,17 +97,33 @@ void EspSsl::Disconnect() {
+ }
+ 
+ bool EspSsl::Connect(const std::string& host, int port) {
++    if (receive_abandoned_) {
++        ESP_LOGE(TAG, "TLS receive previously abandoned; this connection cannot be reused");
++        return false;
++    }
+     if (tls_client_ != nullptr) {
+         ESP_LOGE(TAG, "tls client has been initialized");
+         return false;
+@@ -57,7 +62,10 @@ bool EspSsl::Connect(const std::string& host, int port) {
+ 
+     connected_ = true;
+ 
+-    // 2026-09-06 hutuji 修复（R5）：keep-alive 长连接必须自证存活。
++    // 2026-09-06 hutuji 修复（R5）：keep-alive 长连接必须自证存活。空趟 120s 后
++    // 开始 TCP 探测（间隔 10s × 3 次无应答判死，≤150s 检出）：WiFi 静默丢失时，
++    // 否则池化连接上的下一次 Send 会卡在 TCP 重传直到超时。对端（nginx keepalive）
++    // 关闭连接时 recv 返回 0 → OnDisconnected → 连接标记错误 → 复用方自动重建。
+     {
+         int sockfd;
+         if (esp_tls_get_conn_sockfd(tls_client_, &sockfd) == ESP_OK && sockfd >= 0) {
+@@ -73,7 +81,11 @@ bool EspSsl::Connect(const std::string& host, int port) {
+     }
+ 
+     xEventGroupClearBits(event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT);
+-    // R5：创建失败显式报错；R8：栈进 PSRAM，不与 hutuji_preview 抢内部连续块。
++    // 2026-09-06 hutuji 修复（R5）：堆碎片期 xTaskCreate 静默失败必须显式报错。
++    // 2026-09-06 R8：ssl_receive 栈改 PSRAM——与 hutuji_preview 不再互抢内部连续块
++    // （COM14：preview 内部 6144 存活时 largest 钉死，TLS 4KB 栈创建/读失败）。
++    // 本组件在 managed_components/，重拉取会覆盖；升级须带
++    // patches/esp-ml307-ssl-rx-task-and-keepalive.patch。
+     if (xTaskCreateWithCaps([](void* arg) {
+         EspSsl* ssl = (EspSsl*)arg;
+         ssl->ReceiveTask();
+@@ -96,16 +108,32 @@ void EspSsl::Disconnect() {
      
      // Close socket if it is open
      if (tls_client_ != nullptr) {
@@ -27,18 +62,17 @@ index 1e365ab..4884f1a 100644
 -        ESP_ERROR_CHECK(esp_tls_get_conn_sockfd(tls_client_, &sockfd));
 -        if (sockfd >= 0) {
 -            close(sockfd);
--        }
--    
--        auto bits = xEventGroupWaitBits(event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
--        if (!(bits & ESP_SSL_EVENT_RECEIVE_TASK_EXIT)) {
--            ESP_LOGE(TAG, "Failed to wait for receive task exit");
 +        int sockfd = -1;
 +        // SDK析构拥有close权；先close会让其他任务复用fd，再被旧TLS二次close误杀。
 +        // shutdown只中断收发，不回收fd，接收线程退出后再由SDK唯一释放。
 +        if (esp_tls_get_conn_sockfd(tls_client_, &sockfd) == ESP_OK && sockfd >= 0) {
 +            shutdown(sockfd, SHUT_RDWR);
          }
- 
+     
+-        auto bits = xEventGroupWaitBits(event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+-        if (!(bits & ESP_SSL_EVENT_RECEIVE_TASK_EXIT)) {
+-            ESP_LOGE(TAG, "Failed to wait for receive task exit");
+-        }
 +        EventBits_t bits = 0;
 +        int rounds = 0;
 +        constexpr int kTlsReceiveExitWaitRounds = 3;
@@ -58,11 +92,10 @@ index 1e365ab..4884f1a 100644
 +            }
 +            ESP_LOGW(TAG, "Waiting for TLS receive task exit after shutdown");
 +        } while (true);
-+
+ 
          esp_tls_conn_destroy(tls_client_);
          tls_client_ = nullptr;
-     }
-@@ -154,8 +171,14 @@ void EspSsl::ReceiveTask() {
+@@ -154,8 +182,14 @@ void EspSsl::ReceiveTask() {
          }
  
          if (ret <= 0) {
@@ -80,10 +113,16 @@ index 1e365ab..4884f1a 100644
              connected_ = false;
              // 接收失败或连接断开时调用断连回调
 diff --git a/managed_components/78__esp-ml307/src/esp/esp_ssl.h b/managed_components/78__esp-ml307/src/esp/esp_ssl.h
-index cd2bf41..d36f549 100644
+index cd2bf41..9d22b50 100644
 --- a/managed_components/78__esp-ml307/src/esp/esp_ssl.h
 +++ b/managed_components/78__esp-ml307/src/esp/esp_ssl.h
-@@ -25,6 +25,7 @@ private:
+@@ -20,11 +20,13 @@ public:
+     int Send(const std::string& data) override;
+ 
+     int GetLastError() override;
++    bool ReceiveAbandoned() const override { return receive_abandoned_; }
+ 
+ private:
      esp_tls_t* tls_client_ = nullptr;
      EventGroupHandle_t event_group_ = nullptr;
      TaskHandle_t receive_task_handle_ = nullptr;
