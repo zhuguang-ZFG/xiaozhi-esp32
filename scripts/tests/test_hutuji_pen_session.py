@@ -139,6 +139,7 @@ struct Job {
     uint32_t stream_connection_seq_=7,stream_banner_seq_=9;
     bool stream_disconnected_=false;
     std::string last_error_;
+    std::atomic<int> tls_heap_fail_count_{0};
     bool WaitWhilePaused(){return !abort_requested_;}
     void SetStreamingOrPaused(){}
     bool StartAbortResetTask(){return false;}

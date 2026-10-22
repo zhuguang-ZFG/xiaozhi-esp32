@@ -1460,6 +1460,8 @@ std::string Job::RequestPenTest() {
         abort_requested_.store(false);
         busy_.store(true);
         pen_test_active_.store(true);
+        last_error_.clear();
+        tls_heap_fail_count_.store(0, std::memory_order_relaxed);
         pipe.SetTaskSessionActive(true);
         stream_connection_seq_ = pipe.GetConnectionSequence();
         stream_banner_seq_ = pipe.GetResetBannerSequence();
@@ -1495,6 +1497,7 @@ std::string Job::RequestPenTest() {
                     if (job.abort_requested_.load()) {
                         ok = false;
                     } else if (!same_session()) {
+                        job.last_error_ = "试笔前连接已变化";
                         ok = false;
                     } else {
                         motion_attempted = true;
@@ -1503,15 +1506,26 @@ std::string Job::RequestPenTest() {
                             if (p.SendLineForSession("G1G90 Z0.0F10000", connection, banner)) {
                                 ++submitted;
                             } else {
+                                job.last_error_ = "试笔抬笔命令发送失败";
                                 ok = false;
                             }
                         } else {
+                            job.last_error_ = "试笔落笔命令发送失败";
                             ok = false;
                         }
                     }
                 }
                 for (int i = 0; i < submitted; ++i) {
-                    if (p.TakeResponse(3000) != WaitResult::Ok || !same_session()) {
+                    const WaitResult response = p.TakeResponse(3000);
+                    if (!same_session()) {
+                        job.last_error_ = "试笔应答期间连接已变化";
+                        ok = false;
+                    } else if (response != WaitResult::Ok) {
+                        if (job.last_error_.empty()) {
+                            job.last_error_ = response == WaitResult::Timeout
+                                                  ? "试笔运动应答超时，结果未确认"
+                                                  : "试笔运动被写字机拒绝";
+                        }
                         ok = false;
                     }
                 }
@@ -1532,6 +1546,10 @@ std::string Job::RequestPenTest() {
                 aborted = job.abort_requested_.load();
                 // 已尝试运动后取消不能覆盖应答或 fresh Idle 失败。
                 stopped = aborted && (!motion_attempted || ok);
+                if (!stopped && !ok && (job.last_error_.empty() || job.last_error_ == "aborted")) {
+                    job.last_error_ = aborted ? "笔测试停止未确认，请检查写字机"
+                                              : "笔测试失败：写字机没正常应答";
+                }
                 job.SetState(stopped ? "aborted" : ok ? "done" : "error");
                 p.SetTaskSessionActive(false);
                 job.pen_test_active_.store(false);
