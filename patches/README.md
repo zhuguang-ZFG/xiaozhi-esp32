@@ -11,6 +11,7 @@
 | `esp-ml307-http-client-disconnect-wakeup.patch` | `managed_components/78__esp-ml307/src/http_client.cc` | `OnTcpDisconnected` 在头部未收齐时补 `xEventGroupSetBits(EC801E_HTTP_EVENT_ERROR)`，唤醒 `GetStatusCode` 的 event-group 等待——否则 SSL 断连后白等满 60s 超时（2026-09-06 预览「卡死一分钟」实机根因之一） | 2026-09-06 随 v6 镜像上板实证（15:19 失败 0.2s 报错，原为 60s 干等） |
 | `esp-ml307-ssl-rx-task-and-keepalive.patch` | `managed_components/78__esp-ml307/src/esp/esp_ssl.cc` | SSL 收包任务 `xTaskCreate` 结果校验（内部 RAM 耗尽时快速失败并报错，不再静默死连接）+ TCP 层 keepalive（keepidle 120s / keepintvl 10s / keepcnt 3）。背景：2026-09-06 17:45 页 2 下载 3 连超时的根因是内部 SRAM 碎片化至 L3072，收包任务 4KB 栈分配失败且无诊断 | 2026-09-06 随 TLS 复用镜像上板（HIL 待实证） |
 | `esp-ml307-http1-keepalive-default.patch` | `managed_components/78__esp-ml307/src/http_client.cc` + `include/http_client.h` | HTTP/1.1 默认持久连接（RFC 7230 §6.3）：解析 HEADERS 时识别版本置 `response_http_1_1_`，按版本决定收尾行为；`ResetRequestState` 按响应复位。配合 Job 层 TLS 复用，消除每次下载新握手带来的堆 churn | 2026-09-06 随 TLS 复用镜像上板（HIL 待实证） |
+| `esp-ml307-tls-socket-lifecycle.patch` | `managed_components/78__esp-ml307/src/esp/esp_ssl.cc` + `src/esp/esp_ssl.h` | Disconnect 先 shutdown 保留 sockfd，接收线程退出后 `esp_tls_conn_destroy` 唯一 close。最多等待 3×10s；超时放弃 TLS 所有权并泄漏事件组，避免无限阻塞或对仍在跑的接收线程 UAF。读失败记录 ret/errno/内部堆，主动关闭不冒充网络失败 | 2026-10-22 1.0.47 起登记；1.0.48 收紧有限等待。不把源码修复等同历史 OTA 唯一根因 |
 
 ## 应用方法
 
@@ -42,4 +43,4 @@ git apply patches/<name>.patch
 
 **任何 reconfigure / fullclean / 换机构建后，必须复核 `sdkconfig` 里这两项与 defaults 一致**（构建目录 resync 根 sdkconfig 的漂移曾静默覆盖此配置）。验证：`grep -E "TX_BUFFER_TYPE|DYNAMIC_TX_BUFFER_NUM" sdkconfig` 应为 `=1` 和 `=32`。
 
-2026-10-22 TLS生命周期补丁：esp-ml307-tls-socket-lifecycle.patch在三份既有补丁之后应用，Disconnect先shutdown保留socket编号，接收线程退出后esp_tls_conn_destroy唯一close。消除旧TLS二次close关闭被其他HTTP/MQTT/板间连接复用的fd；超时不销毁仍被接收线程使用的TLS。非主动关闭的读失败记录ret/errno和内部堆，主动关闭不冒充网络失败。真实函数描述符交错回归test_tls_lifecycle.py覆盖关闭/读失败/幂等，不把源码修复等同历史OTA唯一根因或已验证出货。
+2026-10-22 TLS生命周期补丁：esp-ml307-tls-socket-lifecycle.patch在三份既有补丁之后应用（CI glob 字母序最后），Disconnect先shutdown保留socket编号，接收线程退出后esp_tls_conn_destroy唯一close。消除旧TLS二次close关闭被其他HTTP/MQTT/板间连接复用的fd。最多3×10s等待；超时放弃TLS所有权并泄漏事件组，不无限阻塞、不destroy仍被接收线程使用的对象。非主动关闭的读失败记录ret/errno和内部堆，主动关闭不冒充网络失败。真实函数描述符交错回归test_tls_lifecycle.py覆盖关闭/读失败/幂等/放弃退出，不把源码修复等同历史OTA唯一根因或已验证出货。

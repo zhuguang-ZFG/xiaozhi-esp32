@@ -23,7 +23,7 @@ PROGRAM=r'''
 #include <functional>
 #include <map>
 struct esp_tls_t {int sockfd=3;};
-int mode=0,destroyed=0,closed=0,shutdowns=0,callback_count=0,foreign_fd=-1;
+int mode=0,destroyed=0,closed=0,shutdowns=0,callback_count=0,foreign_fd=-1,waits=0;
 std::map<int,int> owners;
 bool saw_tls_before_worker_exit=false;
 using EventBits_t=int;
@@ -41,12 +41,13 @@ int shutdown(int fd,int){assert(owners[fd]==1);++shutdowns;return 0;}
 int allocate_foreign(){int fd=3;while(owners.count(fd))++fd;owners[fd]=2;return fd;}
 int esp_tls_get_conn_sockfd(esp_tls_t* p,int* out){*out=p->sockfd;return ESP_OK;}
 int esp_tls_conn_destroy(esp_tls_t* p){++destroyed;if(p->sockfd>=0)close(p->sockfd);delete p;return 0;}
-int xEventGroupWaitBits(int,int,int,int,int){foreign_fd=allocate_foreign();saw_tls_before_worker_exit=destroyed==0;return 1;}
+int xEventGroupWaitBits(int,int,int,int,int){if(mode==4){++waits;return 0;}foreign_fd=allocate_foreign();saw_tls_before_worker_exit=destroyed==0;return 1;}
 size_t heap_caps_get_free_size(int){return 32000;}
 size_t heap_caps_get_largest_free_block(int){return 16000;}
 int esp_tls_conn_read(esp_tls_t*,char*,size_t){errno=EIO;return -76;}
 struct EspSsl {
  bool connected_=true;esp_tls_t* tls_client_=nullptr;int event_group_=0,last_error_=0;
+ bool receive_abandoned_=false;
  std::function<void()> disconnect_callback_;
  std::function<void(const std::string&)> stream_callback_;
  void Disconnect();void ReceiveTask();
@@ -57,9 +58,10 @@ int main(int argc,char**argv){
  if(mode!=3)ssl.tls_client_=new esp_tls_t();
  if(mode==2){ssl.disconnect_callback_=[](){++callback_count;};ssl.ReceiveTask();assert(!ssl.connected_);assert(callback_count==1);assert(ssl.last_error_==-76);}
  ssl.Disconnect();ssl.Disconnect();
- if(mode!=3){assert(saw_tls_before_worker_exit);assert(destroyed==1);assert(closed==1);assert(owners[foreign_fd]==2);assert(owners.size()==1);}
+ if(mode==4){assert(waits==3);assert(destroyed==0);assert(closed==0);assert(shutdowns==1);assert(ssl.tls_client_==nullptr);assert(ssl.receive_abandoned_);assert(owners[3]==1);}
+ else if(mode!=3){assert(saw_tls_before_worker_exit);assert(destroyed==1);assert(closed==1);assert(owners[foreign_fd]==2);assert(owners.size()==1);}
  else assert(destroyed==0 && closed==0 && shutdowns==0);
- assert(!ssl.connected_);printf("PASS mode=%d closes=%d shutdowns=%d foreign=%d\n",mode,closed,shutdowns,foreign_fd);
+ assert(!ssl.connected_);printf("PASS mode=%d closes=%d shutdowns=%d foreign=%d waits=%d\n",mode,closed,shutdowns,foreign_fd,waits);
 }
 '''
 class TlsLifecycleTest(unittest.TestCase):
@@ -80,4 +82,5 @@ class TlsLifecycleTest(unittest.TestCase):
  def test_disconnected_transport_still_has_one_socket_owner(self):self.check(1)
  def test_unexpected_read_failure_records_error_and_notifies_once(self):self.check(2)
  def test_uninitialized_disconnect_is_idempotent(self):self.check(3)
+ def test_abandoned_receive_task_does_not_hang_or_close_foreign_fd(self):self.check(4)
 if __name__=='__main__':unittest.main()
