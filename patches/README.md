@@ -41,3 +41,5 @@ git apply patches/<name>.patch
 - `CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1` + `CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y` + `CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32`：WiFi TX 缓冲必须动态。静态 16 块会把内部 RAM 钉到 activation 任务 8KB 栈分配失败、启动链静默全停（当日实测：激活挂死、无 OTA/模型/MQTT/NTP）。
 
 **任何 reconfigure / fullclean / 换机构建后，必须复核 `sdkconfig` 里这两项与 defaults 一致**（构建目录 resync 根 sdkconfig 的漂移曾静默覆盖此配置）。验证：`grep -E "TX_BUFFER_TYPE|DYNAMIC_TX_BUFFER_NUM" sdkconfig` 应为 `=1` 和 `=32`。
+
+2026-10-22 TLS生命周期补丁：esp-ml307-tls-socket-lifecycle.patch在三份既有补丁之后应用，Disconnect先shutdown保留socket编号，接收线程退出后esp_tls_conn_destroy唯一close。消除旧TLS二次close关闭被其他HTTP/MQTT/板间连接复用的fd；超时不销毁仍被接收线程使用的TLS。非主动关闭的读失败记录ret/errno和内部堆，主动关闭不冒充网络失败。真实函数描述符交错回归test_tls_lifecycle.py覆盖关闭/读失败/幂等，不把源码修复等同历史OTA唯一根因或已验证出货。
