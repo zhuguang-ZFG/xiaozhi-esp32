@@ -45,3 +45,5 @@ git apply patches/<name>.patch
 **任何 reconfigure / fullclean / 换机构建后，必须复核 `sdkconfig` 里这两项与 defaults 一致**（构建目录 resync 根 sdkconfig 的漂移曾静默覆盖此配置）。验证：`grep -E "TX_BUFFER_TYPE|DYNAMIC_TX_BUFFER_NUM" sdkconfig` 应为 `=1` 和 `=32`。
 
 2026-10-22 TLS生命周期补丁：esp-ml307-tls-socket-lifecycle.patch在三份既有补丁之后应用，Disconnect先shutdown保留socket编号，接收线程退出后esp_tls_conn_destroy唯一close。消除旧TLS二次close关闭被其他HTTP/MQTT/板间连接复用的fd。最多3×10s等待；超时放弃TLS所有权并泄漏事件组，不无限阻塞、不destroy仍被接收线程使用的对象。1.0.49 起放弃对象禁止 Connect，并由字母序最后的 esp-ml307-z-tls-abandon-leak.patch 在 HttpClient 路径泄漏整个 EspSsl。非主动关闭的读失败记录ret/errno和内部堆，主动关闭不冒充网络失败。真实函数描述符交错回归test_tls_lifecycle.py覆盖关闭/读失败/幂等/放弃退出，源码断言覆盖 leak/拒绝重用，不把源码修复等同历史OTA唯一根因或已验证出货。
+
+2026-10-22 F49：`esp-ml307-zz-shared-receive-state.patch` 必须在上述补丁之后应用。HTTP/WebSocket 公共对象持有共享接收 State，TCP 回调弱引用 State、执行期间提升强引用；关闭标记退休、有限等待并唤醒 HTTP 背压，旧 State 不被新请求复用。放弃接收者后保留借用 TLS 指针，拒绝继续发送/重连；State 析构仅释放已放弃 Tcp 的所有权，避免接收线程访问已释放对象。正常 HTTP 同源 keepalive 保留，跨源重建；握手失败和未连接析构也回收。完整 HTTP/WebSocket 宿主回归见 `scripts/tests/test_transport_owner_lifetime.py`；版本 1.0.50，构建与上板状态分开记录于枢纽 readiness。

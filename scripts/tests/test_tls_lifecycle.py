@@ -58,7 +58,7 @@ int main(int argc,char**argv){
  if(mode!=3)ssl.tls_client_=new esp_tls_t();
  if(mode==2){ssl.disconnect_callback_=[](){++callback_count;};ssl.ReceiveTask();assert(!ssl.connected_);assert(callback_count==1);assert(ssl.last_error_==-76);}
  ssl.Disconnect();ssl.Disconnect();
- if(mode==4){assert(waits==3);assert(destroyed==0);assert(closed==0);assert(shutdowns==1);assert(ssl.tls_client_==nullptr);assert(ssl.receive_abandoned_);assert(owners[3]==1);}
+ if(mode==4){assert(waits==3);assert(destroyed==0);assert(closed==0);assert(shutdowns==1);assert(ssl.tls_client_!=nullptr);assert(ssl.receive_abandoned_);assert(owners[3]==1);}
  else if(mode!=3){assert(saw_tls_before_worker_exit);assert(destroyed==1);assert(closed==1);assert(owners[foreign_fd]==2);assert(owners.size()==1);}
  else assert(destroyed==0 && closed==0 && shutdowns==0);
  assert(!ssl.connected_);printf("PASS mode=%d closes=%d shutdowns=%d foreign=%d waits=%d\n",mode,closed,shutdowns,foreign_fd,waits);

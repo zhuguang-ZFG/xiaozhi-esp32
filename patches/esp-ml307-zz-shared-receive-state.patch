@@ -1,0 +1,831 @@
+diff --git a/managed_components/78__esp-ml307/include/tcp.h b/managed_components/78__esp-ml307/include/tcp.h
+index 591a723..1a33b42 100644
+--- a/managed_components/78__esp-ml307/include/tcp.h
++++ b/managed_components/78__esp-ml307/include/tcp.h
+@@ -4,6 +4,7 @@
+ 
+ #include <string>
+ #include <functional>
++#include <atomic>
+ 
+ class Tcp {
+ public:
+@@ -34,7 +35,7 @@ protected:
+     std::function<void()> disconnect_callback_;
+     
+     // 连接状态管理
+-    bool connected_ = false;         // 是否可以正常读写数据
++    std::atomic<bool> connected_{false};         // 是否可以正常读写数据
+ };
+ 
+ #endif // TCP_H
+diff --git a/managed_components/78__esp-ml307/include/http_client.h b/managed_components/78__esp-ml307/include/http_client.h
+index 68f8d35..33844d5 100644
+--- a/managed_components/78__esp-ml307/include/http_client.h
++++ b/managed_components/78__esp-ml307/include/http_client.h
+@@ -13,6 +13,7 @@
+ #include <condition_variable>
+ #include <optional>
+ #include <memory>
++#include <atomic>
+ #include <deque>
+ #include <cstring>
+ 
+@@ -46,6 +47,37 @@ public:
+     std::string ReadAll() override;
+     int GetLastError() override;
+ 
++private:
++    class State;
++    std::shared_ptr<State> state_;
++};
++
++class HttpClient::State : public std::enable_shared_from_this<HttpClient::State>, public Http {
++public:
++    State(NetworkInterface* network, int connect_id = 0);
++    ~State();
++
++    void SetTimeout(int timeout_ms) override;
++    void SetHeader(const std::string& key, const std::string& value) override;
++    void SetContent(std::string&& content) override;
++    bool Open(const std::string& method, const std::string& url) override;
++    void Close() override;
++    int Read(char* buffer, size_t buffer_size) override;
++    int Write(const char* buffer, size_t buffer_size) override;
++    
++    // Keep-Alive support
++    void SetKeepAlive(bool enable);
++    bool IsConnectionReusable(const std::string& host, int port) const;
++
++    int GetStatusCode() override;
++    std::string GetResponseHeader(const std::string& key) const override;
++    size_t GetBodyLength() override;
++    std::string ReadAll() override;
++    int GetLastError() override;
++
++    std::shared_ptr<State> NewState() const;
++    void Shutdown();
++    bool CanReuse(const std::string& url) const;
+ private:
+     // 数据块结构，用于队列缓冲
+     struct DataChunk {
+@@ -88,7 +120,7 @@ private:
+     int connect_id_;
+     std::unique_ptr<Tcp> tcp_;
+     EventGroupHandle_t event_group_handle_;
+-    std::mutex mutex_;
++    mutable std::mutex mutex_;
+     std::condition_variable cv_;
+     
+     // 用于读取操作的专门锁和缓冲区队列
+@@ -102,6 +134,7 @@ private:
+     std::string rx_buffer_;
+     std::map<std::string, HeaderEntry> headers_;  // key为小写，用于快速查找
+     std::string url_;
++    std::string connected_origin_;
+     std::string method_;
+     std::string protocol_;
+     std::string host_;
+@@ -114,12 +147,13 @@ private:
+     size_t body_offset_ = 0;
+     size_t content_length_ = 0;
+     size_t total_body_received_ = 0;  // 总共接收的响应体字节数
+-    bool eof_ = false;
+-    bool connected_ = false;
++    std::atomic<bool> eof_{false};
++    std::atomic<bool> connected_{false};
++    std::atomic<bool> retired_{false};
+     bool headers_received_ = false;
+     bool request_chunked_ = false;
+     bool response_chunked_ = false;
+-    bool connection_error_ = false;  // 新增：标记连接是否异常断开
++    std::atomic<bool> connection_error_{false};  // 新增：标记连接是否异常断开
+     bool keep_alive_ = false;  // 新增：是否启用 Keep-Alive（默认不启用）
+     bool server_keep_alive_ = false;  // 新增：服务器是否支持 Keep-Alive
+     bool response_http_1_1_ = false;  // 新增：响应 HTTP 版本 ≥1.1（持久连接默认语义）
+diff --git a/managed_components/78__esp-ml307/src/http_client.cc b/managed_components/78__esp-ml307/src/http_client.cc
+index ad8ac63..24d063a 100644
+--- a/managed_components/78__esp-ml307/src/http_client.cc
++++ b/managed_components/78__esp-ml307/src/http_client.cc
+@@ -10,44 +10,42 @@
+ 
+ static const char *TAG = "HttpClient";
+ 
+-HttpClient::HttpClient(NetworkInterface* network, int connect_id) : network_(network), connect_id_(connect_id) {
++HttpClient::State::State(NetworkInterface* network, int connect_id) : network_(network), connect_id_(connect_id) {
+     event_group_handle_ = xEventGroupCreate();
+ }
+ 
+-HttpClient::~HttpClient() {
+-    if (connected_) {
+-        Close();
+-    }
++HttpClient::State::~State() {
++    Shutdown();
+     LeakAbandonedTransport();
+     vEventGroupDelete(event_group_handle_);
+ }
+ 
+-void HttpClient::LeakAbandonedTransport() {
++void HttpClient::State::LeakAbandonedTransport() {
+     if (tcp_ && tcp_->ReceiveAbandoned()) {
+         (void)tcp_.release();
+     }
+ }
+ 
+-void HttpClient::SetTimeout(int timeout_ms) {
++void HttpClient::State::SetTimeout(int timeout_ms) {
+     timeout_ms_ = timeout_ms;
+ }
+ 
+-void HttpClient::SetHeader(const std::string& key, const std::string& value) {
++void HttpClient::State::SetHeader(const std::string& key, const std::string& value) {
+     // 转换key为小写用于存储和查找，但保留原始key用于输出
+     std::string lower_key = key;
+     std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+     headers_[lower_key] = HeaderEntry(key, value);
+ }
+ 
+-void HttpClient::SetContent(std::string&& content) {
++void HttpClient::State::SetContent(std::string&& content) {
+     content_ = std::move(content);
+ }
+ 
+-void HttpClient::SetKeepAlive(bool enable) {
++void HttpClient::State::SetKeepAlive(bool enable) {
+     keep_alive_ = enable;
+ }
+ 
+-bool HttpClient::IsConnectionReusable(const std::string& host, int port) const {
++bool HttpClient::State::IsConnectionReusable(const std::string& host, int port) const {
+     // 检查是否可以复用连接：
+     // 1. 已连接
+     // 2. host 和 port 相同
+@@ -62,7 +60,7 @@ bool HttpClient::IsConnectionReusable(const std::string& host, int port) const {
+            IsDataComplete();
+ }
+ 
+-bool HttpClient::ParseUrl(const std::string& url) {
++bool HttpClient::State::ParseUrl(const std::string& url) {
+     // 解析 URL: protocol://host:port/path
+     size_t protocol_end = url.find("://");
+     if (protocol_end == std::string::npos) {
+@@ -123,7 +121,7 @@ bool HttpClient::ParseUrl(const std::string& url) {
+     return true;
+ }
+ 
+-std::string HttpClient::BuildHttpRequest() {
++std::string HttpClient::State::BuildHttpRequest() {
+     std::ostringstream request;
+ 
+     // 请求行
+@@ -176,7 +174,8 @@ std::string HttpClient::BuildHttpRequest() {
+     return request.str();
+ }
+ 
+-bool HttpClient::Open(const std::string& method, const std::string& url) {
++bool HttpClient::State::Open(const std::string& method, const std::string& url) {
++    if (retired_) return false;
+     method_ = method;
+     url_ = url;
+     
+@@ -187,6 +186,7 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
+     // 检查是否可以复用现有连接
+     bool can_reuse = IsConnectionReusable(host_, port_);
+     
++    if (tcp_ && !can_reuse) { Shutdown(); return false; }
+     uint32_t t_connect = xTaskGetTickCount() * portTICK_PERIOD_MS;
+     if (can_reuse) {
+         ESP_LOGI(TAG, "Reusing existing connection to %s:%d", host_.c_str(), port_);
+@@ -212,13 +212,13 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
+         }
+ 
+         // 设置 TCP 数据接收回调
+-        tcp_->OnStream([this](const std::string& data) {
+-            OnTcpData(data);
++        tcp_->OnStream([weak = weak_from_this()](const std::string& data) {
++            if (auto state = weak.lock(); state && !state->retired_) state->OnTcpData(data);
+         });
+ 
+         // 设置 TCP 断开连接回调
+-        tcp_->OnDisconnected([this]() {
+-            OnTcpDisconnected();
++        tcp_->OnDisconnected([weak = weak_from_this()]() {
++            if (auto state = weak.lock(); state && !state->retired_) state->OnTcpDisconnected();
+         });
+         
+         if (!tcp_->Connect(host_, port_)) {
+@@ -229,6 +229,7 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
+         uint32_t t_connected = xTaskGetTickCount() * portTICK_PERIOD_MS;
+         
+         connected_ = true;
++        connected_origin_ = url.substr(0, url.find('/', url.find("://") + 3));
+         ESP_LOGI(TAG, "Established new connection to %s:%d protocol=%s cost=%u", host_.c_str(), port_, protocol_.c_str(), t_connected - t_connect);
+     }
+     
+@@ -238,9 +239,7 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
+     std::string http_request = BuildHttpRequest();
+     if (tcp_->Send(http_request) <= 0) {
+         ESP_LOGE(TAG, "Send HTTP request failed");
+-        tcp_->Disconnect();
+-        connected_ = false;
+-        LeakAbandonedTransport();
++        Shutdown();
+         return false;
+     }
+ 
+@@ -251,26 +250,28 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
+     return true;
+ }
+ 
+-void HttpClient::Close() {
+-    if (!connected_) {
+-        return;
+-    }
++void HttpClient::State::Close() { Shutdown(); }
+ 
+-    connected_ = false;
+-    server_keep_alive_ = false;  // 重置 Keep-Alive 标志
++void HttpClient::State::Shutdown() {
++    if (retired_.exchange(true)) return;
++    // 与背压等待共用锁，使条件变更和通知不能落在谓词检查与睡眠之间。
++    {
++        std::lock_guard<std::mutex> lock(read_mutex_);
++        connected_ = false;
++        eof_ = true;
++    }
+     write_cv_.notify_all();
++    cv_.notify_all();
++    // 不受 connected_ 影响：远端断开也必须等待接收者，放弃对象到 State 析构时才释放所有权。
+     if (tcp_) {
+         tcp_->Disconnect();
+-        LeakAbandonedTransport();
++        last_error_ = tcp_->GetLastError();
+     }
+-
+-    eof_ = true;
+-    cv_.notify_all();
+-    ESP_LOGI(TAG, "HTTP connection closed");
+ }
+ 
+-void HttpClient::OnTcpData(const std::string& data) {
++void HttpClient::State::OnTcpData(const std::string& data) {
+     std::lock_guard<std::mutex> lock(mutex_);
++    if (retired_) return;
+ 
+     // 检查 body_chunks_ 大小，如果超过 8KB
+     {
+@@ -284,13 +285,15 @@ void HttpClient::OnTcpData(const std::string& data) {
+         });
+     }
+ 
++    if (retired_) return;
+     rx_buffer_.append(data);
+     ProcessReceivedData();
+     cv_.notify_one();
+ }
+ 
+-void HttpClient::OnTcpDisconnected() {
++void HttpClient::State::OnTcpDisconnected() {
+     std::lock_guard<std::mutex> lock(mutex_);
++    if (retired_) return;
+     connected_ = false;
+     server_keep_alive_ = false;  // 连接断开，重置 Keep-Alive 标志
+ 
+@@ -316,7 +319,7 @@ void HttpClient::OnTcpDisconnected() {
+     cv_.notify_all();  // 通知所有等待的读取操作
+ }
+ 
+-void HttpClient::ProcessReceivedData() {
++void HttpClient::State::ProcessReceivedData() {
+     while (!rx_buffer_.empty() && parse_state_ != ParseState::COMPLETE) {
+         switch (parse_state_) {
+             case ParseState::STATUS_LINE: {
+@@ -476,7 +479,7 @@ void HttpClient::ProcessReceivedData() {
+     }
+ }
+ 
+-bool HttpClient::ParseStatusLine(const std::string& line) {
++bool HttpClient::State::ParseStatusLine(const std::string& line) {
+     // HTTP/1.1 200 OK
+     std::istringstream iss(line);
+     std::string version, status_str, reason;
+@@ -507,7 +510,7 @@ bool HttpClient::ParseStatusLine(const std::string& line) {
+     return true;
+ }
+ 
+-bool HttpClient::ParseHeaderLine(const std::string& line) {
++bool HttpClient::State::ParseHeaderLine(const std::string& line) {
+     size_t colon_pos = line.find(':');
+     if (colon_pos == std::string::npos) {
+         ESP_LOGE(TAG, "Invalid header line: %s", line.c_str());
+@@ -532,11 +535,11 @@ bool HttpClient::ParseHeaderLine(const std::string& line) {
+     return true;
+ }
+ 
+-void HttpClient::ParseChunkedBody(const std::string& data) {
++void HttpClient::State::ParseChunkedBody(const std::string& data) {
+     // Chunked body 在 ProcessReceivedData 中的状态机中处理
+ }
+ 
+-void HttpClient::ParseRegularBody(const std::string& data) {
++void HttpClient::State::ParseRegularBody(const std::string& data) {
+     if (!data.empty()) {
+         AddBodyData(data);  // 使用新的方法添加数据
+         total_body_received_ += data.size();  // 累加接收的字节数
+@@ -544,7 +547,7 @@ void HttpClient::ParseRegularBody(const std::string& data) {
+     }
+ }
+ 
+-size_t HttpClient::ParseChunkSize(const std::string& chunk_size_line) {
++size_t HttpClient::State::ParseChunkSize(const std::string& chunk_size_line) {
+     // 解析 chunk size（十六进制）
+     std::string size_str = chunk_size_line;
+ 
+@@ -568,7 +571,7 @@ size_t HttpClient::ParseChunkSize(const std::string& chunk_size_line) {
+     return static_cast<size_t>(chunk_size);
+ }
+ 
+-std::string HttpClient::GetNextLine(std::string& buffer) {
++std::string HttpClient::State::GetNextLine(std::string& buffer) {
+     size_t pos = buffer.find('\n');
+     if (pos == std::string::npos) {
+         return "";  // 没有完整的行
+@@ -585,16 +588,16 @@ std::string HttpClient::GetNextLine(std::string& buffer) {
+     return line;
+ }
+ 
+-bool HttpClient::HasCompleteLine(const std::string& buffer) {
++bool HttpClient::State::HasCompleteLine(const std::string& buffer) {
+     return buffer.find('\n') != std::string::npos;
+ }
+ 
+-void HttpClient::SetError() {
++void HttpClient::State::SetError() {
+     ESP_LOGE(TAG, "HTTP parse error");
+     xEventGroupSetBits(event_group_handle_, EC801E_HTTP_EVENT_ERROR);
+ }
+ 
+-int HttpClient::Read(char* buffer, size_t buffer_size) {
++int HttpClient::State::Read(char* buffer, size_t buffer_size) {
+     std::unique_lock<std::mutex> read_lock(read_mutex_);
+ 
+     // 如果连接异常断开，返回错误
+@@ -673,7 +676,7 @@ int HttpClient::Read(char* buffer, size_t buffer_size) {
+     return 0;
+ }
+ 
+-int HttpClient::Write(const char* buffer, size_t buffer_size) {
++int HttpClient::State::Write(const char* buffer, size_t buffer_size) {
+     if (!connected_) {
+         ESP_LOGE(TAG, "Cannot write: connection closed");
+         return -1;
+@@ -705,7 +708,7 @@ int HttpClient::Write(const char* buffer, size_t buffer_size) {
+     }
+ }
+ 
+-int HttpClient::GetStatusCode() {
++int HttpClient::State::GetStatusCode() {
+     if (!headers_received_) {
+         // 等待头部接收
+         auto bits = xEventGroupWaitBits(event_group_handle_,
+@@ -725,7 +728,7 @@ int HttpClient::GetStatusCode() {
+     return status_code_;
+ }
+ 
+-std::string HttpClient::GetResponseHeader(const std::string& key) const {
++std::string HttpClient::State::GetResponseHeader(const std::string& key) const {
+     // 转换为小写进行查找
+     std::string lower_key = key;
+     std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+@@ -737,7 +740,7 @@ std::string HttpClient::GetResponseHeader(const std::string& key) const {
+     return "";
+ }
+ 
+-size_t HttpClient::GetBodyLength() {
++size_t HttpClient::State::GetBodyLength() {
+     if (!headers_received_) {
+         GetStatusCode();  // 这会等待头部接收
+     }
+@@ -749,7 +752,7 @@ size_t HttpClient::GetBodyLength() {
+     return content_length_;
+ }
+ 
+-void HttpClient::AddBodyData(const std::string& data) {
++void HttpClient::State::AddBodyData(const std::string& data) {
+     if (data.empty()) return;
+ 
+     std::lock_guard<std::mutex> read_lock(read_mutex_);
+@@ -758,7 +761,7 @@ void HttpClient::AddBodyData(const std::string& data) {
+     write_cv_.notify_one();  // 通知写入操作
+ }
+ 
+-void HttpClient::AddBodyData(std::string&& data) {
++void HttpClient::State::AddBodyData(std::string&& data) {
+     if (data.empty()) return;
+ 
+     std::lock_guard<std::mutex> read_lock(read_mutex_);
+@@ -767,7 +770,7 @@ void HttpClient::AddBodyData(std::string&& data) {
+     write_cv_.notify_one();  // 通知写入操作
+ }
+ 
+-std::string HttpClient::ReadAll() {
++std::string HttpClient::State::ReadAll() {
+     std::unique_lock<std::mutex> lock(mutex_);
+ 
+     // 等待完成或出错
+@@ -797,7 +800,7 @@ std::string HttpClient::ReadAll() {
+     return result;
+ }
+ 
+-bool HttpClient::IsDataComplete() const {
++bool HttpClient::State::IsDataComplete() const {
+     // 对于chunked编码，如果parse_state_是COMPLETE，说明接收完整
+     if (response_chunked_) {
+         return parse_state_ == ParseState::COMPLETE;
+@@ -813,14 +816,14 @@ bool HttpClient::IsDataComplete() const {
+     return true;
+ }
+ 
+-int HttpClient::GetLastError() {
++int HttpClient::State::GetLastError() {
+     if (tcp_) {
+         return tcp_->GetLastError();
+     }
+     return last_error_;
+ }
+ 
+-void HttpClient::ResetRequestState() {
++void HttpClient::State::ResetRequestState() {
+     // 重置请求状态，但保持连接
+     status_code_ = -1;
+     response_headers_.clear();
+@@ -853,3 +856,43 @@ void HttpClient::ResetRequestState() {
+                          EC801E_HTTP_EVENT_ERROR |
+                          EC801E_HTTP_EVENT_COMPLETE);
+ }
++
++// State 被正在执行的回调持有；公共对象退场不会销毁其事件组或解析缓冲。
++HttpClient::HttpClient(NetworkInterface* network, int connect_id) : state_(std::make_shared<State>(network, connect_id)) {}
++HttpClient::~HttpClient() { state_->Shutdown(); }
++std::shared_ptr<HttpClient::State> HttpClient::State::NewState() const {
++    auto next = std::make_shared<State>(network_, connect_id_);
++    next->timeout_ms_ = timeout_ms_;
++    next->headers_ = headers_;
++    next->content_ = content_;
++    next->keep_alive_ = keep_alive_;
++    return next;
++}
++bool HttpClient::State::CanReuse(const std::string& url) const {
++    // 接收者可能正等待读者腾出队列；不能持此锁等待，用新状态关闭/唤醒旧请求。
++    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++    return lock.owns_lock() && !retired_ &&
++           connected_origin_ == url.substr(0, url.find('/', url.find("://") + 3)) &&
++           IsConnectionReusable(host_, port_);
++}
++bool HttpClient::Open(const std::string& method, const std::string& url) {
++    if (!state_->CanReuse(url)) {
++        auto next = state_->NewState();
++        state_->Shutdown();
++        state_ = std::move(next);
++    }
++    return state_->Open(method, url);
++}
++void HttpClient::SetTimeout(int timeout_ms) { state_->SetTimeout(timeout_ms); }
++void HttpClient::SetHeader(const std::string& key, const std::string& value) { state_->SetHeader(key, value); }
++void HttpClient::SetContent(std::string&& content) { state_->SetContent(std::move(content)); }
++void HttpClient::Close() { state_->Close(); }
++int HttpClient::Read(char* buffer, size_t buffer_size) { return state_->Read(buffer, buffer_size); }
++int HttpClient::Write(const char* buffer, size_t buffer_size) { return state_->Write(buffer, buffer_size); }
++void HttpClient::SetKeepAlive(bool enable) { state_->SetKeepAlive(enable); }
++bool HttpClient::IsConnectionReusable(const std::string& host, int port) const { return state_->IsConnectionReusable(host, port); }
++int HttpClient::GetStatusCode() { return state_->GetStatusCode(); }
++std::string HttpClient::GetResponseHeader(const std::string& key) const { return state_->GetResponseHeader(key); }
++size_t HttpClient::GetBodyLength() { return state_->GetBodyLength(); }
++std::string HttpClient::ReadAll() { return state_->ReadAll(); }
++int HttpClient::GetLastError() { return state_->GetLastError(); }
+diff --git a/managed_components/78__esp-ml307/include/web_socket.h b/managed_components/78__esp-ml307/include/web_socket.h
+index 382964a..3c7e958 100644
+--- a/managed_components/78__esp-ml307/include/web_socket.h
++++ b/managed_components/78__esp-ml307/include/web_socket.h
+@@ -7,6 +7,7 @@
+ #include <vector>
+ #include <mutex>
+ #include <memory>
++#include <atomic>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/event_groups.h>
+ 
+@@ -43,6 +44,42 @@ public:
+     // 获取最后一次错误码
+     int GetLastError();
+ 
++private:
++    class State;
++    std::shared_ptr<State> state_;
++};
++
++class WebSocket::State : public std::enable_shared_from_this<WebSocket::State> {
++public:
++    State(NetworkInterface* network, int connect_id);
++    ~State();
++
++    void SetHeader(const char* key, const char* value);
++    void SetReceiveBufferSize(size_t size);
++    bool IsConnected() const;
++    bool Connect(const char* uri);
++    bool Send(const std::string& data);
++    bool Send(const void* data, size_t len, bool binary = false, bool fin = true);
++    void Ping();
++    void Close();
++
++    void OnConnected(std::function<void()> callback);
++    void OnDisconnected(std::function<void()> callback);
++    void OnData(std::function<void(const char*, size_t, bool binary)> callback);
++    void OnError(std::function<void(int)> callback);
++    // Invoked when a Pong control frame (opcode 0xA) is received from the
++    // peer, carrying the Pong's application data payload (which echoes the
++    // payload of the Ping that triggered it). Lets callers implement an
++    // active liveness check (send Ping(), expect OnPong within a timeout)
++    // or measure round-trip time, without the library imposing any timeout
++    // policy of its own.
++    void OnPong(std::function<void(const char*, size_t)> callback);
++
++    // 获取最后一次错误码
++    int GetLastError();
++
++    std::shared_ptr<State> NewState() const;
++    void Shutdown();
+ private:
+     NetworkInterface* network_;
+     int connect_id_;
+@@ -51,7 +88,8 @@ private:
+     size_t receive_buffer_size_ = 2048;
+     std::string receive_buffer_;
+     bool handshake_completed_ = false;
+-    bool connected_ = false;
++    std::atomic<bool> connected_{false};
++    std::atomic<bool> retired_{false};
+ 
+     // Mutex for sending data and replying pong
+     std::mutex send_mutex_;
+diff --git a/managed_components/78__esp-ml307/src/web_socket.cc b/managed_components/78__esp-ml307/src/web_socket.cc
+index a2b1f21..09e2648 100644
+--- a/managed_components/78__esp-ml307/src/web_socket.cc
++++ b/managed_components/78__esp-ml307/src/web_socket.cc
+@@ -41,32 +41,36 @@ static std::string base64_encode(const unsigned char *data, size_t len) {
+ }
+ 
+ 
+-WebSocket::WebSocket(NetworkInterface* network, int connect_id) : network_(network), connect_id_(connect_id) {
++WebSocket::State::State(NetworkInterface* network, int connect_id) : network_(network), connect_id_(connect_id) {
+     handshake_event_group_ = xEventGroupCreate();
+ }
+ 
+-WebSocket::~WebSocket() {
+-    if (connected_) {
+-        tcp_->Disconnect();
+-    }
+-    if (handshake_event_group_) {
+-        vEventGroupDelete(handshake_event_group_);
+-    }
++WebSocket::State::~State() {
++    Shutdown();
++    if (tcp_ && tcp_->ReceiveAbandoned()) (void)tcp_.release();
++    if (handshake_event_group_) vEventGroupDelete(handshake_event_group_);
++}
++
++void WebSocket::State::Shutdown() {
++    if (retired_.exchange(true)) return;
++    connected_ = false;
++    // 即使握手失败/远端先断开也要等待；保留 State 可让已进入的回调安全返回。
++    if (tcp_) tcp_->Disconnect();
+ }
+ 
+-void WebSocket::SetHeader(const char* key, const char* value) {
++void WebSocket::State::SetHeader(const char* key, const char* value) {
+     headers_[key] = value;
+ }
+ 
+-void WebSocket::SetReceiveBufferSize(size_t size) {
++void WebSocket::State::SetReceiveBufferSize(size_t size) {
+     receive_buffer_size_ = size;
+ }
+ 
+-bool WebSocket::IsConnected() const {
++bool WebSocket::State::IsConnected() const {
+     return connected_;
+ }
+ 
+-bool WebSocket::Connect(const char* uri) {
++bool WebSocket::State::Connect(const char* uri) {
+     std::string uri_str(uri);
+     std::string protocol, host, port, path;
+     size_t pos = 0;
+@@ -152,17 +156,14 @@ bool WebSocket::Connect(const char* uri) {
+     xEventGroupClearBits(handshake_event_group_, HANDSHAKE_SUCCESS_BIT | HANDSHAKE_FAILED_BIT);
+ 
+     // 设置数据接收回调来处理握手和后续的WebSocket帧
+-    tcp_->OnStream([this](const std::string& data) {
+-        this->OnTcpData(data);
++    tcp_->OnStream([weak = weak_from_this()](const std::string& data) {
++        if (auto state = weak.lock(); state && !state->retired_) state->OnTcpData(data);
+     });
+ 
+     // 设置断开连接回调
+-    tcp_->OnDisconnected([this]() {
+-        if (connected_) {
+-            connected_ = false;
+-            if (on_disconnected_) {
+-                on_disconnected_();
+-            }
++    tcp_->OnDisconnected([weak = weak_from_this()]() {
++        if (auto state = weak.lock(); state && !state->retired_ && state->connected_.exchange(false)) {
++            if (state->on_disconnected_) state->on_disconnected_();
+         }
+     });
+ 
+@@ -201,11 +202,12 @@ bool WebSocket::Connect(const char* uri) {
+ }
+ 
+ 
+-bool WebSocket::Send(const std::string& data) {
++bool WebSocket::State::Send(const std::string& data) {
+     return Send(data.data(), data.size(), false);
+ }
+ 
+-bool WebSocket::Send(const void* data, size_t len, bool binary, bool fin) {
++bool WebSocket::State::Send(const void* data, size_t len, bool binary, bool fin) {
++    if (retired_ || !tcp_) return false;
+     if (len > 65535) {
+         ESP_LOGE(TAG, "Data too large, maximum supported size is 65535 bytes");
+         return false;
+@@ -254,44 +256,44 @@ bool WebSocket::Send(const void* data, size_t len, bool binary, bool fin) {
+     return tcp_->Send(frame) >= 0;
+ }
+ 
+-void WebSocket::Ping() {
++void WebSocket::State::Ping() {
+     SendControlFrame(0x9, nullptr, 0);
+ }
+ 
+-void WebSocket::Close() {
++void WebSocket::State::Close() {
+     if (connected_) {
+         SendControlFrame(0x8, nullptr, 0);
+     }
+ }
+ 
+-void WebSocket::OnConnected(std::function<void()> callback) {
++void WebSocket::State::OnConnected(std::function<void()> callback) {
+     on_connected_ = callback;
+ }
+ 
+-void WebSocket::OnDisconnected(std::function<void()> callback) {
++void WebSocket::State::OnDisconnected(std::function<void()> callback) {
+     on_disconnected_ = callback;
+ }
+ 
+-void WebSocket::OnData(std::function<void(const char*, size_t, bool binary)> callback) {
++void WebSocket::State::OnData(std::function<void(const char*, size_t, bool binary)> callback) {
+     on_data_ = callback;
+ }
+ 
+-void WebSocket::OnError(std::function<void(int)> callback) {
++void WebSocket::State::OnError(std::function<void(int)> callback) {
+     on_error_ = callback;
+ }
+ 
+-void WebSocket::OnPong(std::function<void(const char*, size_t)> callback) {
++void WebSocket::State::OnPong(std::function<void(const char*, size_t)> callback) {
+     on_pong_ = callback;
+ }
+ 
+-int WebSocket::GetLastError() {
++int WebSocket::State::GetLastError() {
+     if (tcp_) {
+         return tcp_->GetLastError();
+     }
+     return 0;  // No error if TCP connection doesn't exist
+ }
+ 
+-void WebSocket::OnTcpData(const std::string& data) {
++void WebSocket::State::OnTcpData(const std::string& data) {
+     // 将新数据追加到接收缓冲区
+     receive_buffer_.append(data);
+     
+@@ -323,7 +325,7 @@ void WebSocket::OnTcpData(const std::string& data) {
+     const uint8_t* buffer = reinterpret_cast<const uint8_t*>(receive_buffer_.data());
+     size_t buffer_size = receive_buffer_.size();
+     
+-    while (buffer_offset < buffer_size) {
++    while (!retired_ && buffer_offset < buffer_size) {
+         if (buffer_size - buffer_offset < 2) break; // 需要更多数据
+ 
+         uint8_t opcode = buffer[buffer_offset] & 0x0F;
+@@ -381,7 +383,7 @@ void WebSocket::OnTcpData(const std::string& data) {
+                 }
+                 current_message_.insert(current_message_.end(), payload.begin(), payload.end());
+                 if (fin) {
+-                    if (on_data_) {
++                    if (!retired_ && on_data_) {
+                         on_data_(current_message_.data(), current_message_.size(), is_binary_);
+                     }
+                     current_message_.clear();
+@@ -390,7 +392,7 @@ void WebSocket::OnTcpData(const std::string& data) {
+                 break;
+             case 0x8: // 关闭帧
+                 connected_ = false;
+-                if (on_disconnected_) {
++                if (!retired_ && on_disconnected_) {
+                     on_disconnected_();
+                 }
+                 break;
+@@ -398,7 +400,7 @@ void WebSocket::OnTcpData(const std::string& data) {
+                 SendControlFrame(0xA, payload.data(), payload_length);
+                 break;
+             case 0xA: // Pong
+-                if (on_pong_) {
++                if (!retired_ && on_pong_) {
+                     on_pong_(payload.data(), payload_length);
+                 }
+                 break;
+@@ -418,7 +420,8 @@ void WebSocket::OnTcpData(const std::string& data) {
+ 
+ 
+ 
+-bool WebSocket::SendControlFrame(uint8_t opcode, const void* data, size_t len) {
++bool WebSocket::State::SendControlFrame(uint8_t opcode, const void* data, size_t len) {
++    if (retired_ || !tcp_) return false;
+     if (len > 125) {
+         ESP_LOGE(TAG, "控制帧有效载荷过大");
+         return false;
+@@ -449,4 +452,37 @@ bool WebSocket::SendControlFrame(uint8_t opcode, const void* data, size_t len) {
+     // 发送帧
+     std::lock_guard<std::mutex> lock(send_mutex_);
+     return tcp_->Send(frame) >= 0;
+-}
+\ No newline at end of file
++}WebSocket::WebSocket(NetworkInterface* network, int connect_id) : state_(std::make_shared<State>(network, connect_id)) {}
++WebSocket::~WebSocket() { state_->Shutdown(); }
++std::shared_ptr<WebSocket::State> WebSocket::State::NewState() const {
++    auto next = std::make_shared<State>(network_, connect_id_);
++    next->headers_ = headers_;
++    next->receive_buffer_size_ = receive_buffer_size_;
++    next->on_data_ = on_data_;
++    next->on_connected_ = on_connected_;
++    next->on_disconnected_ = on_disconnected_;
++    next->on_error_ = on_error_;
++    next->on_pong_ = on_pong_;
++    return next;
++}
++bool WebSocket::Connect(const char* uri) {
++    auto next = state_->NewState();
++    state_->Shutdown();
++    state_ = std::move(next);
++    const bool connected = state_->Connect(uri);
++    if (!connected) state_->Shutdown();
++    return connected;
++}
++void WebSocket::SetHeader(const char* key, const char* value) { state_->SetHeader(key, value); }
++void WebSocket::SetReceiveBufferSize(size_t size) { state_->SetReceiveBufferSize(size); }
++bool WebSocket::IsConnected() const { return state_->IsConnected(); }
++bool WebSocket::Send(const std::string& data) { return state_->Send(data); }
++bool WebSocket::Send(const void* data, size_t len, bool binary, bool fin) { return state_->Send(data, len, binary, fin); }
++void WebSocket::Ping() { state_->Ping(); }
++void WebSocket::Close() { state_->Close(); }
++int WebSocket::GetLastError() { return state_->GetLastError(); }
++void WebSocket::OnConnected(std::function<void()> callback) { state_->OnConnected(std::move(callback)); }
++void WebSocket::OnDisconnected(std::function<void()> callback) { state_->OnDisconnected(std::move(callback)); }
++void WebSocket::OnData(std::function<void(const char*, size_t, bool)> callback) { state_->OnData(std::move(callback)); }
++void WebSocket::OnError(std::function<void(int)> callback) { state_->OnError(std::move(callback)); }
++void WebSocket::OnPong(std::function<void(const char*, size_t)> callback) { state_->OnPong(std::move(callback)); }
+diff --git a/managed_components/78__esp-ml307/src/esp/esp_ssl.cc b/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
+index d78a4c3..e70fdbe 100644
+--- a/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
++++ b/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
+@@ -105,6 +105,7 @@ bool EspSsl::Connect(const std::string& host, int port) {
+ 
+ void EspSsl::Disconnect() {
+     connected_ = false;
++    if (receive_abandoned_) return;
+     
+     // Close socket if it is open
+     if (tls_client_ != nullptr) {
+@@ -129,7 +130,7 @@ void EspSsl::Disconnect() {
+                 // 有限等待后放弃所有权：不destroy仍被接收线程使用的TLS，也不删其事件组。
+                 ESP_LOGE(TAG, "TLS receive task did not exit after shutdown; leaking socket ownership");
+                 receive_abandoned_ = true;
+-                tls_client_ = nullptr;
++                // 保留借用指针直到接收者结束，避免在途读/控制帧重试看到 nullptr。
+                 return;
+             }
+             ESP_LOGW(TAG, "Waiting for TLS receive task exit after shutdown");
+@@ -154,6 +155,7 @@ int EspSsl::Send(const std::string& data) {
+     const char* data_ptr = data.data();
+     
+     while (total_sent < data_size) {
++        if (!connected_) return -1;
+         int ret = esp_tls_conn_write(tls_client_, data_ptr + total_sent, data_size - total_sent);
+ 
+         if (ret == ESP_TLS_ERR_SSL_WANT_WRITE) {
