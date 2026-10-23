@@ -854,7 +854,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
             // Return to idle so the device is not stuck in the connecting
-            // state (not every failure path reports a network error)
+            // state (not every failure path reports a network error).
+            // 关闭通知可能已被上一次打开消费（远端刚断开时替换失败），
+            // 不会再收到 OnAudioChannelClosed，失败路径须自行恢复低功耗。
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             SetDeviceState(kDeviceStateIdle);
             return;
         }
@@ -982,6 +985,8 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
             // Return to idle so the device is not stuck in the connecting
             // state (not every failure path reports a network error), and
             // wake word detection is re-enabled by the idle state handler.
+            // 关闭通知可能已被上一次打开消费，失败路径须自行恢复低功耗。
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             SetDeviceState(kDeviceStateIdle);
             return;
         }
