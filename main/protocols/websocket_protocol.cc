@@ -54,6 +54,23 @@ struct WebsocketProtocol::ChannelState {
 
 WebsocketProtocol::WebsocketProtocol() = default;
 
+namespace {
+// F50-11：接收任务卡死时 ~WebSocket 的有限等待最长 ~30s；失败/替换/关闭路径
+// 不得把音频编码任务或主循环拖在旧对象的同步析构上。由一次性回收任务持有
+// 强引用完成销毁；任务创建失败才退回同步析构（有界等待语义不变）。
+void RetireWebSocketAsync(std::shared_ptr<WebSocket> websocket) {
+    if (!websocket)
+        return;
+    auto* holder = new std::shared_ptr<WebSocket>(std::move(websocket));
+    if (xTaskCreate([](void* arg) {
+            delete static_cast<std::shared_ptr<WebSocket>*>(arg);
+            vTaskDelete(nullptr);
+        }, "ws_retire", 4096, holder, 3, nullptr) != pdPASS) {
+        delete holder;
+    }
+}
+}  // namespace
+
 WebsocketProtocol::~WebsocketProtocol() { CloseAudioChannel(); }
 
 bool WebsocketProtocol::Start() {
@@ -154,7 +171,7 @@ void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
         }
     }
     // 通知可能重入并销毁协议，以下只使用局部所有权，不再访问 this。
-    websocket.reset();
+    RetireWebSocketAsync(std::move(websocket));
     if (closed)
         closed();
 }
@@ -179,7 +196,7 @@ bool WebsocketProtocol::FailChannel(WebsocketProtocol* owner,
             closed = state->RetireLocked();
         }
     }
-    websocket.reset();
+    RetireWebSocketAsync(std::move(websocket));
     if (failed)
         failed(error);
     if (closed)
@@ -205,7 +222,13 @@ bool WebsocketProtocol::OpenAudioChannel() {
         if (previous) {
             previous->attached = false;
             previous_closed = previous->RetireLocked();
-        } else {
+        }
+        // F50-02 评估结论（2026-10-24）：不得放宽为「通知已消费即本回合新建」。
+        // 关闭通知被消费后排入的 Idle 仍可能晚于本回合执行（回归
+        // replace_batch_remote_race 钉住该交错），此时报告新通道成功会被那条
+        // Idle 覆盖 Listening。正确修法在应用层（关闭回调派生的 Idle 须带通道
+        // 代次守卫），需上板验证后再动；协议层维持本回合退休+失败。
+        if (!previous) {
             if (version == 0)
                 version = version_;
             state = std::make_shared<ChannelState>(mutex, version);
@@ -223,11 +246,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
             state->attached = true;
         }
     }
-    // 只要存在旧通道（包括远端已退休、关闭通知已被消费的情形），本回合只完成
-    // 退休与通知并返回失败：关闭回调排入的 Idle 可能晚于本回合执行，此时若报告
-    // 新通道成功，调用方进入 Listening 后会被那条 Idle 覆盖。新通道留待下一次
-    // 显式打开，调用方先回到 Idle。
-    previous_websocket.reset();
+    // 旧 websocket 的析构可能因接收者卡死等待最长 ~30s；异步回收，不占本回合。
+    RetireWebSocketAsync(std::move(previous_websocket));
     if (previous) {
         if (previous_closed)
             previous_closed();

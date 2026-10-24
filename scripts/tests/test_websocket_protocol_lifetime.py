@@ -36,6 +36,14 @@ FREERTOS = replace_once(FREERTOS, 'inline unsigned xEventGroupWaitBits(Event* p,
  if(before_event_wait)before_event_wait(p,bits);
  assert(p->alive);auto value=p->bits.load();if(clear)p->bits.fetch_and(~bits);return value;
 }''') + '\n#define pdTRUE 1\n'
+# F50-11 回收任务桩：内联执行（宿主行为等价同步析构），计数供回归断言。
+FREERTOS += r"""
+using TaskFunction_t=void(*)(void*);
+inline int retire_task_creates=0;
+inline int xTaskCreate(TaskFunction_t fn,const char*,unsigned,void* arg,int,void**){++retire_task_creates;fn(arg);return 1;}
+inline void vTaskDelete(void*){}
+#define pdPASS 1
+"""
 NETWORK = replace_once(FIXTURE['NETWORK'], '#include "tcp.h"', '#include "tcp.h"\n#include "web_socket.h"\n#include "wire.h"')
 NETWORK = replace_once(NETWORK, 'void Disconnect()override{connected_=false;++disconnects;}', '''void Disconnect()override{
  if(!connected_.exchange(false))return;
@@ -195,7 +203,7 @@ int main(int argc,char**argv){
  owner.p->OnIncomingJson([&](const cJSON* root){++jsons;assert(cJSON_IsString(cJSON_GetObjectItem(root,"type")));});
  if(mode=="timeout"||mode=="waiter_destroy"||mode=="waiter_remote")auto_hello=false;
  if(mode=="connect_failure")network.fail_connect=true;
- if(mode=="hello_send_failure")fail_send=true;
+ if(mode=="hello_send_failure"||mode=="fail_retire_async")fail_send=true;
  if(mode=="create_failure")fail_create=true;
  if(mode=="wire2"||mode=="malformed2")selected_version=2;
  if(mode=="wire3"||mode=="malformed3")selected_version=3;
@@ -326,9 +334,10 @@ int main(int argc,char**argv){
   assert(!owner.p->IsAudioChannelOpened()&&transport_destroys==1);
   owner.destroy();assert(deleted_event_sets==0);assert(events_live==0);return 0;
  }
- if(mode=="timeout"||mode=="connect_failure"||mode=="hello_send_failure"||mode=="create_failure"){
+ if(mode=="timeout"||mode=="connect_failure"||mode=="hello_send_failure"||mode=="create_failure"||mode=="fail_retire_async"){
   assert(!ok&&!owner.p->IsAudioChannelOpened());assert(opened==0&&closed==1);
   assert(transport_destroys==(mode=="create_failure"?0:1));
+  if(mode=="fail_retire_async")assert(retire_task_creates>0);  // F50-11：失败路径旧 websocket 经一次性回收任务销毁
   owner.p->CloseAudioChannel();owner.destroy();assert(closed==1&&events_live==0);return 0;
  }
  assert(ok&&opened==1&&owner.p->IsAudioChannelOpened());
@@ -485,6 +494,7 @@ class WebsocketProtocolLifetimeTest(unittest.TestCase):
     def test_hello_waiter_survives_destruction_and_is_woken(self): self.check('waiter_destroy')
     def test_remote_close_wakes_hello_waiter(self): self.check('waiter_remote')
     def test_entered_hello_survives_owner_destruction(self): self.check('hello_destroy')
+    def test_fail_channel_retires_websocket_via_retire_task(self): self.check('fail_retire_async')
     def test_entered_old_hello_cannot_pollute_new_channel(self): self.check('hello_replace')
     def test_entered_json_parse_survives_owner_destruction(self): self.check('json_parse_destroy')
     def test_blocked_audio_does_not_hold_lifetime_lock(self): self.check('audio_block')
