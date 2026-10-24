@@ -1,0 +1,84 @@
+diff --git a/managed_components/78__esp-ml307/include/tcp.h b/managed_components/78__esp-ml307/include/tcp.h
+index 92d365b..591a723 100644
+--- a/managed_components/78__esp-ml307/include/tcp.h
++++ b/managed_components/78__esp-ml307/include/tcp.h
+@@ -26,6 +26,9 @@ public:
+     // 获取最后一次错误码
+     virtual int GetLastError() = 0;
+ 
++    // 接收任务未在有限等待内退出时，对象所有权必须泄漏，禁止再 Connect/delete。
++    virtual bool ReceiveAbandoned() const { return false; }
++
+ protected:
+     std::function<void(const std::string& data)> stream_callback_;
+     std::function<void()> disconnect_callback_;
+diff --git a/managed_components/78__esp-ml307/include/http_client.h b/managed_components/78__esp-ml307/include/http_client.h
+index a16e246..68f8d35 100644
+--- a/managed_components/78__esp-ml307/include/http_client.h
++++ b/managed_components/78__esp-ml307/include/http_client.h
+@@ -163,6 +163,9 @@ private:
+     
+     // 新增：重置请求状态（用于连接复用）
+     void ResetRequestState();
++
++    // 接收线程未退出时泄漏 Tcp，避免 unique_ptr 析构仍在跑的 EspSsl。
++    void LeakAbandonedTransport();
+ };
+ 
+ #endif
+\ No newline at end of file
+diff --git a/managed_components/78__esp-ml307/src/http_client.cc b/managed_components/78__esp-ml307/src/http_client.cc
+index 4ea4a0f..ad8ac63 100644
+--- a/managed_components/78__esp-ml307/src/http_client.cc
++++ b/managed_components/78__esp-ml307/src/http_client.cc
+@@ -18,9 +18,16 @@ HttpClient::~HttpClient() {
+     if (connected_) {
+         Close();
+     }
++    LeakAbandonedTransport();
+     vEventGroupDelete(event_group_handle_);
+ }
+ 
++void HttpClient::LeakAbandonedTransport() {
++    if (tcp_ && tcp_->ReceiveAbandoned()) {
++        (void)tcp_.release();
++    }
++}
++
+ void HttpClient::SetTimeout(int timeout_ms) {
+     timeout_ms_ = timeout_ms;
+ }
+@@ -187,11 +194,12 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
+         ResetRequestState();
+     } else {
+         // 如果之前有连接，先关闭
+-        if (connected_) {
++        if (connected_ && tcp_) {
+             ESP_LOGI(TAG, "Closing previous connection (host or port changed, or connection not reusable)");
+             tcp_->Disconnect();
+             connected_ = false;
+         }
++        LeakAbandonedTransport();
+         
+         // 重置所有状态（不会清空 content_）
+         ResetRequestState();
+@@ -232,6 +240,7 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
+         ESP_LOGE(TAG, "Send HTTP request failed");
+         tcp_->Disconnect();
+         connected_ = false;
++        LeakAbandonedTransport();
+         return false;
+     }
+ 
+@@ -250,7 +259,10 @@ void HttpClient::Close() {
+     connected_ = false;
+     server_keep_alive_ = false;  // 重置 Keep-Alive 标志
+     write_cv_.notify_all();
+-    tcp_->Disconnect();
++    if (tcp_) {
++        tcp_->Disconnect();
++        LeakAbandonedTransport();
++    }
+ 
+     eof_ = true;
+     cv_.notify_all();

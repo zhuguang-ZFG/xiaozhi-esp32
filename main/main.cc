@@ -6,6 +6,7 @@
 #include <esp_event.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_ota_ops.h>
 
 #include "application.h"
 
@@ -21,6 +22,12 @@ extern "C" void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+#ifdef HUTUJI_OTA_POISON_ROLLBACK
+    // 故意坏包 HIL（F6）：新槽启动后立刻判无效并回滚旧槽；禁止量产发此镜像。
+    ESP_LOGE(TAG, "HUTUJI_OTA_POISON_ROLLBACK: mark invalid and reboot to previous");
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+#endif
 
     // Initialize and run the application
     auto& app = Application::GetInstance();

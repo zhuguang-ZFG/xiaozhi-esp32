@@ -10,6 +10,7 @@
 #include <lvgl.h>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -25,6 +26,17 @@ public:
     virtual void ShowNotification(const char* notification, int duration_ms = 3000);
     virtual void ShowNotification(const std::string& notification, int duration_ms = 3000);
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image);
+    // 出图预览确认层：全屏覆盖，与聊天气泡/全脸情绪层无关，故不复用 SetPreviewImage
+    // （后者在 WECHAT 风格下是会话气泡且忽略 nullptr，无法承载"确认前不出图"的门）。
+    // on_confirm/on_cancel 在 LVGL 任务里被调用，实现必须只做转发、不阻塞。
+    virtual void ShowDrawPreview(std::unique_ptr<LvglImage> image, const std::string& hint,
+                                 std::function<void()> on_confirm,
+                                 std::function<void()> on_cancel);
+    /** 预览占位卡：PNG 未落地前先把卡片推上屏，避免用户面对空屏等待。 */
+    virtual void ShowDrawPreviewLoading() {}
+    virtual void HideDrawPreview();
+    virtual void UpdateMachineControlState(const std::string& state);
+
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
     virtual bool SnapshotToJpeg(std::string& jpeg_data, int quality = 80);

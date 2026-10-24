@@ -158,7 +158,7 @@ elseif(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
     set(BOARD_TYPE "lichuang-dev")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
-    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_128)
+    unset(DEFAULT_EMOJI_COLLECTION)
 elseif(CONFIG_BOARD_TYPE_QUANDONG_S3_DEV)
     set(BOARD_TYPE "quandong-s3-dev")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -439,6 +439,10 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    set(HUTUJI_GROBOT_FACE TRUE)
+    # kawaii 桌宠脸默认开（2026-09-06 用户拍板，同日 ElectronBot GIF 脸实物否决）；
+    # 用户 -D=OFF 时 CACHE 已存在，不带 FORCE 的 set 不覆盖——回退 grobot 的通道保留。
+    set(HUTUJI_KAWAII_FACE ON CACHE BOOL "Replace grobot eyes with kawaii animated face")
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-touch-lcd-3.5b")
@@ -863,6 +867,11 @@ elseif(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    set(HUTUJI_GROBOT_FACE TRUE)
+    # kawaii 桌宠脸默认开，与 waveshare-3.5 同口径（2026-09-08 用户主诉「桌宠 UI 不对」：
+    # 首版端口漏开脸编译面，主屏跑成原厂 emoji 聊天 UI）。320x240 与 lichuang 同分辨率，
+    # 脸盒走 lcd_display.cc 的 312x232 else 分支，几何零新增。CACHE 不带 FORCE 可 -D=OFF 回退。
+    set(HUTUJI_KAWAII_FACE ON CACHE BOOL "Replace grobot eyes with kawaii animated face")
 elseif(CONFIG_BOARD_TYPE_AI_VOX3)
     set(BOARD_TYPE "nulllab-ai-vox-v3")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -887,6 +896,26 @@ else()
     )
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 OR CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+    list(APPEND SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pipe.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_job.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_ota.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_activation_relay.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_conversation_report.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_draw_bind.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_bind_identity.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_ble_diag.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_music.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_memory.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_pi_splash.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/plotter_provision.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/hutuji_kdraw_watcher.cc
+    )
+endif()
+if(HUTUJI_GROBOT_FACE AND NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+    list(APPEND SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/grobot_eyes.cc)
+endif()
 
 # Select one audio engine for each chip family
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
@@ -1082,6 +1111,7 @@ idf_component_register(SRCS ${SOURCES}
                         fatfs
                         xiaozhi-fonts
                         ${MAIN_PRIV_REQUIRES_EXTRA}
+                        hutuji_qrcode
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
@@ -1100,6 +1130,58 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     PRIVATE TEXT_FONT_SIZE=${TEXT_FONT_SIZE} TEXT_FONT_BPP=${TEXT_FONT_BPP}
                     )
+if(HUTUJI_GROBOT_FACE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE CONFIG_HUTUJI_GROBOT_FACE=1)
+endif()
+
+# 2026-09-06 用户拍板：kawaii 桌宠脸（lvgl_kawaii_face，程序绘制眼眉嘴腮红+17 情绪
+# +自动眨眼）替换 grobot 程序绘眼；同日先上的 ElectronBot GIF 脸被用户实物否决。
+# 默认只在 waveshare-3.5 板分支打开（分支内 set CACHE 不带 FORCE，-D=OFF 可回退 grobot）。
+if(HUTUJI_KAWAII_FACE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE CONFIG_HUTUJI_KAWAII_FACE=1)
+    target_sources(${COMPONENT_LIB} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/boards/lichuang-dev/kawaii_face/lvgl_kawaii_face.c)
+endif()
+
+option(HUTUJI_AUTO_TEST_DRAW "Enable hutuji auto-test draw on lichuang-dev after pipe ready" OFF)
+set(HUTUJI_AUTO_TEST_DRAW_URL "" CACHE STRING "hutuji auto-test G-code URL; keep empty unless building a local test image")
+set(HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL "" CACHE STRING "hutuji auto-test PNG preview URL from the same hutuji_draw call")
+if(HUTUJI_AUTO_TEST_DRAW)
+    if(NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
+        message(FATAL_ERROR "HUTUJI_AUTO_TEST_DRAW is only supported for lichuang-dev")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_DRAW)
+    if(HUTUJI_AUTO_TEST_DRAW_URL STREQUAL "" OR HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL STREQUAL "")
+        message(WARNING "HUTUJI_AUTO_TEST_DRAW enabled without both HUTUJI_AUTO_TEST_DRAW_URL and HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL")
+    else()
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_DRAW_URL="${HUTUJI_AUTO_TEST_DRAW_URL}")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL="${HUTUJI_AUTO_TEST_DRAW_PREVIEW_URL}")
+    endif()
+endif()
+
+option(HUTUJI_AUTO_TEST_ABORT_ON_PAPER "Enable hutuji bringup 8.5 scaffold: call abort as soon as paper-change window opens" OFF)
+if(HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
+    if(NOT CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 AND NOT CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5 AND NOT CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
+        message(FATAL_ERROR "HUTUJI_AUTO_TEST_ABORT_ON_PAPER is only supported for lichuang-dev / waveshare-3.5 / freenove-2.8")
+    endif()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_AUTO_TEST_ABORT_ON_PAPER)
+    if(NOT HUTUJI_AUTO_TEST_DRAW)
+        message(WARNING "HUTUJI_AUTO_TEST_ABORT_ON_PAPER without HUTUJI_AUTO_TEST_DRAW: paper window only opens if a draw is triggered from the cloud")
+    endif()
+endif()
+
+# 故意坏包 HIL（F6）：新槽启动即 mark invalid 回滚；仅 staging 发版，禁止进量产 latest。
+option(HUTUJI_OTA_POISON_ROLLBACK "Poison OTA image: rollback immediately on boot (HIL only)" OFF)
+if(HUTUJI_OTA_POISON_ROLLBACK)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_OTA_POISON_ROLLBACK)
+    message(WARNING "HUTUJI_OTA_POISON_ROLLBACK=ON — do not ship this image")
+endif()
+
+# 2026-09-05 A/B 归因开关（fable 会诊）：ON = 日志全开对照组（HUTUJI_QUIET_STREAM_LOG=0），
+# 默认 OFF = 压制。两变体同 HEAD 同埋点只差此 option，避免刷旧基线当对照丢埋点。
+option(HUTUJI_STREAM_LOG_VERBOSE "A/B control: keep per-line streaming logs (disable suppression)" OFF)
+if(HUTUJI_STREAM_LOG_VERBOSE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE HUTUJI_QUIET_STREAM_LOG=0)
+endif()
 
 # Add generation rules
 add_custom_command(
