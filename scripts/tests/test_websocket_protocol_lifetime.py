@@ -40,7 +40,14 @@ FREERTOS = replace_once(FREERTOS, 'inline unsigned xEventGroupWaitBits(Event* p,
 FREERTOS += r"""
 using TaskFunction_t=void(*)(void*);
 inline int retire_task_creates=0;
-inline int xTaskCreate(TaskFunction_t fn,const char*,unsigned,void* arg,int,void**){++retire_task_creates;fn(arg);return 1;}
+inline bool defer_retire_tasks=false;
+inline std::vector<std::pair<TaskFunction_t,void*>> deferred_retire_tasks;
+inline int xTaskCreate(TaskFunction_t fn,const char*,unsigned,void* arg,int,void**){
+ ++retire_task_creates;
+ if(defer_retire_tasks){deferred_retire_tasks.push_back({fn,arg});return 1;}
+ fn(arg);return 1;
+}
+inline void run_deferred_retire_tasks(){auto tasks=std::move(deferred_retire_tasks);for(auto& task:tasks)task.first(task.second);}
 inline void vTaskDelete(void*){}
 #define pdPASS 1
 """
@@ -380,6 +387,15 @@ int main(int argc,char**argv){
   if(mode=="text_failure")owner.p->SendMcpMessage("{}");
   else {auto packet=std::make_unique<AudioStreamPacket>();packet->payload={1};assert(!owner.p->SendAudio(std::move(packet)));}
   assert(errors==1&&closed==1&&!owner.p->IsAudioChannelOpened());assert(transport_destroys==1);
+ }else if(mode=="retire_task_limit"){
+  Owner second,third;
+  assert(second.p->OpenAudioChannel());assert(third.p->OpenAudioChannel());
+  defer_retire_tasks=true;
+  owner.p->CloseAudioChannel();second.p->CloseAudioChannel();third.p->CloseAudioChannel();
+  assert(retire_task_creates==2&&deferred_retire_tasks.size()==2);
+  assert(transport_destroys==1);  // 第三个超过上限，退回同步析构。
+  run_deferred_retire_tasks();
+  assert(transport_destroys==3);
  }else if(mode=="hello_destroy"||mode=="hello_replace"||mode=="json_parse_destroy"){
   Barrier parsing;
   auto incoming=mode=="json_parse_destroy"?std::string(R"({"type":"mcp"})"):
@@ -495,6 +511,7 @@ class WebsocketProtocolLifetimeTest(unittest.TestCase):
     def test_remote_close_wakes_hello_waiter(self): self.check('waiter_remote')
     def test_entered_hello_survives_owner_destruction(self): self.check('hello_destroy')
     def test_fail_channel_retires_websocket_via_retire_task(self): self.check('fail_retire_async')
+    def test_retire_tasks_are_bounded_during_disconnect_storm(self): self.check('retire_task_limit')
     def test_entered_old_hello_cannot_pollute_new_channel(self): self.check('hello_replace')
     def test_entered_json_parse_survives_owner_destruction(self): self.check('json_parse_destroy')
     def test_blocked_audio_does_not_hold_lifetime_lock(self): self.check('audio_block')
@@ -508,6 +525,10 @@ class WebsocketProtocolLifetimeTest(unittest.TestCase):
     def test_binary_v1_and_json_wire_behavior(self): self.check('wire1')
     def test_binary_v2_and_json_wire_behavior(self): self.check('wire2')
     def test_binary_v3_and_json_wire_behavior(self): self.check('wire3')
+
+    def test_retire_holder_allocation_is_nonthrowing(self):
+        source = (ROOT / 'main/protocols/websocket_protocol.cc').read_text(encoding='utf-8')
+        self.assertIn('new (std::nothrow) std::shared_ptr<WebSocket>', source)
     def test_v2_rejects_truncated_header_and_payload(self): self.check('malformed2')
     def test_v3_rejects_truncated_header_and_payload(self): self.check('malformed3')
     def test_malformed_hello_does_not_change_negotiation(self): self.check('bad_hello')

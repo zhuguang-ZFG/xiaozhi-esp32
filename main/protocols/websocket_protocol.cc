@@ -7,7 +7,9 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
+#include <atomic>
 #include <cstring>
+#include <new>
 #include "assets/lang_config.h"
 
 #define TAG "WS"
@@ -55,17 +57,38 @@ struct WebsocketProtocol::ChannelState {
 WebsocketProtocol::WebsocketProtocol() = default;
 
 namespace {
+constexpr unsigned kMaxRetireTasks = 2;
+std::atomic<unsigned> retire_tasks_active{0};
+
 // F50-11：接收任务卡死时 ~WebSocket 的有限等待最长 ~30s；失败/替换/关闭路径
 // 不得把音频编码任务或主循环拖在旧对象的同步析构上。由一次性回收任务持有
-// 强引用完成销毁；任务创建失败才退回同步析构（有界等待语义不变）。
+// 强引用完成销毁；同时最多保留两个回收任务，避免断连风暴按每次 4KiB 栈无界
+// 放大。名额、holder 或任务创建失败时退回同步析构（有界等待语义不变）。
 void RetireWebSocketAsync(std::shared_ptr<WebSocket> websocket) {
     if (!websocket)
         return;
-    auto* holder = new std::shared_ptr<WebSocket>(std::move(websocket));
-    if (xTaskCreate([](void* arg) {
-            delete static_cast<std::shared_ptr<WebSocket>*>(arg);
-            vTaskDelete(nullptr);
-        }, "ws_retire", 4096, holder, 3, nullptr) != pdPASS) {
+
+    unsigned active = retire_tasks_active.load(std::memory_order_relaxed);
+    while (active < kMaxRetireTasks &&
+           !retire_tasks_active.compare_exchange_weak(active, active + 1, std::memory_order_acq_rel,
+                                                      std::memory_order_relaxed)) {
+    }
+    if (active >= kMaxRetireTasks)
+        return;  // 局部 websocket 在调用线程同步析构，不再创建额外任务。
+
+    auto* holder = new (std::nothrow) std::shared_ptr<WebSocket>(std::move(websocket));
+    if (!holder) {
+        retire_tasks_active.fetch_sub(1, std::memory_order_acq_rel);
+        return;
+    }
+    if (xTaskCreate(
+            [](void* arg) {
+                delete static_cast<std::shared_ptr<WebSocket>*>(arg);
+                retire_tasks_active.fetch_sub(1, std::memory_order_acq_rel);
+                vTaskDelete(nullptr);
+            },
+            "ws_retire", 4096, holder, 3, nullptr) != pdPASS) {
+        retire_tasks_active.fetch_sub(1, std::memory_order_acq_rel);
         delete holder;
     }
 }
