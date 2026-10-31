@@ -96,16 +96,37 @@ class KawaiiFaceTest(unittest.TestCase):
         self.assertIn('#if CONFIG_HUTUJI_KAWAII_FACE', drift)
         self.assertIn('theme->accent_color()', drift)
         self.assertIn('0xB4F0FF', drift)
-        self.assertIn('lv_canvas_fill_bg(canvas, lv_color_black()', self.kawaii_c)
-        self.assertIn('lv_obj_set_style_bg_color(face_state.face_container, lv_color_black()',
-                      self.kawaii_c)
+        self.assertIn('has_background = true', self.lcd_cc)
+        self.assertIn('0x6B4E5E', self.lcd_cc)
+        self.assertIn('has_background;', self.kawaii_h)
+        self.assertIn('lv_canvas_fill_bg(canvas, face_state.background_color', self.kawaii_c)
+        self.assertIn(
+            'lv_obj_set_style_bg_color(face_state.face_container, face_state.background_color',
+            self.kawaii_c,
+        )
         # 铺满父盒（禁止回退 min 方块裁切）
         self.assertIn('lv_obj_set_size(face_state.face_container, parent_w, parent_h)',
                       self.kawaii_c)
         self.assertIn('parent_w * 0.46f', self.kawaii_c)
         # 禁止回退白底眼白框
         self.assertNotIn('lv_canvas_fill_bg(canvas, lv_color_white()', self.kawaii_c)
+        self.assertNotIn('lv_canvas_fill_bg(canvas, lv_color_black()', self.kawaii_c)
         self.assertNotIn('lv_color_make(50, 180, 255)', self.kawaii_c)
+
+    def test_freenove_production_uses_fh031_cream_palette(self):
+        """量产板保留 dark NVS 键，但视觉令牌切为奶油手绘且状态色独立。"""
+        production = re.search(
+            r'#if CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD\s*'
+            r'(.*?)#elif CONFIG_HUTUJI_KAWAII_FACE',
+            self.lcd_cc,
+            re.S,
+        )
+        self.assertIsNotNone(production)
+        self.assertIn('0xD85F7B', production.group(1))
+        self.assertIn('0xF3A3B5', production.group(1))
+        for color in ('0xFFF7ED', '0xFFFDF8', '0xFAD7E0', '0x89C7B5', '0xF5D77F'):
+            self.assertIn(color, self.lcd_cc)
+        self.assertNotIn('量产深色科技主题', self.lcd_cc)
 
     def test_lichuang_face_box_nearly_fullscreen(self):
         # 立创 320x240：脸盒须近全屏（旧 280x190 目视留白被否）

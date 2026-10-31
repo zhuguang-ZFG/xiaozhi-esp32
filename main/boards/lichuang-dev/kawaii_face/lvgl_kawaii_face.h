@@ -99,6 +99,9 @@ typedef struct {
     /* 本地补丁：与 UI 按钮同源 accent（false 时回落 FACE_EILIK_* 默认） */
     bool     has_accent;
     lv_color_t accent;
+    /* 本地补丁：可配置脸部舞台底色；未设置时保留上游 Eilik 黑底。 */
+    bool     has_background;
+    lv_color_t background;
 } face_config_t;
 
 /* Eilik 虹膜/按钮默认 = 活泼淡青（与 lcd_display dark_accent 同源） */

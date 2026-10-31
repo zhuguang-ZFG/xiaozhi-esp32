@@ -81,7 +81,7 @@ void StyleProductionButton(lv_obj_t* button, LvglTheme* theme, lv_color_t backgr
         lv_color_eq(background, theme->success_color())) {
         foreground = theme->accent_text_color();
     }
-    lv_obj_set_style_radius(button, 12, 0);
+    lv_obj_set_style_radius(button, 16, 0);
     lv_obj_set_style_shadow_width(button, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_shadow_width(button, 0, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(button, 1, 0);
@@ -89,8 +89,8 @@ void StyleProductionButton(lv_obj_t* button, LvglTheme* theme, lv_color_t backgr
     lv_obj_set_style_bg_color(button, background, 0);
     lv_obj_set_style_bg_color(button, lv_color_mix(lv_color_white(), background, 36),
                               LV_STATE_PRESSED);
-    lv_obj_set_style_bg_color(button, lv_color_hex(0x202C3B), LV_STATE_DISABLED);
-    lv_obj_set_style_border_color(button, lv_color_hex(0x314155), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(button, theme->chat_background_color(), LV_STATE_DISABLED);
+    lv_obj_set_style_border_color(button, theme->border_color(), LV_STATE_DISABLED);
     lv_obj_set_style_color_filter_opa(button, LV_OPA_TRANSP, LV_STATE_DISABLED);
     lv_obj_set_style_recolor_opa(button, LV_OPA_TRANSP, LV_STATE_DISABLED);
     lv_obj_set_style_transform_width(button, 0, LV_STATE_PRESSED);
@@ -98,7 +98,7 @@ void StyleProductionButton(lv_obj_t* button, LvglTheme* theme, lv_color_t backgr
     auto* label = lv_obj_get_child(button, 0);
     if (label != nullptr) {
         lv_obj_set_style_text_color(label, foreground, 0);
-        lv_obj_set_style_text_color(label, lv_color_hex(0x9CACC1), LV_STATE_DISABLED);
+        lv_obj_set_style_text_color(label, theme->muted_text_color(), LV_STATE_DISABLED);
     }
 }
 
@@ -179,12 +179,13 @@ void LcdDisplay::InitializeLcdThemes() {
     auto emoji_font = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
 
 #if CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
-    // 量产语义色在主题入口定义，眼睛和按钮始终使用同一个accent。
-    const auto light_accent = lv_color_hex(0x0F8F8A);
-    const auto dark_accent = lv_color_hex(0x45D7F5);
-    const auto dark_success = lv_color_hex(0x69D9AC);
-    const auto dark_warning = lv_color_hex(0xFFC66B);
-    const auto dark_danger = lv_color_hex(0xFF7888);
+    // 量产小派改用 HandRaw FH-031 奶油手绘：珊瑚粉主动作、薄荷绿成功、
+    // 那不勒斯黄提醒。眼睛和按钮仍共用 accent，状态语义不变。
+    const auto light_accent = lv_color_hex(0xD85F7B);
+    const auto dark_accent = lv_color_hex(0xF3A3B5);
+    const auto dark_success = lv_color_hex(0x89C7B5);
+    const auto dark_warning = lv_color_hex(0xF5D77F);
+    const auto dark_danger = lv_color_hex(0xE36D7B);
 #elif CONFIG_HUTUJI_KAWAII_FACE
     // Eilik 桌宠脸：活泼淡青眼/钮同源（2026-09-06 用户圈选目视认定更好看）。
     // 覆盖下方 GROBOT 的 π 中段蓝紫——那套给按钮偏冷静，和淡青虹膜打架。
@@ -255,18 +256,20 @@ void LcdDisplay::InitializeLcdThemes() {
     dark_theme->set_emoji_font(emoji_font);
 
 #if CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD
-    // 量产深色科技主题：墨蓝分层、青蓝主操作，安全语义色保持独立。
-    dark_theme->set_background_color(lv_color_hex(0x0B111C));
-    dark_theme->set_text_color(lv_color_hex(0xE6EEF7));
-    dark_theme->set_chat_background_color(lv_color_hex(0x0F1825));
-    dark_theme->set_surface_color(lv_color_hex(0x121D2C));
-    dark_theme->set_assistant_bubble_color(lv_color_hex(0x1B2A3D));
-    dark_theme->set_user_bubble_color(lv_color_hex(0x183B4D));
-    dark_theme->set_system_bubble_color(lv_color_hex(0x121D2C));
-    dark_theme->set_system_text_color(lv_color_hex(0x9CACC1));
-    dark_theme->set_muted_text_color(lv_color_hex(0x9CACC1));
-    dark_theme->set_border_color(lv_color_hex(0x2C4056));
-    dark_theme->set_accent_text_color(lv_color_hex(0x071521));
+    // 设备历史上把量产主题键钉为 "dark"；保留键值避免 NVS 迁移，只把该主题的
+    // 视觉令牌换成 FH-031 奶油手绘。协议、控件树和状态语义完全不变。
+    dark_theme->set_background_color(lv_color_hex(0xFFF7ED));
+    dark_theme->set_text_color(lv_color_hex(0x4D3A46));
+    dark_theme->set_chat_background_color(lv_color_hex(0xFBEFE5));
+    dark_theme->set_surface_color(lv_color_hex(0xFFFDF8));
+    dark_theme->set_assistant_bubble_color(lv_color_hex(0xFFFDF8));
+    dark_theme->set_user_bubble_color(lv_color_hex(0xFAD7E0));
+    dark_theme->set_system_bubble_color(lv_color_hex(0xFBEFE5));
+    dark_theme->set_system_text_color(lv_color_hex(0x8F7A84));
+    dark_theme->set_muted_text_color(lv_color_hex(0x8F7A84));
+    dark_theme->set_border_color(lv_color_hex(0xE4C8D1));
+    dark_theme->set_low_battery_color(lv_color_hex(0xC85668));
+    dark_theme->set_accent_text_color(lv_color_hex(0x4D2938));
 #endif
 
     auto& theme_manager = LvglThemeManager::GetInstance();
@@ -2443,10 +2446,13 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
         grobot_stage_ = lv_obj_create(screen);
         lv_obj_set_size(grobot_stage_, LV_HOR_RES - 16, 140);
         lv_obj_set_pos(grobot_stage_, 8, 34);
-        lv_obj_set_style_radius(grobot_stage_, 16, 0);
-        lv_obj_set_style_bg_color(grobot_stage_, lv_color_black(), 0);
-        lv_obj_set_style_border_width(grobot_stage_, 1, 0);
-        lv_obj_set_style_border_color(grobot_stage_, theme->border_color(), 0);
+        lv_obj_set_style_radius(grobot_stage_, 22, 0);
+        lv_obj_set_style_bg_color(grobot_stage_, lv_color_hex(0x6B4E5E), 0);
+        lv_obj_set_style_border_width(grobot_stage_, 2, 0);
+        lv_obj_set_style_border_color(grobot_stage_, lv_color_hex(0xF3A3B5), 0);
+        lv_obj_set_style_shadow_width(grobot_stage_, 8, 0);
+        lv_obj_set_style_shadow_color(grobot_stage_, lv_color_hex(0xA8D5C6), 0);
+        lv_obj_set_style_shadow_opa(grobot_stage_, LV_OPA_40, 0);
         lv_obj_set_style_pad_all(grobot_stage_, 0, 0);
         lv_obj_remove_flag(grobot_stage_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(grobot_stage_, LV_OBJ_FLAG_CLICKABLE);
@@ -2510,8 +2516,10 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     // kawaii 桌宠脸（2026-09-06 用户拍板，同日替掉 ElectronBot GIF 脸——用户见过
     // 实物后指明要 Eilik 那种有大眼+嘴的桌宠感）：vendored lvgl_kawaii_face 程序
     // 绘制（眼/眉/嘴/腮红，17 情绪+自动眨眼），零图片零解码开销；字幕条共用。
-    // Eilik 黑底：脸盒本身也刷黑，避免布局缝露出主题浅色。
-    lv_obj_set_style_bg_color(emoji_box_, lv_color_black(), 0);
+    // 量产 FH-031 用暖莓色小舞台，其他板仍保留用户已拍板的 Eilik 黑底。
+    const lv_color_t kawaii_background =
+        IsProductionHutujiScreen() ? lv_color_hex(0x6B4E5E) : lv_color_black();
+    lv_obj_set_style_bg_color(emoji_box_, kawaii_background, 0);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_COVER, 0);
     InitKawaiiFace();
     if (kawaii_face_active_) {
@@ -2565,11 +2573,12 @@ void LcdDisplay::CreateGrobotSubtitleBar(lv_obj_t* screen, LvglTheme* theme) {
     if (IsProductionHutujiScreen()) {
         lv_obj_set_size(grobot_subtitle_bar_, LV_HOR_RES - 24, 30);
         lv_obj_align(grobot_subtitle_bar_, LV_ALIGN_BOTTOM_MID, 0, -66);
-        lv_obj_set_style_radius(grobot_subtitle_bar_, 10, 0);
-        lv_obj_set_style_border_width(grobot_subtitle_bar_, 0, 0);
-        lv_obj_set_style_bg_color(grobot_subtitle_bar_, lv_color_black(), 0);
+        lv_obj_set_style_radius(grobot_subtitle_bar_, 14, 0);
+        lv_obj_set_style_border_width(grobot_subtitle_bar_, 1, 0);
+        lv_obj_set_style_border_color(grobot_subtitle_bar_, theme->border_color(), 0);
+        lv_obj_set_style_bg_color(grobot_subtitle_bar_, theme->surface_color(), 0);
         lv_obj_set_style_bg_opa(grobot_subtitle_bar_, LV_OPA_COVER, 0);
-        lv_obj_set_style_text_color(grobot_subtitle_label_, theme->muted_text_color(), 0);
+        lv_obj_set_style_text_color(grobot_subtitle_label_, theme->text_color(), 0);
         lv_obj_set_width(grobot_subtitle_label_, LV_HOR_RES - 40);
     }
     lv_obj_add_flag(grobot_subtitle_bar_, LV_OBJ_FLAG_HIDDEN);
@@ -3868,7 +3877,8 @@ face_emotion_t LcdDisplay::MapKawaiiEmotion_(const char* name) {
 void LcdDisplay::InitKawaiiFace() {
     kawaii_face_active_ = true;
     kawaii_emotion_ = "neutral";
-    // 父对象 = 近全屏脸盒；画布 SPIRAM；虹膜色 = 主题 accent（与控制/画画/说话同色）
+    // 父对象 = 近全屏脸盒；画布 SPIRAM；虹膜色 = 主题 accent。量产板额外传
+    // 暖莓底色，避免奶油 UI 中间突然掉回纯黑科技屏。
     auto* theme = static_cast<LvglTheme*>(current_theme_);
     face_config_t cfg = {
         .parent = emoji_box_,
@@ -3877,6 +3887,8 @@ void LcdDisplay::InitKawaiiFace() {
         .auto_blink = true,
         .has_accent = true,
         .accent = theme != nullptr ? theme->accent_color() : lv_color_hex(FACE_EILIK_ACCENT_HEX),
+        .has_background = true,
+        .background = IsProductionHutujiScreen() ? lv_color_hex(0x6B4E5E) : lv_color_black(),
     };
     if (face_animation_init(&cfg) == ESP_OK) {
         ESP_LOGI(TAG, "Kawaii face initialized (Eilik + accent-matched iris)");

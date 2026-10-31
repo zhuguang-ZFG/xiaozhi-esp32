@@ -10,6 +10,8 @@
  *     （音频会话期最大连续块仅 ~8KB 史），~155KB 画布不许压内部堆。
  *  3. Eilik 风（2026-09-06 用户拍板「方案 1」）——黑底大亮眼、无眼白框、
  *     虹膜偏青白发光、眼宽 ~88%、细眉弱腮红、闭嘴淡弧线；不动情绪映射。
+ *  4. 可配置舞台底色——量产 Freenove 使用 FH-031 暖莓底，其他板默认黑底不变；
+ *     眼、嘴画布与容器共用同一底色，避免矩形接缝。
  */
 
 /* 补丁 3：Eilik 风可调常量（host 测钉字面量）
@@ -160,6 +162,7 @@ typedef struct
     lv_color_t iris_border;
     lv_color_t accent_line;
     lv_color_t accent_glow;
+    lv_color_t background_color;
 
     lv_timer_t *anim_timer;
     bool initialized;
@@ -197,6 +200,8 @@ esp_err_t face_animation_init(face_config_t *config)
         face_state.config.blink_interval = DEFAULT_BLINK_INTERVAL;
         face_state.config.auto_blink = true;
         face_state.config.has_accent = false;
+        face_state.config.has_background = false;
+        face_state.config.background = lv_color_black();
     }
 
     if (face_state.config.has_accent)
@@ -208,9 +213,14 @@ esp_err_t face_animation_init(face_config_t *config)
         face_state.iris_color = lv_color_make(FACE_EILIK_IRIS_R, FACE_EILIK_IRIS_G,
                                              FACE_EILIK_IRIS_B);
     }
-    face_state.iris_border = lv_color_mix(lv_color_black(), face_state.iris_color, LV_OPA_40);
+    face_state.background_color = face_state.config.has_background
+                                      ? face_state.config.background
+                                      : lv_color_black();
+    face_state.iris_border =
+        lv_color_mix(face_state.background_color, face_state.iris_color, LV_OPA_40);
     face_state.accent_line = lv_color_mix(lv_color_white(), face_state.iris_color, LV_OPA_30);
-    face_state.accent_glow = lv_color_mix(lv_color_black(), face_state.iris_color, LV_OPA_60);
+    face_state.accent_glow =
+        lv_color_mix(face_state.background_color, face_state.iris_color, LV_OPA_60);
 
     lv_obj_t *parent_obj = (face_state.config.parent != NULL)
                                ? face_state.config.parent
@@ -243,8 +253,8 @@ esp_err_t face_animation_init(face_config_t *config)
     face_state.face_container = lv_obj_create(parent_obj);
     lv_obj_set_size(face_state.face_container, parent_w, parent_h);
     lv_obj_center(face_state.face_container);
-    /* Eilik：头盔黑底（上游透明，白眼白嘴会漏出主题浅色） */
-    lv_obj_set_style_bg_color(face_state.face_container, lv_color_black(), 0);
+    /* 眼/嘴画布与容器共用舞台色，避免三块 RGB565 画布露出矩形接缝。 */
+    lv_obj_set_style_bg_color(face_state.face_container, face_state.background_color, 0);
     lv_obj_set_style_bg_opa(face_state.face_container, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(face_state.face_container, 0, 0);
     lv_obj_set_style_pad_all(face_state.face_container, 0, 0);
@@ -346,7 +356,7 @@ static void draw_eye(lv_obj_t *canvas, uint8_t openness, bool is_left)
     uint16_t width = face_state.eye_cw;
     uint16_t height = face_state.eye_cw;
 
-    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
+    lv_canvas_fill_bg(canvas, face_state.background_color, LV_OPA_COVER);
 
     lv_layer_t layer;
     lv_canvas_init_layer(canvas, &layer);
@@ -810,7 +820,7 @@ static void draw_mouth(lv_obj_t *canvas, int8_t curve)
     uint16_t width = face_state.mouth_cw;
     uint16_t height = face_state.mouth_ch;
 
-    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
+    lv_canvas_fill_bg(canvas, face_state.background_color, LV_OPA_COVER);
 
     lv_layer_t layer;
     lv_canvas_init_layer(canvas, &layer);
