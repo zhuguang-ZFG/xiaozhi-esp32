@@ -1,0 +1,54 @@
+diff --git a/managed_components/78__esp-ml307/src/esp/esp_ssl.cc b/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
+--- a/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
++++ b/managed_components/78__esp-ml307/src/esp/esp_ssl.cc
+@@ -1,6 +1,10 @@
+ #include "esp_ssl.h"
+ #include <esp_log.h>
+ #include <esp_crt_bundle.h>
++#include <esp_heap_caps.h>
++#include <freertos/idf_additions.h>
++#include <sys/socket.h>
++#include <netinet/tcp.h>
+ #include <cstring>
+ #include <unistd.h>
+ 
+@@ -53,13 +57,44 @@ bool EspSsl::Connect(const std::string& host, int port) {
+ 
+     connected_ = true;
+ 
++    // 2026-09-06 hutuji 修复（R5）：keep-alive 长连接必须自证存活。
++    {
++        int sockfd;
++        if (esp_tls_get_conn_sockfd(tls_client_, &sockfd) == ESP_OK && sockfd >= 0) {
++            int keepalive = 1;
++            int keepidle = 120;
++            int keepintvl = 10;
++            int keepcnt = 3;
++            setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
++            setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
++            setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
++            setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
++        }
++    }
++
+     xEventGroupClearBits(event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT);
+-    xTaskCreate([](void* arg) {
++    // R5：创建失败显式报错；R8：栈进 PSRAM，不与 hutuji_preview 抢内部连续块。
++    if (xTaskCreateWithCaps([](void* arg) {
+         EspSsl* ssl = (EspSsl*)arg;
+         ssl->ReceiveTask();
+         xEventGroupSetBits(ssl->event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT);
+-        vTaskDelete(NULL);
+-    }, "ssl_receive", 4096, this, 1, &receive_task_handle_);
++        vTaskDeleteWithCaps(NULL);
++    }, "ssl_receive", 4096, this, 1, &receive_task_handle_,
++                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
++        ESP_LOGE(TAG, "ssl_receive task create failed (SPIRAM stack?)");
++        receive_task_handle_ = nullptr;
++        connected_ = false;
++        esp_tls_conn_destroy(tls_client_);
++        tls_client_ = nullptr;
++        return false;
++    }
+     return true;
+ }

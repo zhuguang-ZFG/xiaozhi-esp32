@@ -28,6 +28,11 @@ class VersionTests(unittest.TestCase):
             names = [variant["full_name"] for variant in variants]
             self.assertEqual(len(names), len(set(names)))
 
+        self.assertTrue(all(variant["target"] for variant in idf6))
+        p4_variants = [variant for variant in idf6 if variant["target"] == "esp32p4"]
+        self.assertTrue(p4_variants)
+        self.assertIn("m5stack-tab5", {variant["full_name"] for variant in p4_variants})
+
         idf6_names = {variant["full_name"] for variant in idf6}
         self.assertIn("esp-p4-function-ev-board", idf6_names)
         self.assertIn("esp-p4-function-ev-board-p4x", idf6_names)

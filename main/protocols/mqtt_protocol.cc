@@ -80,6 +80,13 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     auto username = settings.GetString("username");
     auto password = settings.GetString("password");
     int keepalive_interval = settings.GetInt("keepalive", 240);
+#ifdef CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+    // 本机家用网络约 60s 会回收空闲映射；云端工具通道随之形成半开连接，
+    // ESP-MQTT 仍自认为在线且不会触发重连。30s PING 在回收窗口前保活。
+    if (keepalive_interval <= 0 || keepalive_interval > 30) {
+        keepalive_interval = 30;
+    }
+#endif
     publish_topic_ = settings.GetString("publish_topic");
 
     if (endpoint.empty()) {
@@ -130,11 +137,18 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
             ESP_LOGI(TAG, "Received goodbye message, session_id: %s",
                      cJSON_IsString(session_id) ? session_id->valuestring : "null");
             if (cJSON_IsString(session_id) && session_id_ == session_id->valuestring) {
+                // 记下 goodbye 归属的会话：关闭在主循环排队执行，届时新 hello 可能
+                // 已替换 session_id_；不复核会把新会话的 UDP 通道拆掉（2026-08-22
+                // HIL：新会话开启 160ms 即被排队的旧关闭掐断，用户感知「点了没反应」）。
+                std::string goodbye_session = session_id->valuestring;
                 auto alive = alive_;  // Capture alive flag
-                Application::GetInstance().Schedule([this, alive]() {
-                    if (*alive) {
+                Application::GetInstance().Schedule([this, alive, goodbye_session]() {
+                    if (*alive && session_id_ == goodbye_session) {
                         // Server initiated goodbye, don't send goodbye back to avoid ping-pong
                         CloseAudioChannel(false);
+                    } else {
+                        ESP_LOGI(TAG, "Drop queued goodbye close: current session %s",
+                                 session_id_.c_str());
                     }
                 });
             }
@@ -217,6 +231,13 @@ void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
         std::lock_guard<std::mutex> lock(channel_mutex_);
         udp = std::move(udp_);
     }
+    if (udp == nullptr) {
+        // 通道本就不在：不拿旧 session_id 发 goodbye，也不触发 closed 回调
+        // （回调会踩 LOW_POWER 并强制 idle；重连后服务器对旧会话的 goodbye
+        // 不应再扰动当前状态，2026-08-22 HIL 坐实）。
+        ESP_LOGI(TAG, "Audio channel already closed, ignore close request");
+        return;
+    }
     udp.reset();
 
     ESP_LOGI(TAG, "Closing audio channel, send_goodbye: %d", send_goodbye);
@@ -248,14 +269,19 @@ bool MqttProtocol::OpenAudioChannel() {
     session_id_ = "";
     xEventGroupClearBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
 
+    // 迟到 hello 防护：只接受「本次尝试在等」的 hello。超时放弃后服务器才回的
+    // hello 若写入 session_id_/事件位，下一次开启会复用服务器即将 goodbye 的死会话。
+    hello_pending_ = true;
     auto message = GetHelloMessage();
     if (!SendText(message)) {
+        hello_pending_ = false;
         return false;
     }
 
     // 等待服务器响应
     EventBits_t bits = xEventGroupWaitBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT,
                                            pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+    hello_pending_ = false;
     if (!(bits & MQTT_PROTOCOL_SERVER_HELLO_EVENT)) {
         ESP_LOGE(TAG, "Failed to receive server hello");
         SetError(Lang::Strings::SERVER_TIMEOUT);
@@ -375,6 +401,10 @@ std::string MqttProtocol::GetHelloMessage() {
 }
 
 void MqttProtocol::ParseServerHello(const cJSON* root) {
+    if (!hello_pending_) {
+        ESP_LOGI(TAG, "Ignoring stale server hello: no open attempt waiting");
+        return;
+    }
     auto transport = cJSON_GetObjectItem(root, "transport");
     if (!cJSON_IsString(transport) || strcmp(transport->valuestring, "udp") != 0) {
         ESP_LOGE(TAG, "Unsupported or missing transport");

@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-19T00:00:00Z",
+  "title": "Design System: Grobot 创作工作台",
+  "extensions": {
+    "colorMeta": {
+      "ink-navy": { "role": "neutral", "displayName": "深墨蓝工作底", "canonical": "#10161C", "tonalRamp": ["#080B0E", "#0B1014", "#10161C", "#141C22", "#1A242B", "#34434A", "#667078", "#F2F0E8"] },
+      "paper-surface": { "role": "neutral", "displayName": "纸感深表面", "canonical": "#1A242B", "tonalRamp": ["#0B1014", "#10161C", "#141C22", "#1A242B", "#34434A", "#667078", "#A7B1B8", "#F2F0E8"] },
+      "paper-light": { "role": "neutral", "displayName": "暖纸浅底", "canonical": "#F4F1EA", "tonalRamp": ["#1E252B", "#667078", "#A7B1B8", "#D8D1C4", "#EDE8DE", "#F4F1EA", "#FFFDF8", "#FFFFFF"] },
+      "cyan-brand": { "role": "primary", "displayName": "Grobot 青蓝", "canonical": "#32D6CB", "tonalRamp": ["#073C3A", "#0A5A56", "#0F8F8A", "#1B7773", "#32D6CB", "#5ECBDA", "#A0E9E2", "#E4FAF7"] },
+      "text-light": { "role": "neutral", "displayName": "浅色文字", "canonical": "#F2F0E8", "tonalRamp": ["#1E252B", "#34434A", "#667078", "#A7B1B8", "#D8D1C4", "#EDE8DE", "#F4F1EA", "#F2F0E8"] },
+      "text-muted": { "role": "neutral", "displayName": "静音文字", "canonical": "#A7B1B8", "tonalRamp": ["#1E252B", "#34434A", "#667078", "#7F8C93", "#A7B1B8", "#C0C8CC", "#D8D1C4", "#F2F0E8"] },
+      "success": { "role": "tertiary", "displayName": "成功绿", "canonical": "#5ECB9A", "tonalRamp": ["#123B2B", "#1A5A40", "#2F8F68", "#5ECB9A", "#8DE0B5", "#B4ECCE", "#D9F7E5", "#F2FFF7"] },
+      "warning": { "role": "secondary", "displayName": "警示琥珀", "canonical": "#E4B15D", "tonalRamp": ["#4A2B08", "#7A4B0E", "#C8862A", "#E4B15D", "#F0CD8D", "#F7E0B5", "#FCF0D4", "#FFF9ED"] },
+      "danger": { "role": "secondary", "displayName": "危险红", "canonical": "#E06A70", "tonalRamp": ["#4A171A", "#782529", "#C64F52", "#E06A70", "#EE9B9F", "#F5C2C5", "#FBE4E5", "#FFF5F5"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "设备级标题", "purpose": "Grobot 相关的主视觉或设备级标题。" },
+      "headline": { "displayName": "面板标题", "purpose": "预览、状态和控制面板标题。" },
+      "body": { "displayName": "正文", "purpose": "对话、说明和状态详情。" },
+      "label": { "displayName": "动作标签", "purpose": "触摸按钮和状态胶囊，保持直接可读。" }
+    },
+    "shadows": [
+      { "name": "card-ambient", "value": "LVGL shadow width 24, black, opacity 30%", "purpose": "预览卡和控制面板相对背景的结构性抬升。" },
+      { "name": "stage-ambient", "value": "LVGL shadow width 18, black, opacity 20%", "purpose": "Grobot 纸感舞台的轻微分层。" }
+    ],
+    "motion": [],
+    "breakpoints": [
+      { "name": "waveshare-landscape", "value": "480x320" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Main safe action with a large child-friendly touch target.",
+      "html": "<button class=\"ds-btn-primary\">确认绘制</button>",
+      "css": ".ds-btn-primary { background: #32D6CB; color: #071316; height: 56px; padding: 0 20px; border: 0; border-radius: 18px; font: 500 20px/1.2 sans-serif; } .ds-btn-primary:focus-visible { outline: 3px solid #F2F0E8; outline-offset: 3px; } .ds-btn-primary:active { background: #1B7773; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Quiet alternative action for cancel, fold, and non-primary controls.",
+      "html": "<button class=\"ds-btn-secondary\">取消</button>",
+      "css": ".ds-btn-secondary { background: #1A242B; color: #F2F0E8; height: 56px; padding: 0 20px; border: 1px solid #34434A; border-radius: 18px; font: 500 20px/1.2 sans-serif; } .ds-btn-secondary:focus-visible { outline: 3px solid #32D6CB; outline-offset: 3px; } .ds-btn-secondary:active { background: #34434A; }"
+    },
+    {
+      "name": "Status Pill",
+      "kind": "chip",
+      "refersTo": "status-pill",
+      "description": "Centered machine status that combines color with readable text.",
+      "html": "<span class=\"ds-status-pill\">准备就绪</span>",
+      "css": ".ds-status-pill { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 0 10px; background: #1A242B; color: #F2F0E8; border: 1px solid #34434A; border-radius: 18px; font: 500 20px/1.2 sans-serif; }"
+    },
+    {
+      "name": "Preview Card",
+      "kind": "card",
+      "refersTo": "preview-card",
+      "description": "Paper-like confirmation surface that isolates the drawing before motion.",
+      "html": "<section class=\"ds-preview-card\"><div class=\"ds-preview-paper\">预览</div></section>",
+      "css": ".ds-preview-card { background: #1A242B; color: #F2F0E8; padding: 10px; border: 1px solid #34434A; border-radius: 24px; box-shadow: 0 8px 24px rgba(0,0,0,.30); } .ds-preview-paper { min-height: 160px; display: grid; place-items: center; background: #F6F1E6; color: #10161C; border-radius: 16px; }"
+    },
+    {
+      "name": "Grobot Stage",
+      "kind": "custom",
+      "refersTo": "stage",
+      "description": "Quiet paper-like stage that keeps Grobot emotionally central.",
+      "html": "<div class=\"ds-grobot-stage\"><span>◡‿◡</span></div>",
+      "css": ".ds-grobot-stage { width: 468px; height: 308px; display: grid; place-items: center; background: #1A242B; border: 1px solid #34434A; border-radius: 32px; box-shadow: 0 8px 18px rgba(0,0,0,.20); color: #32D6CB; font: 500 30px/1.2 sans-serif; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Quiet Creative Desk",
+    "overview": "Grobot 创作工作台把设备变成一张安静的创作桌：深色、低饱和的工作底承托 Grobot 的表情，青蓝只在安全且需要注意的动作上发光；纸感卡片把预览、状态和控制从背景中托起。它既要让孩子一眼读懂下一步，也要让调试操作者在需要时找到完整工具，而不是把机器控制铺成工程控制台。视觉系统偏温暖、精确、可触摸。圆角、边框和柔和阴影表达“这是一个可拿起的物件”，而不是装饰性浮夸；状态始终有文字或控件状态配合颜色，危险动作保持明确的红色实心按钮和直接标签。",
+    "keyCharacteristics": ["Grobot 是主角，预览和安全动作优先于调试细节。", "深墨蓝底 + 青蓝品牌色 + 纸感表面形成安静层次。", "所有主要触摸目标至少 56px 高；高级机器工具默认折叠。"],
+    "rules": [
+      { "name": "The Cyan Scarcity Rule", "body": "青蓝只负责主动作和安全注意，不把整个界面染成霓虹。", "section": "colors" }
+    ],
+    "dos": ["Do keep primary touch targets at or above 56px and use direct localized labels.", "Do preserve state-aware enable/disable behavior and pair status colors with text or control state.", "Do use the semantic theme tokens instead of scattering new palette literals through layout code.", "Do keep advanced machine controls available behind an explicit collapsed section."],
+    "donts": ["Don't make Grobot compete with the drawing preview or confirmation action.", "Don't turn the primary surface into a dense debug console.", "Don't rely on color alone to communicate machine state.", "Don't use full-screen opaque bars or neon-accented surfaces as default decoration."]
+  }
+}

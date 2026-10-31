@@ -935,6 +935,24 @@ menu "WiFi Configuration Method"
             The provisioning client must support ffdhe3072, SHA-256, and AES-CTR.
 endmenu
 
+config HUTUJI_BLE_DIAGNOSTICS
+    bool "Enable hutuji BLE-DIAG phase A read-only diagnostics"
+    default n
+    depends on BT_ENABLED && BT_NIMBLE_ENABLED
+    depends on !USE_ESP_BLUFI_WIFI_PROVISIONING
+    depends on BOARD_TYPE_LICHUANG_DEV_S3 || BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5
+    help
+        hutuji BLE-DIAG phase A: coarse read-only status advertising only.
+        Non-connectable, non-scannable legacy advertising with a single
+        6-byte Service Data payload; no GATT service, no pairing, no
+        control commands, no G-code path.
+
+        Off by default. Even when compiled in, advertising stays off until
+        the NVS runtime switch `ble_diag/enabled` is explicitly set to 1.
+
+        Mutually exclusive with BluFi provisioning: both own the BLE
+        controller and NimBLE host, so they must never be built together.
+
 config AUDIO_DEBUG_UDP_SERVER
     string "Audio Debug UDP Server Address"
     default "192.168.2.100:8000"

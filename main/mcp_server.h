@@ -1,15 +1,16 @@
 #ifndef MCP_SERVER_H
 #define MCP_SERVER_H
 
-#include <string>
-#include <vector>
-#include <map>
+#include <mbedtls/base64.h>
+#include <atomic>
 #include <functional>
-#include <variant>
+#include <map>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
-#include <mbedtls/base64.h>
+#include <variant>
+#include <vector>
 
 #include <cJSON.h>
 
@@ -212,6 +213,7 @@ private:
     PropertyList properties_;
     std::function<ReturnValue(const PropertyList&)> callback_;
     bool user_only_ = false;
+    bool background_ = false;
 
 public:
     McpTool(const std::string& name, 
@@ -224,6 +226,8 @@ public:
         callback_(callback) {}
 
     void set_user_only(bool user_only) { user_only_ = user_only; }
+    void set_background(bool background) { background_ = background; }
+    bool background() const { return background_; }
     inline const std::string& name() const { return name_; }
     inline const std::string& description() const { return description_; }
     inline const PropertyList& properties() const { return properties_; }
@@ -322,6 +326,12 @@ public:
     void AddUserOnlyTools();
     void AddTool(McpTool* tool);
     void AddTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback);
+    // 仅显式选择的阻塞工具使用后台任务；其它工具继续在主事件循环执行。
+    void AddBackgroundTool(const std::string& name, const std::string& description,
+                           const PropertyList& properties,
+                           std::function<ReturnValue(const PropertyList&)> callback);
+    // 屏幕与 MCP 的慢操作共用单槽；返回 false 时调用方立即反馈，不排队。
+    bool ScheduleBackground(std::function<void()> call);
     void AddUserOnlyTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback);
     void ParseMessage(const cJSON* json);
     void ParseMessage(const std::string& message);
@@ -337,6 +347,13 @@ private:
 
     void GetToolsList(int id, const std::string& cursor, bool list_user_only_tools);
     void DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments);
+    void DispatchToolCall(int id, McpTool* tool, PropertyList arguments);
+    struct BackgroundCall {
+        McpServer* server;
+        std::function<void()> call;
+    };
+    static void BackgroundToolTaskEntry(void* arg);
+    std::atomic<bool> background_tool_active_{false};
 
     std::vector<McpTool*> tools_;
 };
