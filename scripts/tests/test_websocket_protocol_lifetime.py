@@ -40,10 +40,11 @@ FREERTOS = replace_once(FREERTOS, 'inline unsigned xEventGroupWaitBits(Event* p,
 FREERTOS += r"""
 using TaskFunction_t=void(*)(void*);
 inline int retire_task_creates=0;
-inline bool defer_retire_tasks=false;
+inline bool defer_retire_tasks=false,fail_retire_task_create=false;
 inline std::vector<std::pair<TaskFunction_t,void*>> deferred_retire_tasks;
 inline int xTaskCreate(TaskFunction_t fn,const char*,unsigned,void* arg,int,void**){
  ++retire_task_creates;
+ if(fail_retire_task_create)return 0;
  if(defer_retire_tasks){deferred_retire_tasks.push_back({fn,arg});return 1;}
  fn(arg);return 1;
 }
@@ -388,14 +389,41 @@ int main(int argc,char**argv){
   else {auto packet=std::make_unique<AudioStreamPacket>();packet->payload={1};assert(!owner.p->SendAudio(std::move(packet)));}
   assert(errors==1&&closed==1&&!owner.p->IsAudioChannelOpened());assert(transport_destroys==1);
  }else if(mode=="retire_task_limit"){
+  // 断连风暴：单个回收任务串行析构，调用方只入队，三次关闭都不在调用线程析构。
   Owner second,third;
   assert(second.p->OpenAudioChannel());assert(third.p->OpenAudioChannel());
   defer_retire_tasks=true;
   owner.p->CloseAudioChannel();second.p->CloseAudioChannel();third.p->CloseAudioChannel();
-  assert(retire_task_creates==2&&deferred_retire_tasks.size()==2);
-  assert(transport_destroys==1);  // 第三个超过上限，退回同步析构。
+  assert(retire_task_creates==1&&deferred_retire_tasks.size()==1);
+  assert(transport_destroys==0);
   run_deferred_retire_tasks();
   assert(transport_destroys==3);
+  // 队列排空后任务已退出；下一次退休重新懒创建，空闲期不常驻栈。
+  assert(owner.p->OpenAudioChannel());owner.p->CloseAudioChannel();
+  assert(retire_task_creates==2&&deferred_retire_tasks.size()==1&&transport_destroys==3);
+  run_deferred_retire_tasks();
+  assert(transport_destroys==4);
+ }else if(mode=="retire_queue_full"){
+  // 只有定长队列已满（极端异常）才在调用线程同步析构，其余全部异步。
+  std::vector<std::unique_ptr<Owner>> others;
+  for(int i=0;i<8;++i){others.push_back(std::make_unique<Owner>());assert(others.back()->p->OpenAudioChannel());}
+  defer_retire_tasks=true;
+  for(auto& other:others)other->p->CloseAudioChannel();
+  assert(retire_task_creates==1&&transport_destroys==0);
+  owner.p->CloseAudioChannel();
+  assert(retire_task_creates==1&&transport_destroys==1);
+  run_deferred_retire_tasks();
+  assert(transport_destroys==9);
+ }else if(mode=="retire_create_failure"){
+  // 任务创建失败：调用线程同步排空队列，并复位运行标志，后续仍可创建任务。
+  fail_retire_task_create=true;
+  owner.p->CloseAudioChannel();
+  assert(retire_task_creates==1&&transport_destroys==1);
+  fail_retire_task_create=false;defer_retire_tasks=true;
+  assert(owner.p->OpenAudioChannel());owner.p->CloseAudioChannel();
+  assert(retire_task_creates==2&&deferred_retire_tasks.size()==1&&transport_destroys==1);
+  run_deferred_retire_tasks();
+  assert(transport_destroys==2);
  }else if(mode=="hello_destroy"||mode=="hello_replace"||mode=="json_parse_destroy"){
   Barrier parsing;
   auto incoming=mode=="json_parse_destroy"?std::string(R"({"type":"mcp"})"):
@@ -511,7 +539,9 @@ class WebsocketProtocolLifetimeTest(unittest.TestCase):
     def test_remote_close_wakes_hello_waiter(self): self.check('waiter_remote')
     def test_entered_hello_survives_owner_destruction(self): self.check('hello_destroy')
     def test_fail_channel_retires_websocket_via_retire_task(self): self.check('fail_retire_async')
-    def test_retire_tasks_are_bounded_during_disconnect_storm(self): self.check('retire_task_limit')
+    def test_retire_storm_uses_single_lazy_worker(self): self.check('retire_task_limit')
+    def test_retire_queue_full_falls_back_to_sync(self): self.check('retire_queue_full')
+    def test_retire_task_create_failure_drains_synchronously(self): self.check('retire_create_failure')
     def test_entered_old_hello_cannot_pollute_new_channel(self): self.check('hello_replace')
     def test_entered_json_parse_survives_owner_destruction(self): self.check('json_parse_destroy')
     def test_blocked_audio_does_not_hold_lifetime_lock(self): self.check('audio_block')
@@ -526,9 +556,12 @@ class WebsocketProtocolLifetimeTest(unittest.TestCase):
     def test_binary_v2_and_json_wire_behavior(self): self.check('wire2')
     def test_binary_v3_and_json_wire_behavior(self): self.check('wire3')
 
-    def test_retire_holder_allocation_is_nonthrowing(self):
+    def test_retire_queue_needs_no_heap_holder(self):
+        # 定长环形队列直接持有强引用：关闭/析构路径不再为 holder 分配堆内存。
         source = (ROOT / 'main/protocols/websocket_protocol.cc').read_text(encoding='utf-8')
-        self.assertIn('new (std::nothrow) std::shared_ptr<WebSocket>', source)
+        self.assertFalse('new std::shared_ptr<WebSocket>' in source)
+        self.assertFalse('new (std::nothrow) std::shared_ptr<WebSocket>' in source)
+        self.assertTrue('std::shared_ptr<WebSocket> retire_queue[kRetireQueueDepth]' in source)
     def test_v2_rejects_truncated_header_and_payload(self): self.check('malformed2')
     def test_v3_rejects_truncated_header_and_payload(self): self.check('malformed3')
     def test_malformed_hello_does_not_change_negotiation(self): self.check('bad_hello')

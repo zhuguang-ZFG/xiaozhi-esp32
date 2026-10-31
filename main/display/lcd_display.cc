@@ -70,6 +70,15 @@ bool IsProductionHutujiScreen() {
 #endif
 }
 
+// 量产桌宠舞台是暖莓底；奶油主题正文同为暖莓系（对比约 1.4:1），kawaii 初始化
+// 失败回落的 emoji 图标改用奶油字（约 6.9:1），其他板黑底仍跟随主题正文色。
+constexpr uint32_t kProductionStageHex = 0x6B4E5E;
+constexpr uint32_t kProductionStageTextHex = 0xFFF7ED;
+
+lv_color_t EmojiLabelColor(LvglTheme* theme) {
+    return IsProductionHutujiScreen() ? lv_color_hex(kProductionStageTextHex) : theme->text_color();
+}
+
 void StyleProductionButton(lv_obj_t* button, LvglTheme* theme, lv_color_t background,
                            lv_color_t foreground) {
     if (!IsProductionHutujiScreen()) {
@@ -2447,7 +2456,7 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
         lv_obj_set_size(grobot_stage_, LV_HOR_RES - 16, 140);
         lv_obj_set_pos(grobot_stage_, 8, 34);
         lv_obj_set_style_radius(grobot_stage_, 22, 0);
-        lv_obj_set_style_bg_color(grobot_stage_, lv_color_hex(0x6B4E5E), 0);
+        lv_obj_set_style_bg_color(grobot_stage_, lv_color_hex(kProductionStageHex), 0);
         lv_obj_set_style_border_width(grobot_stage_, 2, 0);
         lv_obj_set_style_border_color(grobot_stage_, lv_color_hex(0xF3A3B5), 0);
         lv_obj_set_style_shadow_width(grobot_stage_, 8, 0);
@@ -2471,7 +2480,7 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
-    lv_obj_set_style_text_color(emoji_label_, theme->text_color(), 0);
+    lv_obj_set_style_text_color(emoji_label_, EmojiLabelColor(theme), 0);
     lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_EDIT_SQUARE);
 
     emoji_image_ = lv_image_create(emoji_box_);
@@ -2518,7 +2527,7 @@ void LcdDisplay::InitializeEmotionUi(lv_obj_t* screen, LvglTheme* theme,
     // 绘制（眼/眉/嘴/腮红，17 情绪+自动眨眼），零图片零解码开销；字幕条共用。
     // 量产 FH-031 用暖莓色小舞台，其他板仍保留用户已拍板的 Eilik 黑底。
     const lv_color_t kawaii_background =
-        IsProductionHutujiScreen() ? lv_color_hex(0x6B4E5E) : lv_color_black();
+        IsProductionHutujiScreen() ? lv_color_hex(kProductionStageHex) : lv_color_black();
     lv_obj_set_style_bg_color(emoji_box_, kawaii_background, 0);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_COVER, 0);
     InitKawaiiFace();
@@ -3688,7 +3697,7 @@ void LcdDisplay::SetTheme(Theme* theme) {
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
     if (emoji_label_ != nullptr) {
-        lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
+        lv_obj_set_style_text_color(emoji_label_, EmojiLabelColor(lvgl_theme), 0);
     }
     if (grobot_stage_ != nullptr) {
         lv_obj_set_style_bg_color(grobot_stage_, lvgl_theme->surface_color(), 0);
@@ -3778,7 +3787,7 @@ void LcdDisplay::SetTheme(Theme* theme) {
     }
 
     if (emoji_label_ != nullptr) {
-        lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
+        lv_obj_set_style_text_color(emoji_label_, EmojiLabelColor(lvgl_theme), 0);
     }
 
     // Update bottom bar background color with 50% opacity
@@ -3888,7 +3897,7 @@ void LcdDisplay::InitKawaiiFace() {
         .has_accent = true,
         .accent = theme != nullptr ? theme->accent_color() : lv_color_hex(FACE_EILIK_ACCENT_HEX),
         .has_background = true,
-        .background = IsProductionHutujiScreen() ? lv_color_hex(0x6B4E5E) : lv_color_black(),
+        .background = IsProductionHutujiScreen() ? lv_color_hex(kProductionStageHex) : lv_color_black(),
     };
     if (face_animation_init(&cfg) == ESP_OK) {
         ESP_LOGI(TAG, "Kawaii face initialized (Eilik + accent-matched iris)");

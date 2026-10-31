@@ -128,6 +128,31 @@ class KawaiiFaceTest(unittest.TestCase):
             self.assertIn(color, self.lcd_cc)
         self.assertNotIn('量产深色科技主题', self.lcd_cc)
 
+    def test_production_emoji_fallback_contrasts_with_berry_stage(self):
+        """kawaii 初始化失败回落 emoji 图标时，暖莓舞台上的图标不得沿用暖莓正文色。"""
+        stage = re.search(r'constexpr uint32_t kProductionStageHex = 0x([0-9A-F]{6});', self.lcd_cc)
+        ink = re.search(r'constexpr uint32_t kProductionStageTextHex = 0x([0-9A-F]{6});', self.lcd_cc)
+        self.assertIsNotNone(stage)
+        self.assertIsNotNone(ink)
+        self.assertEqual(stage.group(1), '6B4E5E')
+
+        def luminance(hex_color):
+            def channel(value):
+                c = int(value, 16) / 255
+                return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+            r, g, b = (channel(hex_color[i:i + 2]) for i in (0, 2, 4))
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+        high, low = sorted((luminance(stage.group(1)), luminance(ink.group(1))), reverse=True)
+        self.assertGreaterEqual((high + 0.05) / (low + 0.05), 4.5)
+        # 创建与两条 SetTheme 分支统一走同一取色入口，主题切换不回落正文色。
+        colors = re.findall(r'lv_obj_set_style_text_color\(emoji_label_, ([^;]*)\);', self.lcd_cc)
+        self.assertEqual(len(colors), 3, colors)
+        for color in colors:
+            self.assertTrue(color.startswith('EmojiLabelColor('), color)
+        # 舞台三处取色共用同一常量，避免改一处漏一处。
+        self.assertNotIn('lv_color_hex(0x6B4E5E)', self.lcd_cc)
+
     def test_lichuang_face_box_nearly_fullscreen(self):
         # 立创 320x240：脸盒须近全屏（旧 280x190 目视留白被否）
         self.assertIn('constexpr int kFaceWidth = 312;', self.lcd_cc)

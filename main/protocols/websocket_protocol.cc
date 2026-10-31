@@ -7,9 +7,8 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
-#include <atomic>
 #include <cstring>
-#include <new>
+#include <mutex>
 #include "assets/lang_config.h"
 
 #define TAG "WS"
@@ -57,39 +56,65 @@ struct WebsocketProtocol::ChannelState {
 WebsocketProtocol::WebsocketProtocol() = default;
 
 namespace {
-constexpr unsigned kMaxRetireTasks = 2;
-std::atomic<unsigned> retire_tasks_active{0};
+constexpr size_t kRetireQueueDepth = 8;
+std::mutex retire_mutex;
+std::shared_ptr<WebSocket> retire_queue[kRetireQueueDepth];
+size_t retire_head = 0;
+size_t retire_count = 0;
+bool retire_worker_running = false;
+
+// 逐个出队并在锁外析构；队列空时于同一把锁内清 running 标志后返回，生产者
+// 据此决定是否需要重新拉起回收任务，不会出现「任务刚判空退出、新项无人回收」。
+void DrainRetireQueue() {
+    for (;;) {
+        std::shared_ptr<WebSocket> websocket;
+        {
+            std::lock_guard<std::mutex> lock(retire_mutex);
+            if (retire_count == 0) {
+                retire_worker_running = false;
+                return;
+            }
+            websocket = std::move(retire_queue[retire_head]);
+            retire_head = (retire_head + 1) % kRetireQueueDepth;
+            --retire_count;
+        }
+        websocket.reset();
+    }
+}
 
 // F50-11：接收任务卡死时 ~WebSocket 的有限等待最长 ~30s；失败/替换/关闭路径
-// 不得把音频编码任务或主循环拖在旧对象的同步析构上。由一次性回收任务持有
-// 强引用完成销毁；同时最多保留两个回收任务，避免断连风暴按每次 4KiB 栈无界
-// 放大。名额、holder 或任务创建失败时退回同步析构（有界等待语义不变）。
+// 不得把音频编码任务或主循环拖在旧对象的同步析构上。调用方只把强引用放进
+// 定长环形队列，由单个懒创建的回收任务串行析构，队列排空即退出：空闲不占栈，
+// 断连风暴也只占一份 4KiB 栈。仅两种情况退回调用线程同步析构（有界等待语义
+// 不变）：队列已满——8 个旧连接都在等待析构，说明已极端异常，继续堆积只会
+// 拖住更多 TLS 内存；或回收任务创建失败——此时在调用线程排空整个队列。
 void RetireWebSocketAsync(std::shared_ptr<WebSocket> websocket) {
     if (!websocket)
         return;
 
-    unsigned active = retire_tasks_active.load(std::memory_order_relaxed);
-    while (active < kMaxRetireTasks &&
-           !retire_tasks_active.compare_exchange_weak(active, active + 1, std::memory_order_acq_rel,
-                                                      std::memory_order_relaxed)) {
+    bool start_worker = false;
+    {
+        std::lock_guard<std::mutex> lock(retire_mutex);
+        if (retire_count < kRetireQueueDepth) {
+            retire_queue[(retire_head + retire_count) % kRetireQueueDepth] = std::move(websocket);
+            ++retire_count;
+            start_worker = !retire_worker_running;
+            retire_worker_running = true;
+        }
     }
-    if (active >= kMaxRetireTasks)
-        return;  // 局部 websocket 在调用线程同步析构，不再创建额外任务。
-
-    auto* holder = new (std::nothrow) std::shared_ptr<WebSocket>(std::move(websocket));
-    if (!holder) {
-        retire_tasks_active.fetch_sub(1, std::memory_order_acq_rel);
+    if (websocket) {
+        websocket.reset();  // 队列已满：锁外同步析构。
         return;
     }
+    if (!start_worker)
+        return;
     if (xTaskCreate(
-            [](void* arg) {
-                delete static_cast<std::shared_ptr<WebSocket>*>(arg);
-                retire_tasks_active.fetch_sub(1, std::memory_order_acq_rel);
+            [](void*) {
+                DrainRetireQueue();
                 vTaskDelete(nullptr);
             },
-            "ws_retire", 4096, holder, 3, nullptr) != pdPASS) {
-        retire_tasks_active.fetch_sub(1, std::memory_order_acq_rel);
-        delete holder;
+            "ws_retire", 4096, nullptr, 3, nullptr) != pdPASS) {
+        DrainRetireQueue();
     }
 }
 }  // namespace
